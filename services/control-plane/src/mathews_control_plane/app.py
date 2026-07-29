@@ -13,6 +13,7 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
     version: str
     environment: str
+    configuration_ready: bool
 
 
 app = FastAPI(
@@ -23,7 +24,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_methods=["GET"],
-    allow_origins=[settings.web_origin],
+    allow_origins=[str(settings.web_origin).rstrip("/")],
 )
 
 
@@ -34,4 +35,5 @@ async def health() -> HealthResponse:
         status="ok",
         version=__version__,
         environment=settings.environment,
+        configuration_ready=settings.automation_ready,
     )

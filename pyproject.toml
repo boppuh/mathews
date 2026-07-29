@@ -16,19 +16,27 @@ dev = [
 [tool.uv]
 package = false
 
+[tool.uv.sources]
+mathews-configuration = { workspace = true }
+
 [tool.uv.workspace]
 members = [
+  "libraries/configuration",
   "services/control-plane",
   "services/host-agent",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-q"
-testpaths = ["services"]
+testpaths = [
+  "libraries/configuration/tests",
+  "services",
+]
 
 [tool.mypy]
 strict = true
 mypy_path = [
+  "libraries/configuration/src",
   "services/control-plane/src",
   "services/host-agent/src",
 ]

@@ -8,6 +8,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "mathews-configuration",
     "mathews-control-plane",
     "mathews-host-agent",
     "mathews-workspace",
@@ -214,11 +215,17 @@ wheels = [
 ]
 
 [[package]]
+name = "mathews-configuration"
+version = "0.1.0"
+source = { editable = "libraries/configuration" }
+
+[[package]]
 name = "mathews-control-plane"
 version = "0.1.0"
 source = { editable = "services/control-plane" }
 dependencies = [
     { name = "fastapi" },
+    { name = "mathews-configuration" },
     { name = "pydantic-settings" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -226,6 +233,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "mathews-configuration", editable = "libraries/configuration" },
     { name = "pydantic-settings", specifier = ">=2.8,<3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
 ]
@@ -234,6 +242,12 @@ requires-dist = [
 name = "mathews-host-agent"
 version = "0.1.0"
 source = { editable = "services/host-agent" }
+dependencies = [
+    { name = "mathews-configuration" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mathews-configuration", editable = "libraries/configuration" }]
 
 [[package]]
 name = "mathews-workspace"
