@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const isWindows = process.platform === "win32";
 
 if (process.env.MATHEWS_SKIP_POSTGRES !== "1") {
   const database = spawnSync(
@@ -40,8 +41,10 @@ if (process.env.MATHEWS_SKIP_POSTGRES !== "1") {
 const services = [
   {
     name: "web",
-    command: "npm",
-    args: ["run", "dev", "--workspace", "@mathews/web"],
+    command: isWindows ? (process.env.ComSpec ?? "cmd.exe") : "npm",
+    args: isWindows
+      ? ["/d", "/s", "/c", "npm.cmd", "run", "dev", "--workspace", "@mathews/web"]
+      : ["run", "dev", "--workspace", "@mathews/web"],
   },
   {
     name: "api",
@@ -106,7 +109,7 @@ for (const service of services) {
     children.delete(service.name);
     if (!shuttingDown) {
       console.error(`[${service.name}] exited unexpectedly (${signal ?? code ?? "unknown"}).`);
-      shutdown("SIGTERM", code ?? 1);
+      shutdown("SIGTERM", code === 0 ? 1 : (code ?? 1));
     }
   });
 }
