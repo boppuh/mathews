@@ -85,6 +85,21 @@ def test_blank_optional_environment_values_are_unconfigured(
     assert settings.hermes_api_key_ref is None
 
 
+def test_shared_dotenv_ignores_launcher_and_legacy_fields(tmp_path: Path) -> None:
+    from mathews_control_plane.settings import Settings
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "MATHEWS_SKIP_POSTGRES=1\n"
+        "MATHEWS_HERMES_API_KEY=unused-legacy-secret\n"
+    )
+
+    settings = Settings(_env_file=env_file)  # type: ignore[call-arg]
+
+    assert settings.automation_ready is False
+    assert "unused-legacy-secret" not in str(settings.safe_summary())
+
+
 def test_configuration_report_redacts_database_credentials() -> None:
     from mathews_control_plane.configuration import configuration_report
     from mathews_control_plane.settings import Settings

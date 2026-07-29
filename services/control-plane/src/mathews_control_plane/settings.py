@@ -39,7 +39,9 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         env_prefix="MATHEWS_",
-        extra="forbid",
+        # The workspace shares this file with the Node development launcher.
+        # Unknown entries are ignored; required automation fields still fail closed.
+        extra="ignore",
         validate_default=True,
     )
 
