@@ -35,7 +35,7 @@ export default function Home() {
           <h2 id="workflow-heading">Durable stages, visible evidence</h2>
         </div>
         <ol className="timeline">
-          {TASK_STATES.slice(0, 8).map((stage, index) => (
+          {TASK_STATES.map((stage, index) => (
             <li key={stage}>
               <span>{String(index + 1).padStart(2, "0")}</span>
               {stageLabel(stage)}

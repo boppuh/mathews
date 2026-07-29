@@ -7,7 +7,17 @@ const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 if (process.env.MATHEWS_SKIP_POSTGRES !== "1") {
   const database = spawnSync(
     "docker",
-    ["compose", "-f", "infra/compose.yaml", "up", "-d", "--wait", "postgres"],
+    [
+      "compose",
+      "--project-directory",
+      workspaceRoot,
+      "-f",
+      path.join(workspaceRoot, "infra/compose.yaml"),
+      "up",
+      "-d",
+      "--wait",
+      "postgres",
+    ],
     {
       cwd: workspaceRoot,
       stdio: "inherit",
