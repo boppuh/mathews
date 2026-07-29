@@ -94,7 +94,7 @@ for (const service of services) {
   });
   child.on("exit", (code, signal) => {
     children.delete(service.name);
-    if (!shuttingDown && (code !== 0 || signal)) {
+    if (!shuttingDown) {
       console.error(`[${service.name}] exited unexpectedly (${signal ?? code ?? "unknown"}).`);
       shutdown("SIGTERM", code ?? 1);
     }
