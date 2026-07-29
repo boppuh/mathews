@@ -1,0 +1,48 @@
+{
+  "name": "mathews",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Evidence-first autonomous iOS delivery workspace",
+  "packageManager": "npm@10.9.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "overrides": {
+    "next": {
+      "postcss": "8.5.25",
+      "sharp": "0.35.3"
+    },
+    "postcss": "8.5.25",
+    "sharp": "0.35.3"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "dev": "node scripts/dev.mjs",
+    "dev:api": "uv run --package mathews-control-plane uvicorn mathews_control_plane.app:app --reload --host 127.0.0.1 --port 8000",
+    "dev:host": "uv run --package mathews-host-agent mathews-host-agent",
+    "dev:web": "npm run dev --workspace @mathews/web",
+    "dev:worker": "uv run --package mathews-control-plane mathews-worker",
+    "lint": "npm run lint:js && npm run lint:python",
+    "lint:js": "biome check apps packages scripts",
+    "lint:python": "uv run ruff check services",
+    "test": "npm run test:js && npm run test:python",
+    "test:js": "npm run test --workspaces --if-present",
+    "test:python": "uv run pytest",
+    "typecheck": "npm run typecheck:js && npm run typecheck:python",
+    "typecheck:js": "npm run typecheck --workspaces --if-present",
+    "typecheck:python": "uv run mypy services"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "@types/node": "26.1.2",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

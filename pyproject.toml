@@ -1,0 +1,41 @@
+[project]
+name = "mathews-workspace"
+version = "0.1.0"
+description = "Python workspace for the Mathews control plane and host agent"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "httpx2>=2,<3",
+  "mypy>=1.15,<2",
+  "pytest>=8,<9",
+  "ruff>=0.11,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+  "services/control-plane",
+  "services/host-agent",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["services"]
+
+[tool.mypy]
+strict = true
+mypy_path = [
+  "services/control-plane/src",
+  "services/host-agent/src",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]

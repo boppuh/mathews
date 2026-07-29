@@ -1,0 +1,16 @@
+[project]
+name = "mathews-host-agent"
+version = "0.1.0"
+description = "Narrow local macOS execution agent for Mathews"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+mathews-host-agent = "mathews_host_agent.agent:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mathews_host_agent"]
