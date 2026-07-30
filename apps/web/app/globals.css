@@ -801,7 +801,7 @@ section {
   width: 0.45rem;
   height: 0.45rem;
   border-radius: 50%;
-  background: currentColor;
+  background: currentcolor;
 }
 
 .cockpit-live-status.live-live {

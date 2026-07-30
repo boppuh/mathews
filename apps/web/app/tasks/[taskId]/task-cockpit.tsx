@@ -54,6 +54,7 @@ function failureMessage(error: unknown): string {
 export function TaskCockpit({ taskId }: { taskId: string }) {
   const [state, setState] = useState<CockpitState>({ status: "loading" });
   const [liveStatus, setLiveStatus] = useState<LiveStatus>("connecting");
+  const loadedEventCursor = useRef({ taskId: "", sequence: 0 });
   const detailLoader = useRef<LatestTaskDetailLoader | null>(null);
   if (detailLoader.current === null) {
     detailLoader.current = new LatestTaskDetailLoader();
@@ -95,21 +96,44 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
     };
   }, [loadCockpit]);
 
+  const readyTaskId = state.status === "ready" ? state.cockpit.task.id : null;
+  const latestLoadedSequence =
+    state.status === "ready" ? (state.cockpit.events.at(-1)?.sequence ?? 0) : 0;
+
   useEffect(() => {
-    if (state.status !== "ready" || state.cockpit.task.id !== taskId) {
+    if (readyTaskId !== taskId) {
+      return;
+    }
+    if (loadedEventCursor.current.taskId !== taskId) {
+      loadedEventCursor.current = {
+        taskId,
+        sequence: latestLoadedSequence,
+      };
+      return;
+    }
+    loadedEventCursor.current.sequence = Math.max(
+      loadedEventCursor.current.sequence,
+      latestLoadedSequence,
+    );
+  }, [latestLoadedSequence, readyTaskId, taskId]);
+
+  useEffect(() => {
+    if (readyTaskId !== taskId) {
       return;
     }
 
     const refreshController = new AbortController();
     let refreshTimer: number | undefined;
-    let highestObservedSequence = state.cockpit.events.at(-1)?.sequence ?? 0;
+    let highestObservedSequence =
+      loadedEventCursor.current.taskId === taskId ? loadedEventCursor.current.sequence : 0;
     const eventSource = new EventSource(taskEventStreamUrl(taskId), {
       withCredentials: true,
     });
     setLiveStatus("connecting");
 
     eventSource.onopen = () => setLiveStatus("live");
-    eventSource.onerror = () => setLiveStatus("reconnecting");
+    eventSource.onerror = () =>
+      setLiveStatus(eventSource.readyState === EventSource.CLOSED ? "unavailable" : "reconnecting");
     const refreshFromStream = async () => {
       const refreshed = await loadCockpit(refreshController.signal, true);
       if (!refreshed && !refreshController.signal.aborted) {
@@ -148,7 +172,7 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
         window.clearTimeout(refreshTimer);
       }
     };
-  }, [loadCockpit, state, taskId]);
+  }, [loadCockpit, readyTaskId, taskId]);
 
   if (state.status === "loading") {
     return (
