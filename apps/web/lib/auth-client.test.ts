@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { BOOTSTRAP_PASSWORD_POLICY_MESSAGE } from "./auth";
+import { BOOTSTRAP_PASSWORD_POLICY_MESSAGE, INVALID_BOOTSTRAP_REQUEST_MESSAGE } from "./auth";
 import {
   AuthRequestError,
   authClient,
@@ -169,10 +169,15 @@ describe("authClient mutation contract", () => {
 
   it("maps bootstrap 422 responses to the fixed password policy message", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ detail: "do not display this backend body" }), {
-        status: 422,
-        headers: { "Content-Type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({
+          detail: "password must contain at least 15 characters and at most 1024 UTF-8 bytes",
+        }),
+        {
+          status: 422,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
     );
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("document", { cookie: "__Host-mathews-csrf=csrf-token" });
@@ -182,4 +187,23 @@ describe("authClient mutation contract", () => {
       status: 422,
     });
   });
+
+  it.each([{ detail: "invalid request" }, { detail: "do not display this backend body" }])(
+    "maps other bootstrap 422 details to a fixed invalid-request message",
+    async (body) => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          status: 422,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      vi.stubGlobal("document", { cookie: "__Host-mathews-csrf=csrf-token" });
+
+      await expect(authClient.bootstrap("one-time-token", "short")).rejects.toMatchObject({
+        message: INVALID_BOOTSTRAP_REQUEST_MESSAGE,
+        status: 422,
+      });
+    },
+  );
 });

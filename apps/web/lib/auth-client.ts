@@ -4,12 +4,15 @@ import {
   type AuthStatus,
   BOOTSTRAP_PASSWORD_POLICY_MESSAGE,
   cookieValue,
+  INVALID_BOOTSTRAP_REQUEST_MESSAGE,
   normalizeControlPlaneUrl,
   parseAuthSession,
   parseAuthStatus,
 } from "./auth";
 
 const CSRF_COOKIE_NAME = "__Host-mathews-csrf";
+const BOOTSTRAP_PASSWORD_POLICY_DETAIL =
+  "password must contain at least 15 characters and at most 1024 UTF-8 bytes";
 const controlPlaneUrl = normalizeControlPlaneUrl(process.env.NEXT_PUBLIC_CONTROL_PLANE_URL);
 
 export class AuthRequestError extends Error {
@@ -22,7 +25,14 @@ export class AuthRequestError extends Error {
   }
 }
 
-async function request(path: string, init: RequestInit, fallbackError: string): Promise<Response> {
+type ErrorMessageForResponse = (response: Response) => Promise<string | undefined>;
+
+async function request(
+  path: string,
+  init: RequestInit,
+  fallbackError: string,
+  errorMessageForResponse?: ErrorMessageForResponse,
+): Promise<Response> {
   const response = await fetch(`${controlPlaneUrl}${path}`, {
     ...init,
     credentials: "include",
@@ -33,10 +43,35 @@ async function request(path: string, init: RequestInit, fallbackError: string): 
   });
 
   if (!response.ok) {
-    throw new AuthRequestError(fallbackError, response.status);
+    const responseError = await errorMessageForResponse?.(response);
+    throw new AuthRequestError(responseError ?? fallbackError, response.status);
   }
 
   return response;
+}
+
+async function bootstrapErrorMessage(response: Response): Promise<string | undefined> {
+  if (response.status !== 422) {
+    return undefined;
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return INVALID_BOOTSTRAP_REQUEST_MESSAGE;
+  }
+
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    "detail" in body &&
+    body.detail === BOOTSTRAP_PASSWORD_POLICY_DETAIL
+  ) {
+    return BOOTSTRAP_PASSWORD_POLICY_MESSAGE;
+  }
+
+  return INVALID_BOOTSTRAP_REQUEST_MESSAGE;
 }
 
 function csrfHeaders(): HeadersInit {
@@ -71,22 +106,16 @@ export const authClient = {
   },
 
   async bootstrap(bootstrapToken: string, password: string): Promise<void> {
-    try {
-      await request(
-        "/api/auth/bootstrap",
-        {
-          method: "POST",
-          headers: csrfHeaders(),
-          body: JSON.stringify({ bootstrap_token: bootstrapToken, password }),
-        },
-        "The bootstrap token or password was not accepted.",
-      );
-    } catch (error) {
-      if (error instanceof AuthRequestError && error.status === 422) {
-        throw new AuthRequestError(BOOTSTRAP_PASSWORD_POLICY_MESSAGE, error.status);
-      }
-      throw error;
-    }
+    await request(
+      "/api/auth/bootstrap",
+      {
+        method: "POST",
+        headers: csrfHeaders(),
+        body: JSON.stringify({ bootstrap_token: bootstrapToken, password }),
+      },
+      "The bootstrap token or password was not accepted.",
+      bootstrapErrorMessage,
+    );
   },
 
   async login(password: string): Promise<void> {

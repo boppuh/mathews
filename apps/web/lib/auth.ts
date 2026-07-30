@@ -19,6 +19,8 @@ export type AuthView = "bootstrap" | "bootstrap-unavailable" | "login" | "worksp
 export const BOOTSTRAP_PASSWORD_MIN_LENGTH = 15;
 export const BOOTSTRAP_PASSWORD_POLICY_MESSAGE =
   "Use at least 15 characters for the workspace password.";
+export const INVALID_BOOTSTRAP_REQUEST_MESSAGE =
+  "The bootstrap request was invalid. Check the fields and try again.";
 export const PASSWORD_CONFIRMATION_MESSAGE = "Passwords do not match.";
 
 const DEFAULT_CONTROL_PLANE_URL = "http://localhost:8000";

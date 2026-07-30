@@ -177,26 +177,34 @@ export function AuthGate({ children }: { children: ReactNode }) {
     sessionLoader.current = new LatestAuthSnapshotLoader();
   }
 
-  const loadSession = useCallback(async (signal?: AbortSignal): Promise<AuthSnapshot | null> => {
-    setSessionState({ status: "checking" });
-    try {
-      const snapshot = await sessionLoader.current?.load(signal);
-      if (!snapshot) {
+  const loadSession = useCallback(
+    async (
+      signal?: AbortSignal,
+      options: { background?: boolean } = {},
+    ): Promise<AuthSnapshot | null> => {
+      if (!options.background) {
+        setSessionState({ status: "checking" });
+      }
+      try {
+        const snapshot = await sessionLoader.current?.load(signal);
+        if (!snapshot) {
+          return null;
+        }
+        setSessionState({ status: "ready", snapshot });
+        return snapshot;
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          return null;
+        }
+        setSessionState({
+          status: "failed",
+          message: messageFrom(error, "Unable to reach the control plane."),
+        });
         return null;
       }
-      setSessionState({ status: "ready", snapshot });
-      return snapshot;
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-        return null;
-      }
-      setSessionState({
-        status: "failed",
-        message: messageFrom(error, "Unable to reach the control plane."),
-      });
-      return null;
-    }
-  }, []);
+    },
+    [],
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -210,7 +218,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
     }
 
     const delay = sessionRefreshDelay(sessionState.snapshot.session.expires_at);
-    const timeout = window.setTimeout(() => void loadSession(), delay);
+    const timeout = window.setTimeout(
+      () => void loadSession(undefined, { background: true }),
+      delay,
+    );
     return () => window.clearTimeout(timeout);
   }, [loadSession, sessionState]);
 
