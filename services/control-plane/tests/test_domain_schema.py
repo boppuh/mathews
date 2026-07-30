@@ -44,7 +44,11 @@ EXPECTED_DOMAIN_TABLES = {
     "background_jobs",
     "brief_approval_decisions",
     "briefs",
+    "evidence_audit_events",
+    "evidence_deletion_requests",
+    "evidence_derivatives",
     "evidence_records",
+    "evidence_tombstones",
     "policy_version_prompt_templates",
     "policy_version_review_rules",
     "policy_versions",
@@ -334,8 +338,8 @@ def test_complete_domain_graph_round_trip(tmp_path: Path) -> None:
                 content_hash=f"sha256:{'c' * 64}",
                 content_address=f"sha256:{'c' * 64}",
                 captured_at=now,
-                access_classification="task",
-                retention_policy="mvp-default",
+                access_classification="TASK_OWNER",
+                retention_policy="TASK_LIFETIME",
                 **context,
             )
             session.add(evidence)

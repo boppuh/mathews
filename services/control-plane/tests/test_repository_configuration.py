@@ -26,6 +26,13 @@ from mathews_control_plane.database import (
     session_scope,
 )
 from mathews_control_plane.domain_models import EvidenceRecord, RepositoryConfiguration
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+    load_evidence,
+)
 from mathews_control_plane.repository_configuration import (
     RepositoryPreflightBindingError,
     RepositoryPreflightNotReadyError,
@@ -453,8 +460,8 @@ def test_capture_persists_canonical_evidence_and_require_verifies_exact_binding(
         assert evidence is not None
         assert evidence.content_hash == captured.evidence_address
         assert evidence.content_address == captured.evidence_address
-        artifact = json.loads(store.get_bytes(captured.evidence_address))
-        assert artifact == {
+        artifact = load_evidence(session, store, evidence)
+        assert artifact.content == {
             "schema_version": 1,
             "repository_key": "boppuh/mathews",
             **report.to_dict(),
@@ -473,6 +480,62 @@ def test_capture_persists_canonical_evidence_and_require_verifies_exact_binding(
         assert ready.binding.configuration_id == configuration.id
         assert ready.binding.resolved_base_sha == "a" * 40
         assert ready.evidence_id == captured.evidence_id
+
+
+def test_correction_successor_invalidates_attached_preflight_readiness(
+    repository_database: SessionFactory,
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    with session_scope(repository_database) as session:
+        configuration = _configuration(session)
+        report = _report(
+            configuration,
+            _begin_preflight(session, store, configuration),
+        )
+        captured = capture_preflight_report(
+            session,
+            store,
+            report=report,
+            owner_id="local-user",
+            actor_id="host-agent",
+            root_correlation_id=uuid4(),
+        )
+        attached = session.get(EvidenceRecord, captured.evidence_id)
+        assert attached is not None
+        capture_evidence(
+            session,
+            store,
+            payload={
+                "schema_version": 1,
+                "repository_key": configuration.repository_key,
+                **report.to_dict(),
+            },
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.RESULT,
+            evidence_type=attached.evidence_type,
+            origin="control-plane:correction",
+            access_classification=EvidenceAccessClass.INTERNAL,
+            retention_policy=EvidenceRetentionClass.REPOSITORY_LIFETIME,
+            owner_id=attached.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=attached.root_correlation_id,
+            correction_of_id=attached.id,
+        )
+
+        with pytest.raises(
+            RepositoryPreflightNotReadyError,
+            match="evidence is invalid",
+        ):
+            require_preflight_ready(
+                session,
+                store,
+                repository_key=configuration.repository_key,
+                configuration_id=configuration.id,
+                configuration_version=configuration.version,
+                configuration_digest=report.configuration_digest,
+                resolved_base_sha=cast(str, report.resolved_base_sha),
+            )
 
 
 def test_capture_rejects_any_inexact_host_binding_before_writing_artifact(

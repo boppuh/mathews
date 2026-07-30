@@ -37,7 +37,13 @@ from mathews_control_plane.database import (
     get_task_record,
     session_scope,
 )
-from mathews_control_plane.domain_models import TaskEvent
+from mathews_control_plane.domain_models import EvidenceRecord, TaskEvent
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+)
 from mathews_control_plane.repository_configuration import (
     begin_preflight_attempt,
     capture_preflight_report,
@@ -47,7 +53,7 @@ from mathews_control_plane.repository_configuration import (
 )
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine, make_url
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 _DATABASE_URL_ENV = "POSTGRES_TEST_DATABASE_URL"
 
@@ -334,8 +340,8 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         authentication_service = AuthenticationService(factory)
         with engine.connect() as connection:
             current_revision = MigrationContext.configure(connection).get_current_revision()
-        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0003"]
-        assert current_revision == "0003"
+        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0004"]
+        assert current_revision == "0004"
         inspector = inspect(engine)
         validation_run_foreign_keys = inspector.get_foreign_keys("validation_runs")
         validation_run_foreign_tables = {
@@ -371,6 +377,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         with session_scope(factory) as session:
             created = create_task_record(
                 session,
+                store,
                 repository="boppuh/mathews",
                 base_revision="a" * 40,
                 requester="local-user",
@@ -437,6 +444,23 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
                     root_correlation_id=root_correlation_id,
                 )
             )
+        with engine.connect() as connection:
+            request_evidence_id = connection.execute(
+                text(
+                    "SELECT id FROM evidence_records "
+                    "WHERE task_id = :task_id AND evidence_type = 'task-request'"
+                ),
+                {"task_id": task_id},
+            ).scalar_one()
+        with pytest.raises(DBAPIError, match="append-only"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE evidence_records SET origin = 'rewritten' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": request_evidence_id},
+                )
         with pytest.raises(IntegrityError):
             with session_scope(factory) as session:
                 session.add(
@@ -511,6 +535,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         readiness_lock_acquired = Event()
         release_readiness_lock = Event()
         writer_started = Event()
+        correction_started = Event()
 
         def hold_readiness_lock() -> None:
             with session_scope(recreated_factory) as session:
@@ -540,18 +565,49 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
                     root_correlation_id=uuid4(),
                 ).version
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        def correct_preflight_evidence() -> str:
+            correction_started.set()
+            with session_scope(recreated_factory) as session:
+                original = session.get(EvidenceRecord, preflight_evidence_id)
+                assert original is not None
+                correction = capture_evidence(
+                    session,
+                    recreated_store,
+                    payload={
+                        "schema_version": 1,
+                        "repository_key": "boppuh/mathews",
+                        **preflight_report.to_dict(),
+                    },
+                    media_type="application/json",
+                    source_kind=EvidenceSourceKind.RESULT,
+                    evidence_type=original.evidence_type,
+                    origin="control-plane:correction",
+                    access_classification=EvidenceAccessClass.INTERNAL,
+                    retention_policy=EvidenceRetentionClass.REPOSITORY_LIFETIME,
+                    owner_id=original.owner_id,
+                    actor_id="postgres-test",
+                    root_correlation_id=original.root_correlation_id,
+                    correction_of_id=original.id,
+                )
+                return str(correction.record.id)
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
             holder = executor.submit(hold_readiness_lock)
             assert readiness_lock_acquired.wait(timeout=5)
             writer = executor.submit(create_next_configuration)
+            correction = executor.submit(correct_preflight_evidence)
             assert writer_started.wait(timeout=5)
+            assert correction_started.wait(timeout=5)
             try:
                 with pytest.raises(FutureTimeoutError):
                     writer.result(timeout=0.2)
+                with pytest.raises(FutureTimeoutError):
+                    correction.result(timeout=0.2)
             finally:
                 release_readiness_lock.set()
             holder.result(timeout=5)
             assert writer.result(timeout=5) == 2
+            assert correction.result(timeout=5)
 
         recreated_authentication_service.logout(authenticated)
         assert (

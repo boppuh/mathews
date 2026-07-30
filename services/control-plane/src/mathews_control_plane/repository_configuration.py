@@ -18,14 +18,22 @@ from mathews_configuration import (
 from mathews_configuration import (
     RepositoryPreflightReport as ValidatedRepositoryPreflightReport,
 )
-from sqlalchemy import Select, select
+from sqlalchemy import Select, exists, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from mathews_control_plane.artifacts import ArtifactStore, ArtifactStoreError
+from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.domain_models import EvidenceRecord
 from mathews_control_plane.domain_models import (
     RepositoryConfiguration as RepositoryConfigurationRecord,
+)
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceError,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+    load_evidence,
 )
 
 _PREFLIGHT_SCHEMA_VERSION = 1
@@ -33,8 +41,8 @@ _PREFLIGHT_EVIDENCE_TYPE = "repository-preflight"
 _PREFLIGHT_ORIGIN = "host-agent:repository-preflight"
 _PREFLIGHT_REQUEST_EVIDENCE_TYPE = "repository-preflight-request"
 _PREFLIGHT_REQUEST_ORIGIN = "control-plane:repository-preflight-request"
-_PREFLIGHT_ACCESS_CLASSIFICATION = "internal"
-_PREFLIGHT_RETENTION_POLICY = "repository-configuration"
+_PREFLIGHT_ACCESS_CLASSIFICATION = EvidenceAccessClass.INTERNAL
+_PREFLIGHT_RETENTION_POLICY = EvidenceRetentionClass.REPOSITORY_LIFETIME
 _DIGEST_PREFIX = "sha256:"
 _PREFLIGHT_KEYS = {
     "schema_version",
@@ -280,36 +288,35 @@ def begin_preflight_attempt(
 
     configuration_digest = repository_configuration_digest(configuration)
     attempt_id = uuid4()
-    request_payload = _canonical_json_bytes(
-        {
-            "schema_version": _PREFLIGHT_SCHEMA_VERSION,
-            "attempt_id": str(attempt_id),
-            "configuration_id": str(configuration.id),
-            "repository_key": configuration.repository_key,
-            "configuration_version": configuration.version,
-            "configuration_digest": configuration_digest,
-        }
-    )
-    artifact = artifact_store.put_bytes(request_payload)
-    evidence = EvidenceRecord(
-        id=attempt_id,
-        task_id=None,
-        validation_run_id=None,
+    request_payload = {
+        "schema_version": _PREFLIGHT_SCHEMA_VERSION,
+        "attempt_id": str(attempt_id),
+        "configuration_id": str(configuration.id),
+        "repository_key": configuration.repository_key,
+        "configuration_version": configuration.version,
+        "configuration_digest": configuration_digest,
+    }
+    captured = capture_evidence(
+        session,
+        artifact_store,
+        payload=request_payload,
+        media_type="application/json",
+        source_kind=EvidenceSourceKind.REQUEST,
         evidence_type=_PREFLIGHT_REQUEST_EVIDENCE_TYPE,
         origin=_PREFLIGHT_REQUEST_ORIGIN,
-        content_hash=artifact.address,
-        content_address=artifact.address,
-        captured_at=_captured_at(requested_at),
         access_classification=_PREFLIGHT_ACCESS_CLASSIFICATION,
         retention_policy=_PREFLIGHT_RETENTION_POLICY,
+        evidence_id=attempt_id,
+        task_id=None,
+        validation_run_id=None,
+        captured_at=_captured_at(requested_at),
         owner_id=_required_text(owner_id, field="owner id", maximum=255),
         actor_id=_required_text(actor_id, field="actor id", maximum=255),
         root_correlation_id=root_correlation_id,
         causation_id=causation_id,
         parent_correlation_id=parent_correlation_id,
     )
-    session.add(evidence)
-    session.flush()
+    evidence = captured.record
     configuration.preflight_evidence_id = evidence.id
     session.flush()
     return RepositoryPreflightAttempt(
@@ -318,7 +325,7 @@ def begin_preflight_attempt(
         repository_key=configuration.repository_key,
         configuration_version=configuration.version,
         configuration_digest=configuration_digest,
-        evidence_address=artifact.address,
+        evidence_address=captured.envelope_address,
     )
 
 
@@ -396,26 +403,26 @@ def capture_preflight_report(
             "preflight report does not match the active issued attempt"
         )
 
-    artifact = artifact_store.put_bytes(payload)
-    evidence = EvidenceRecord(
-        id=uuid4(),
-        task_id=None,
-        validation_run_id=None,
+    captured = capture_evidence(
+        session,
+        artifact_store,
+        payload=canonical_report,
+        media_type="application/json",
+        source_kind=EvidenceSourceKind.RESULT,
         evidence_type=_PREFLIGHT_EVIDENCE_TYPE,
         origin=_PREFLIGHT_ORIGIN,
-        content_hash=artifact.address,
-        content_address=artifact.address,
-        captured_at=_captured_at(captured_at),
         access_classification=_PREFLIGHT_ACCESS_CLASSIFICATION,
         retention_policy=_PREFLIGHT_RETENTION_POLICY,
+        task_id=None,
+        validation_run_id=None,
+        captured_at=_captured_at(captured_at),
         owner_id=_required_text(owner_id, field="owner id", maximum=255),
         actor_id=_required_text(actor_id, field="actor id", maximum=255),
         root_correlation_id=root_correlation_id,
         causation_id=causation_id,
         parent_correlation_id=parent_correlation_id,
     )
-    session.add(evidence)
-    session.flush()
+    evidence = captured.record
     configuration.preflight_evidence_id = evidence.id
     session.flush()
 
@@ -423,7 +430,7 @@ def capture_preflight_report(
         binding=binding,
         status=validated_report.status.value,
         evidence_id=evidence.id,
-        evidence_address=artifact.address,
+        evidence_address=captured.envelope_address,
     )
 
 
@@ -583,7 +590,11 @@ def _load_attached_evidence(
         raise RepositoryPreflightNotReadyError(
             "authoritative repository configuration has no preflight evidence"
         )
-    evidence = session.get(EvidenceRecord, configuration.preflight_evidence_id)
+    evidence = session.scalar(
+        select(EvidenceRecord)
+        .where(EvidenceRecord.id == configuration.preflight_evidence_id)
+        .with_for_update()
+    )
     valid_type_and_origin = evidence is not None and (
         (
             evidence.evidence_type == _PREFLIGHT_EVIDENCE_TYPE
@@ -601,17 +612,28 @@ def _load_attached_evidence(
         or evidence.validation_run_id is not None
         or evidence.correction_of_id is not None
         or not valid_type_and_origin
-        or evidence.access_classification != _PREFLIGHT_ACCESS_CLASSIFICATION
-        or evidence.retention_policy != _PREFLIGHT_RETENTION_POLICY
+        or evidence.access_classification != _PREFLIGHT_ACCESS_CLASSIFICATION.value
+        or evidence.retention_policy != _PREFLIGHT_RETENTION_POLICY.value
         or evidence.content_address is None
         or evidence.content_hash != evidence.content_address
+        or session.scalar(
+            select(exists().where(EvidenceRecord.correction_of_id == evidence.id))
+        )
     ):
         raise RepositoryPreflightNotReadyError(
             "attached repository preflight evidence is invalid"
         )
     try:
-        payload = artifact_store.get_bytes(evidence.content_address)
-    except (ArtifactStoreError, ValueError):
+        loaded = load_evidence(session, artifact_store, evidence)
+        expected_source = (
+            EvidenceSourceKind.RESULT.value
+            if evidence.evidence_type == _PREFLIGHT_EVIDENCE_TYPE
+            else EvidenceSourceKind.REQUEST.value
+        )
+        if loaded.envelope.get("source_kind") != expected_source:
+            raise EvidenceError("attached evidence source is invalid")
+        payload = loaded.content_bytes
+    except EvidenceError:
         raise RepositoryPreflightNotReadyError(
             "attached repository preflight artifact is unavailable or invalid"
         ) from None
