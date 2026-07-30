@@ -4,6 +4,14 @@ The host agent is a per-user, non-root LaunchAgent. It accepts exactly one
 length-prefixed authenticated request per connection on a private Unix domain
 socket. There is no TCP listener or generic command endpoint.
 
+Task worktrees live beneath the journal directory's private `workspaces`
+registry. The `workspace.create`, `workspace.inspect`, and `workspace.cleanup`
+operations require signed task-lease authority. Creation freezes the configured
+base ref to a commit SHA; cleanup revalidates the signed repository
+configuration and removes only a path with the exact task/configuration
+ownership record. Cancellation cleanup also requires a canonical cancellation
+identifier.
+
 ## Prerequisites
 
 1. Create the runtime directory with mode `0700`:

@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import RLock
 from types import TracebackType
 from typing import TypeVar, cast
@@ -38,6 +39,10 @@ from mathews_host_agent.journal import (
     OperationStatus,
 )
 from mathews_host_agent.preflight import RepositoryPreflightRunner
+from mathews_host_agent.workspaces import (
+    GitWorkspaceLifecycle,
+    WorkspaceLifecycleError,
+)
 
 HostOperationHandler = Callable[
     ["HostOperationContext", dict[str, JsonValue]],
@@ -382,8 +387,12 @@ class HostRequestDispatcher:
 def default_operation_registry(
     *,
     preflight: RepositoryPreflightRunner | None = None,
+    workspaces: GitWorkspaceLifecycle | None = None,
 ) -> HostOperationRegistry:
     runner = preflight or RepositoryPreflightRunner()
+    workspace_lifecycle = workspaces or GitWorkspaceLifecycle(
+        Path.home() / "Library" / "Application Support" / "Mathews" / "workspaces"
+    )
 
     def health(
         _context: HostOperationContext,
@@ -402,25 +411,62 @@ def default_operation_registry(
         authority = context.request.authority
         if not isinstance(authority, RepositoryHostAuthority):
             raise HostOperationRejected("AUTHORITY_NOT_ALLOWED")
-        raw_configuration = arguments["configuration"]
-        assert isinstance(raw_configuration, dict)
-        try:
-            configuration = RepositoryConfiguration.from_dict(
-                authority.configuration_id,
-                raw_configuration,
-            )
-        except RepositoryConfigurationError:
-            raise HostOperationRejected("INVALID_CONFIGURATION") from None
-        if (
-            configuration.repository_key != authority.repository_key
-            or configuration.digest != authority.configuration_digest
-        ):
-            raise HostOperationRejected("CONFIGURATION_BINDING_MISMATCH")
+        configuration = _configuration_argument(authority, arguments)
         attempt_id = _uuid_argument(arguments["attempt_id"])
         return cast(
             dict[str, JsonValue],
             runner.run(configuration, attempt_id=attempt_id).to_dict(),
         )
+
+    def workspace_create(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = context.perform_authorized_effect(
+                lambda: workspace_lifecycle.create(authority, configuration)
+            )
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def workspace_inspect(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = workspace_lifecycle.inspect(authority, configuration)
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def workspace_cleanup(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        cancellation_id = (
+            None
+            if arguments["cancellation_id"] is None
+            else _uuid_argument(arguments["cancellation_id"])
+        )
+        try:
+            result = context.perform_authorized_effect(
+                lambda: workspace_lifecycle.cleanup(
+                    authority,
+                    configuration,
+                    reason=cast(str, arguments["reason"]),
+                    cancellation_id=cancellation_id,
+                )
+            )
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
 
     def lease_probe(
         context: HostOperationContext,
@@ -482,6 +528,23 @@ def default_operation_registry(
                 validate=_validate_empty,
                 handle=lease_probe,
             ),
+            "workspace.cleanup": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_workspace_cleanup,
+                handle=workspace_cleanup,
+                mutates_host=True,
+            ),
+            "workspace.create": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_configuration,
+                handle=workspace_create,
+                mutates_host=True,
+            ),
+            "workspace.inspect": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_configuration,
+                handle=workspace_inspect,
+            ),
         }
     )
 
@@ -501,6 +564,62 @@ def _validate_preflight(
     if not isinstance(arguments["configuration"], dict):
         raise HostOperationRejected("INVALID_ARGUMENTS")
     return arguments
+
+
+def _validate_configuration(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"configuration"} or not isinstance(
+        arguments["configuration"], dict
+    ):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    return arguments
+
+
+def _validate_workspace_cleanup(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"configuration", "reason", "cancellation_id"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    if not isinstance(arguments["configuration"], dict):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    reason = arguments["reason"]
+    cancellation_id = arguments["cancellation_id"]
+    if reason not in {"CANCELLED", "COMPLETED"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    if reason == "CANCELLED":
+        _uuid_argument(cancellation_id)
+    elif cancellation_id is not None:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    return arguments
+
+
+def _configuration_argument(
+    authority: RepositoryHostAuthority | TaskLeaseHostAuthority,
+    arguments: dict[str, JsonValue],
+) -> RepositoryConfiguration:
+    raw_configuration = arguments["configuration"]
+    assert isinstance(raw_configuration, dict)
+    try:
+        configuration = RepositoryConfiguration.from_dict(
+            authority.configuration_id,
+            raw_configuration,
+        )
+    except RepositoryConfigurationError:
+        raise HostOperationRejected("INVALID_CONFIGURATION") from None
+    if (
+        configuration.repository_key != authority.repository_key
+        or configuration.digest != authority.configuration_digest
+    ):
+        raise HostOperationRejected("CONFIGURATION_BINDING_MISMATCH")
+    return configuration
+
+
+def _task_authority(context: HostOperationContext) -> TaskLeaseHostAuthority:
+    authority = context.request.authority
+    if not isinstance(authority, TaskLeaseHostAuthority):
+        raise HostOperationRejected("AUTHORITY_NOT_ALLOWED")
+    return authority
 
 
 def _validate_reconcile(

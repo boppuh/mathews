@@ -35,6 +35,7 @@ from mathews_host_agent.journal import (
     JournalResult,
 )
 from mathews_host_agent.preflight import RepositoryPreflightRunner
+from mathews_host_agent.workspaces import GitWorkspaceLifecycle
 
 NOW_MS = 1_800_000_000_000
 
@@ -636,6 +637,9 @@ def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
         "operation.reconcile",
         "repository.preflight",
         "task.lease_probe",
+        "workspace.cleanup",
+        "workspace.create",
+        "workspace.inspect",
     )
     assert all(
         forbidden not in capability
@@ -757,3 +761,174 @@ def test_repository_preflight_binds_typed_configuration_to_authority(
     }
     assert len(calls) == 1
     assert calls[0][1] == attempt_id
+
+
+def test_workspace_operations_are_configuration_bound_fenced_and_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    cancellation_id = uuid4()
+    calls: list[tuple[str, UUID]] = []
+
+    class FakeConfiguration:
+        repository_key = "boppuh/mathews"
+        digest = "sha256:" + "1" * 64
+
+    class FakeConfigurationFactory:
+        @staticmethod
+        def from_dict(
+            received_configuration_id: UUID,
+            value: object,
+        ) -> FakeConfiguration:
+            assert received_configuration_id == configuration_id
+            assert value == {"typed": "configuration"}
+            return FakeConfiguration()
+
+    class FakeWorkspaces:
+        def create(
+            self,
+            authority: TaskLeaseHostAuthority,
+            _configuration: object,
+        ) -> dict[str, object]:
+            calls.append(("create", authority.task_id))
+            return {
+                "task_id": str(authority.task_id),
+                "branch_name": f"mathews/{authority.task_id}",
+                "clean": True,
+            }
+
+        def inspect(
+            self,
+            authority: TaskLeaseHostAuthority,
+            _configuration: object,
+        ) -> dict[str, object]:
+            calls.append(("inspect", authority.task_id))
+            return {"task_id": str(authority.task_id), "clean": True}
+
+        def cleanup(
+            self,
+            authority: TaskLeaseHostAuthority,
+            _configuration: object,
+            *,
+            reason: str,
+            cancellation_id: UUID | None,
+        ) -> dict[str, object]:
+            calls.append(("cleanup", authority.task_id))
+            return {
+                "task_id": str(authority.task_id),
+                "state": "CLEANED",
+                "reason": reason,
+                "cancellation_id": (
+                    None if cancellation_id is None else str(cancellation_id)
+                ),
+            }
+
+    monkeypatch.setattr(
+        dispatch_module,
+        "RepositoryConfiguration",
+        FakeConfigurationFactory,
+    )
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=default_operation_registry(
+            workspaces=cast(GitWorkspaceLifecycle, FakeWorkspaces())
+        ),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+    authority = _task_authority()
+    requests = (
+        _request(
+            name="workspace.create",
+            authority=authority,
+            idempotency_key="workspace-create",
+            arguments={"configuration": {"typed": "configuration"}},
+        ),
+        _request(
+            name="workspace.inspect",
+            authority=authority,
+            idempotency_key="workspace-inspect",
+            arguments={"configuration": {"typed": "configuration"}},
+        ),
+        _request(
+            name="workspace.cleanup",
+            authority=authority,
+            idempotency_key="workspace-cleanup",
+            arguments={
+                "configuration": {"typed": "configuration"},
+                "reason": "CANCELLED",
+                "cancellation_id": str(cancellation_id),
+            },
+        ),
+    )
+
+    responses = tuple(
+        authenticator.verify_response(
+            dispatcher.dispatch(authenticator.sign_request(request))
+        )
+        for request in requests
+    )
+
+    assert [response.status for response in responses] == [
+        HostResponseStatus.OK,
+        HostResponseStatus.OK,
+        HostResponseStatus.OK,
+    ]
+    assert responses[0].execution_fencing_token == 1
+    assert responses[1].execution_fencing_token == 1
+    assert responses[2].result["cancellation_id"] == str(cancellation_id)
+    assert calls == [
+        ("create", authority.task_id),
+        ("inspect", authority.task_id),
+        ("cleanup", authority.task_id),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("reason", "cancellation_id"),
+    (
+        ("CANCELLED", None),
+        ("COMPLETED", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        ("UNKNOWN", None),
+    ),
+)
+def test_workspace_cleanup_rejects_inconsistent_reason_metadata(
+    tmp_path: Path,
+    reason: str,
+    cancellation_id: str | None,
+) -> None:
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=default_operation_registry(
+            workspaces=GitWorkspaceLifecycle((tmp_path / "workspaces").resolve())
+        ),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+    request = _request(
+        name="workspace.cleanup",
+        idempotency_key=f"cleanup-{reason.lower()}",
+        arguments={
+            "configuration": {},
+            "reason": reason,
+            "cancellation_id": cancellation_id,
+        },
+    )
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(request))
+    )
+
+    assert response.status is HostResponseStatus.REJECTED
+    assert response.code == "INVALID_ARGUMENTS"

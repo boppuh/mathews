@@ -29,6 +29,7 @@ from mathews_host_agent.launchd import (
 )
 from mathews_host_agent.secrets import KeychainProviderError, KeychainSecretProvider
 from mathews_host_agent.server import HostServerError, HostSocketServer, LocalSocketBinding
+from mathews_host_agent.workspaces import GitWorkspaceLifecycle
 
 logger = logging.getLogger("mathews.host_agent")
 _DEFAULT_AUTH_REFERENCE = "keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1"
@@ -73,7 +74,11 @@ def run(settings: HostAgentSettings) -> None:
     dispatcher = HostRequestDispatcher(
         authenticator=authenticator,
         journal=journal,
-        registry=default_operation_registry(),
+        registry=default_operation_registry(
+            workspaces=GitWorkspaceLifecycle(
+                settings.journal_path.parent / "workspaces"
+            )
+        ),
         host_id=settings.host_id,
     )
     server = HostSocketServer(dispatcher=dispatcher)

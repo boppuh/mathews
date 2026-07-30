@@ -90,7 +90,9 @@ def task_harness(tmp_path: Path) -> Iterator[TaskHarness]:
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     store = ArtifactStore(tmp_path / "artifacts")
-    clock = MutableClock(datetime(2026, 7, 30, 12, 0, tzinfo=UTC))
+    # HTTPX's cookie jar evaluates Expires against the real wall clock, so keep
+    # the service clock aligned rather than letting this fixture age into expiry.
+    clock = MutableClock(datetime.now(UTC).replace(microsecond=0))
     authentication_service = AuthenticationService(factory, clock=clock)
     task_service = TaskService(factory, store, clock=clock)
     app = create_app(
@@ -208,7 +210,10 @@ def test_create_persists_redacted_task_evidence_and_intake_event(
         "repository": "boppuh/mathews",
         "base_revision": _BASE_SHA.lower(),
         "created_at": created["created_at"],
-        "last_activity_at": "2026-07-30T12:00:00Z",
+        "last_activity_at": task_harness.clock.now.isoformat().replace(
+            "+00:00",
+            "Z",
+        ),
         "blockers": [],
         "cockpit_path": f"/tasks/{task_id}",
     }
