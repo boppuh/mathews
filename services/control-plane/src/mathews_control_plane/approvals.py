@@ -1094,6 +1094,13 @@ class ApprovalService:
                         )
                     )
                 )
+                if (
+                    len(combined_evidence_ids)
+                    > MAX_APPROVAL_EVIDENCE_REFERENCES
+                ):
+                    raise InvalidApprovalError(
+                        "combined approval evidence is too large"
+                    )
                 fingerprint = _decision_fingerprint(
                     request_id=request.id,
                     decision_id=decision_id,
@@ -1364,6 +1371,11 @@ class ApprovalService:
             brief_decision.actor_id = actor_id
             brief_decision.updated_at = decided_at
         elif request_type is ApprovalRequestType.REVIEW_RULE:
+            if decision not in {
+                ApprovalDecision.APPROVE,
+                ApprovalDecision.REJECT,
+            }:
+                return
             candidate = session.scalar(
                 select(RuleCandidate)
                 .where(RuleCandidate.id == request.subject_id)

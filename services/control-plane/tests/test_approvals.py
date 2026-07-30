@@ -610,6 +610,39 @@ def test_rule_candidate_approval_is_non_executable_until_recorded(
     assert candidate.status is RuleCandidateStatus.APPROVED
 
 
+def test_cancelling_rule_review_does_not_reject_candidate(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+
+    result = service.decide(
+        request_id,
+        decision_id=uuid4(),
+        decision=ApprovalDecision.CANCEL,
+        actor_id="local-user",
+    )
+
+    assert result.task_state is TaskState.CANCELLED
+    with approval_harness.factory() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+    assert candidate is not None
+    assert candidate.status is RuleCandidateStatus.EVALUATED
+
+
 def test_expiry_is_audited_and_fails_instead_of_completing(
     approval_harness: ApprovalHarness,
 ) -> None:
@@ -684,6 +717,41 @@ def test_expiry_reconciliation_skips_uninitialized_legacy_rows(
         )
 
     assert _service(approval_harness).expire_due() == ()
+    with approval_harness.factory() as session:
+        request = session.get(ApprovalRequest, request_id)
+    assert request is not None
+    assert request.status is ApprovalStatus.PENDING
+    assert request.decision_id is None
+
+
+def test_decision_rejects_request_and_decision_evidence_over_combined_cap(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, _subject_id = _create_task(
+        approval_harness,
+        state=TaskState.IMPLEMENTING,
+    )
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.IMPLEMENTING,
+        request_type=ApprovalRequestType.UNSAFE_ACTION,
+    )
+
+    with pytest.raises(
+        InvalidApprovalError,
+        match="combined approval evidence",
+    ):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.DENY,
+            actor_id="local-user",
+            evidence_ids=tuple(uuid4() for _ in range(100)),
+        )
+
     with approval_harness.factory() as session:
         request = session.get(ApprovalRequest, request_id)
     assert request is not None
