@@ -447,9 +447,9 @@ def test_migrated_task_lifecycle_requires_matching_append_only_audit(
     reference_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     correlation_id = "ffffffffffffffffffffffffffffffff"
     global_evidence_id = "abababababababababababababababab"
-    escalation_event_id = "acacacacacacacacacacacacacacac"
-    escalation_transition_id = "adadadadadadadadadadadadadadad"
-    escalation_reference_id = "aeaeaeaeaeaeaeaeaeaeaeaeaeaeae"
+    escalation_event_id = "ac" * 16
+    escalation_transition_id = "ad" * 16
+    escalation_reference_id = "ae" * 16
     illegal_event_id = "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc"
     illegal_transition_id = "bdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbd"
     illegal_reference_id = "bebebebebebebebebebebebebebebebe"
@@ -752,7 +752,7 @@ def test_migrated_task_lifecycle_requires_matching_append_only_audit(
             )
         with pytest.raises(
             IntegrityError,
-            match="lifecycle projection|matching audit",
+            match=r"lifecycle projection|matching audit",
         ):
             with engine.begin() as connection:
                 connection.execute(
@@ -831,7 +831,7 @@ def test_migrated_task_lifecycle_requires_matching_append_only_audit(
             )
         with pytest.raises(
             IntegrityError,
-            match="illegal task lifecycle edge|matching audit",
+            match=r"illegal task lifecycle edge|matching audit",
         ):
             with engine.begin() as connection:
                 connection.execute(

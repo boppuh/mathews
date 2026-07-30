@@ -33,7 +33,14 @@ from mathews_control_plane.domain_models import (
     TaskTerminalOutcome,
     ValidationContract,
 )
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+)
 from mathews_control_plane.task_state_machine import (
+    MAX_TRANSITION_EVIDENCE_REFERENCES,
     ClosedTaskTransitionGateEvaluator,
     DraftPrGateFacts,
     InvalidTaskTransitionError,
@@ -604,6 +611,82 @@ def test_transition_service_is_idempotent_and_writes_typed_provenance(
     assert evaluator.policy_id == active_policy.id
     assert event.actor_id == "control-plane"
     assert [reference.evidence_id for reference in references] == [evidence_id]
+    assert event_count == 1
+
+
+def test_transition_evidence_reference_limits_and_order_are_enforced(
+    state_machine_harness: StateMachineHarness,
+) -> None:
+    task_id, first_evidence_id = _create_task_policy_and_evidence(
+        state_machine_harness
+    )
+    with state_machine_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        second = capture_evidence(
+            session,
+            state_machine_harness.store,
+            payload={"status": "second"},
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.RESULT,
+            evidence_type="test-result",
+            origin="validator",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+            owner_id=task.owner_id,
+            actor_id="validator",
+            root_correlation_id=task.root_correlation_id,
+            task_id=task.id,
+            captured_at=_NOW,
+        )
+        second_evidence_id = second.record.id
+
+    service = _service(state_machine_harness)
+    for evidence_ids in (
+        (),
+        (first_evidence_id, first_evidence_id),
+        tuple(uuid4() for _ in range(MAX_TRANSITION_EVIDENCE_REFERENCES + 1)),
+    ):
+        with pytest.raises(
+            InvalidTaskTransitionError,
+            match="evidence references are invalid",
+        ):
+            service.transition(
+                task_id,
+                transition_id=uuid4(),
+                expected_state=TaskState.INTAKE,
+                kind=TaskTransitionKind.START_BRIEFING,
+                reason_code="INVALID_EVIDENCE_REFERENCES",
+                evidence_ids=evidence_ids,
+            )
+
+    result = service.transition(
+        task_id,
+        transition_id=uuid4(),
+        expected_state=TaskState.INTAKE,
+        kind=TaskTransitionKind.START_BRIEFING,
+        reason_code="ORDERED_EVIDENCE_REFERENCES",
+        evidence_ids=(second_evidence_id, first_evidence_id),
+    )
+    with state_machine_harness.factory() as session:
+        references = list(
+            session.scalars(
+                select(TaskEventEvidenceReference)
+                .where(TaskEventEvidenceReference.task_event_id == result.event_id)
+                .order_by(TaskEventEvidenceReference.position)
+            )
+        )
+        event_count = session.scalar(
+            select(func.count())
+            .select_from(TaskEvent)
+            .where(TaskEvent.task_id == task_id)
+        )
+
+    assert [reference.evidence_id for reference in references] == [
+        second_evidence_id,
+        first_evidence_id,
+    ]
+    assert [reference.position for reference in references] == [1, 2]
     assert event_count == 1
 
 

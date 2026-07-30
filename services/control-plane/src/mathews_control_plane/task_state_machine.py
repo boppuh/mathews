@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -409,13 +409,15 @@ def evaluate_task_transition(
     gate_head: str | None = None
     retry_delta = 1 if kind is TaskTransitionKind.BEGIN_REPAIR else 0
     if kind is TaskTransitionKind.OPEN_VERIFIED_DRAFT_PR:
-        assert guards.draft_pr is not None
+        if guards.draft_pr is None:
+            raise InvalidTaskTransitionError("task transition is not allowed")
         gate_head = _verified_draft_head(guards.draft_pr)
     elif kind in {
         TaskTransitionKind.MARK_MERGE_READY,
         TaskTransitionKind.ACKNOWLEDGE_HANDOFF,
     }:
-        assert guards.readiness is not None
+        if guards.readiness is None:
+            raise InvalidTaskTransitionError("task transition is not allowed")
         gate_head = _readiness_head(snapshot, guards.readiness)
 
     outcome = (
@@ -592,6 +594,22 @@ def _verify_transition_evidence(
     records_by_id = {record.id: record for record in records}
     if len(records_by_id) != len(evidence_ids):
         raise TaskTransitionNotFoundError("transition evidence is unavailable")
+    correction_source_ids = {
+        correction_of_id
+        for correction_of_id in session.scalars(
+            select(EvidenceRecord.correction_of_id).where(
+                EvidenceRecord.correction_of_id.in_(evidence_ids)
+            )
+        )
+        if correction_of_id is not None
+    }
+    deletion_requested_ids = set(
+        session.scalars(
+            select(EvidenceDeletionRequest.evidence_id).where(
+                EvidenceDeletionRequest.evidence_id.in_(evidence_ids)
+            )
+        )
+    )
     ordered: list[EvidenceRecord] = []
     for evidence_id in evidence_ids:
         record = records_by_id[evidence_id]
@@ -599,18 +617,8 @@ def _verify_transition_evidence(
             record.task_id != task.id
             or record.owner_id != task.owner_id
             or record.root_correlation_id != task.root_correlation_id
-            or session.scalar(
-                select(
-                    exists().where(EvidenceRecord.correction_of_id == record.id)
-                )
-            )
-            or session.scalar(
-                select(
-                    exists().where(
-                        EvidenceDeletionRequest.evidence_id == record.id
-                    )
-                )
-            )
+            or record.id in correction_source_ids
+            or record.id in deletion_requested_ids
         ):
             raise TaskTransitionNotFoundError("transition evidence is unavailable")
         try:
