@@ -38,6 +38,11 @@ from mathews_control_plane.reliability import (
     StartupRecoveryService,
 )
 from mathews_control_plane.settings import Settings, settings
+from mathews_control_plane.tasks import (
+    TaskBodyLimitMiddleware,
+    TaskService,
+    create_task_router,
+)
 
 
 class HealthResponse(BaseModel):
@@ -54,6 +59,7 @@ def create_app(
     session_factory: SessionFactory | None = None,
     authentication_service: AuthenticationService | None = None,
     evidence_service: EvidenceService | None = None,
+    task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
     startup_recovery_service: StartupRecoveryService | None = None,
     startup_recovery_adapters: Mapping[
@@ -86,6 +92,11 @@ def create_app(
     artifact_store = ArtifactStore.from_settings(current_settings)
     if evidence_service is None:
         evidence_service = EvidenceService(
+            session_factory,
+            artifact_store,
+        )
+    if task_service is None:
+        task_service = TaskService(
             session_factory,
             artifact_store,
         )
@@ -146,10 +157,12 @@ def create_app(
         application.state.database_engine = database_engine
     application.state.authentication_service = authentication_service
     application.state.evidence_service = evidence_service
+    application.state.task_service = task_service
     application.state.approval_service = approval_service
     application.state.startup_recovery_service = startup_recovery_service
     application.include_router(create_authentication_router(authentication_service))
     application.include_router(create_evidence_router(evidence_service))
+    application.include_router(create_task_router(task_service))
 
     @application.exception_handler(RequestValidationError)
     async def sanitized_validation_error(
@@ -180,6 +193,7 @@ def create_app(
     )
     application.add_middleware(AuthenticationBodyLimitMiddleware)
     application.add_middleware(EvidenceBodyLimitMiddleware)
+    application.add_middleware(TaskBodyLimitMiddleware)
     # CORS is the outer layer so even authentication failures carry the exact
     # trusted-origin response headers expected by browser clients.
     application.add_middleware(
