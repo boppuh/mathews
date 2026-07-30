@@ -278,7 +278,10 @@ def _blockers_by_task(
     )
     outage_counts = _count_rows(
         session.execute(
-            select(BackgroundJob.task_id, func.count())
+            select(
+                BackgroundJob.task_id,
+                func.count(func.distinct(BackgroundJob.id)),
+            )
             .join(
                 DependencyOutageAttempt,
                 DependencyOutageAttempt.job_id == BackgroundJob.id,
@@ -342,7 +345,11 @@ def _blockers_by_task(
             task_blockers.append(
                 TaskBlockerResponse(
                     code="RECONCILIATION_REQUIRED",
-                    label="Reconciliation required",
+                    label=(
+                        "Reconciliation required"
+                        if reconciliation_count == 1
+                        else "Reconciliations required"
+                    ),
                     count=reconciliation_count,
                 )
             )

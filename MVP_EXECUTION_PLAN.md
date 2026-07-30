@@ -16,8 +16,8 @@ complete here unless its backlog definition of done is satisfied on `main`.
 - Completed: `0.1` application workspace, `0.2` configuration and secrets,
   `0.3` durable local infrastructure, `0.4` local authentication, `1.1` domain
   schema, `1.2` minimal evidence safety foundation, `1.3` audited task state
-  machine, `1.4` leased durable background-job loop, and `1.5` approvals and
-  resumable escalation, `1.6` cancellation and dependency-outage handling,
+  machine, `1.4` leased durable background-job loop, `1.5` approvals and
+  resumable escalation, and `1.6` cancellation and dependency-outage handling,
   plus `3.1` validated repository configuration and read-only preflight, `3.2`
   authenticated macOS host agent, `5.1` deterministic simulator-flow
   contracts, and `6.1` least-privilege GitHub App authentication.

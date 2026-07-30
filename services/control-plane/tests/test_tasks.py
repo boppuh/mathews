@@ -265,6 +265,19 @@ def test_list_orders_recent_activity_and_projects_durable_blockers(
                 root_correlation_id=first_task.root_correlation_id,
             )
         )
+        session.add(
+            ReconciliationTarget(
+                task_id=first_id,
+                kind=ReconciliationTargetKind.BRANCH_HEAD,
+                target_key=f"task:{first_id}:branch",
+                expected_payload={"head": "d" * 40},
+                expected_fingerprint="e" * 64,
+                status=ReconciliationStatus.PENDING,
+                owner_id=first_task.owner_id,
+                actor_id="control-plane",
+                root_correlation_id=first_task.root_correlation_id,
+            )
+        )
 
     response = task_harness.client.get("/api/tasks")
 
@@ -281,10 +294,57 @@ def test_list_orders_recent_activity_and_projects_durable_blockers(
         },
         {
             "code": "RECONCILIATION_REQUIRED",
-            "label": "Reconciliation required",
-            "count": 1,
+            "label": "Reconciliations required",
+            "count": 2,
         },
     ]
+
+
+def test_create_redacts_summary_before_task_event_and_list_projection(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    raw_email = "alice@example.com"
+    raw_token = "raw-task-intake-token"
+    raw_request = (
+        f"Email {raw_email} after the fix. "
+        f"Authorization: Bearer {raw_token}"
+    )
+
+    created = _create(task_harness, csrf_token, request=raw_request)
+    task_id = UUID(str(created["id"]))
+    summary = str(created["summary"])
+    assert raw_email not in summary
+    assert raw_token not in summary
+    assert "[REDACTED:EMAIL]" in summary
+    assert "[REDACTED:AUTHORIZATION]" in summary
+
+    listed = task_harness.client.get("/api/tasks")
+    assert listed.status_code == 200
+    listed_summary = listed.json()["tasks"][0]["summary"]
+    assert listed_summary == summary
+    assert raw_email not in listed.text
+    assert raw_token not in listed.text
+
+    with task_harness.factory() as session:
+        task = session.get(Task, task_id)
+        event = session.scalar(
+            select(TaskEvent).where(TaskEvent.task_id == task_id)
+        )
+        assert task is not None
+        evidence = session.get(
+            EvidenceRecord,
+            UUID(task.raw_request.removeprefix("evidence://")),
+        )
+        assert evidence is not None
+        loaded = load_evidence(session, task_harness.store, evidence)
+
+    assert event is not None
+    assert event.payload["summary"] == summary
+    assert raw_email not in str(event.payload)
+    assert raw_token not in str(event.payload)
+    assert raw_email not in str(loaded.content)
+    assert raw_token not in str(loaded.content)
 
 
 @pytest.mark.parametrize(

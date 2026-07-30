@@ -590,9 +590,13 @@ section {
 
 .task-card:hover,
 .task-card:focus-visible {
-  outline: none;
   background: rgb(112 225 200 / 4%);
   box-shadow: inset 3px 0 var(--accent);
+}
+
+.task-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .task-card-topline,
