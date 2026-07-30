@@ -73,3 +73,29 @@ export const taskClient = {
     return parseTaskSummary(await response.json());
   },
 };
+
+export type TaskListClient = Pick<typeof taskClient, "list">;
+
+export class LatestTaskListLoader {
+  private generation = 0;
+
+  invalidate(): void {
+    this.generation += 1;
+  }
+
+  async load(
+    signal?: AbortSignal,
+    client: TaskListClient = taskClient,
+  ): Promise<TaskListResponse | undefined> {
+    const requestGeneration = ++this.generation;
+    try {
+      const result = await client.list(signal);
+      return requestGeneration === this.generation ? result : undefined;
+    } catch (error) {
+      if (requestGeneration !== this.generation) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+}

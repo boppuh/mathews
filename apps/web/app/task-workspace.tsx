@@ -3,10 +3,10 @@
 import type { CreateTaskRequest, TaskSummary } from "@mathews/contracts";
 import Link from "next/link";
 import type { FormEvent } from "react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { stageLabel } from "../lib/stages";
-import { TaskRequestError, taskClient } from "../lib/task-client";
+import { LatestTaskListLoader, TaskRequestError, taskClient } from "../lib/task-client";
 import { mergeLoadedTasks, shortRevision } from "../lib/tasks";
 
 type TaskListState =
@@ -38,11 +38,18 @@ export function TaskWorkspace() {
   const [request, setRequest] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const taskListLoader = useRef<LatestTaskListLoader | null>(null);
+  if (taskListLoader.current === null) {
+    taskListLoader.current = new LatestTaskListLoader();
+  }
 
   const loadTasks = useCallback(async (signal?: AbortSignal) => {
     setListState((current) => (current.status === "ready" ? current : { status: "loading" }));
     try {
-      const result = await taskClient.list(signal);
+      const result = await taskListLoader.current?.load(signal);
+      if (!result) {
+        return;
+      }
       setListState((current) => {
         if (current.status !== "ready") {
           return { status: "ready", tasks: result.tasks };
@@ -84,6 +91,7 @@ export function TaskWorkspace() {
     setCreateError(null);
     try {
       const created = await taskClient.create(body);
+      taskListLoader.current?.invalidate();
       setListState((current) => ({
         status: "ready",
         tasks:

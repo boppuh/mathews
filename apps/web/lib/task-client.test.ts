@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { TaskRequestError, taskClient } from "./task-client";
+import { LatestTaskListLoader, TaskRequestError, taskClient } from "./task-client";
 
 const task = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -101,5 +101,34 @@ describe("taskClient", () => {
       }),
     ).rejects.toBeInstanceOf(TaskRequestError);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("LatestTaskListLoader", () => {
+  it("drops an older failure after a successful create invalidates it", async () => {
+    let rejectOlder: ((error: Error) => void) | undefined;
+    const olderRequest = new Promise<never>((_resolve, reject) => {
+      rejectOlder = reject;
+    });
+    const loader = new LatestTaskListLoader();
+    const result = loader.load(undefined, {
+      list: vi.fn().mockReturnValue(olderRequest),
+    });
+
+    loader.invalidate();
+    rejectOlder?.(new TaskRequestError("stale failure", 503));
+
+    await expect(result).resolves.toBeUndefined();
+  });
+
+  it("surfaces the newest list failure", async () => {
+    const error = new TaskRequestError("current failure", 503);
+    const loader = new LatestTaskListLoader();
+
+    await expect(
+      loader.load(undefined, {
+        list: vi.fn().mockRejectedValue(error),
+      }),
+    ).rejects.toBe(error);
   });
 });
