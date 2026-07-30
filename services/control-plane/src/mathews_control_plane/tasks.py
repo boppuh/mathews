@@ -25,6 +25,7 @@ from mathews_control_plane.domain_models import (
     ApprovalStatus,
     BackgroundJob,
     DependencyOutageAttempt,
+    EvidenceRecord,
     ReconciliationStatus,
     ReconciliationTarget,
     Task,
@@ -120,6 +121,60 @@ class TaskSummaryResponse(BaseModel):
 
 class TaskListResponse(BaseModel):
     tasks: list[TaskSummaryResponse]
+
+
+class TaskStateContextResponse(BaseModel):
+    kind: Literal[
+        "ACTIVE",
+        "RESUMABLE_ESCALATION",
+        "TERMINAL",
+        "VERIFIED_DRAFT_PR",
+        "HUMAN_MERGE_READY",
+        "AUTOMATION_HANDED_OFF",
+    ]
+    label: str
+    detail: str
+    resume_state: TaskState | None = None
+
+
+class TaskEventResponse(BaseModel):
+    id: UUID
+    sequence: int = Field(ge=1)
+    kind: Literal["CREATED", "STATE_TRANSITION", "APPROVAL", "ACTIVITY"]
+    summary: str
+    occurred_at: datetime
+    from_state: TaskState | None = None
+    to_state: TaskState | None = None
+    evidence_count: int = Field(ge=0)
+
+
+class TaskEvidenceResponse(BaseModel):
+    id: UUID
+    evidence_type: str
+    captured_at: datetime
+    status: Literal["AVAILABLE", "CORRECTION", "DELETED"]
+
+
+class TaskApprovalResponse(BaseModel):
+    id: UUID
+    type_label: str
+    status: ApprovalStatus
+    requesting_state: TaskState
+    resume_state: TaskState | None = None
+    created_at: datetime
+    expires_at: datetime | None = None
+
+
+class TaskCockpitResponse(BaseModel):
+    task: TaskSummaryResponse
+    state_context: TaskStateContextResponse
+    events: list[TaskEventResponse]
+    evidence: list[TaskEvidenceResponse]
+    approvals: list[TaskApprovalResponse]
+
+
+class TaskNotFoundError(RuntimeError):
+    """The task is absent or outside the authenticated owner's scope."""
 
 
 class TaskService:
@@ -230,6 +285,79 @@ class TaskService:
                 ]
             )
 
+    def detail(
+        self,
+        task_id: UUID,
+        authentication: AuthenticatedSession,
+    ) -> TaskCockpitResponse:
+        owner_id = _principal(authentication)
+        with self._factory() as session:
+            task = session.scalar(
+                select(Task).where(
+                    Task.id == task_id,
+                    Task.owner_id == owner_id,
+                )
+            )
+            if task is None:
+                raise TaskNotFoundError("task is unavailable")
+
+            events = tuple(
+                session.scalars(
+                    select(TaskEvent)
+                    .where(
+                        TaskEvent.task_id == task.id,
+                        TaskEvent.owner_id == owner_id,
+                    )
+                    .order_by(TaskEvent.sequence, TaskEvent.id)
+                )
+            )
+            evidence = tuple(
+                session.scalars(
+                    select(EvidenceRecord)
+                    .where(
+                        EvidenceRecord.task_id == task.id,
+                        EvidenceRecord.owner_id == owner_id,
+                    )
+                    .order_by(EvidenceRecord.captured_at, EvidenceRecord.id)
+                )
+            )
+            approvals = tuple(
+                session.scalars(
+                    select(ApprovalRequest)
+                    .where(
+                        ApprovalRequest.task_id == task.id,
+                        ApprovalRequest.owner_id == owner_id,
+                    )
+                    .order_by(ApprovalRequest.created_at.desc(), ApprovalRequest.id.desc())
+                )
+            )
+            reference_counts = _event_evidence_counts(
+                session,
+                tuple(event.id for event in events),
+            )
+            blockers = _blockers_by_task(session, (task.id,)).get(task.id, ())
+            last_activity_at = max(
+                (event.occurred_at for event in events),
+                default=task.updated_at,
+            )
+            return TaskCockpitResponse(
+                task=_task_response(
+                    task,
+                    last_activity_at=last_activity_at,
+                    blockers=blockers,
+                ),
+                state_context=_task_state_context(task),
+                events=[
+                    _event_response(
+                        event,
+                        evidence_count=reference_counts.get(event.id, 0),
+                    )
+                    for event in events
+                ],
+                evidence=[_evidence_response(record) for record in evidence],
+                approvals=[_approval_response(request) for request in approvals],
+            )
+
 
 def _principal(authentication: AuthenticatedSession) -> str:
     if authentication.user_id != _LOCAL_USER_ID:
@@ -265,6 +393,24 @@ def _count_rows(
         for task_id, count in rows
         if task_id is not None
     }
+
+
+def _event_evidence_counts(
+    session: Session,
+    event_ids: Sequence[UUID],
+) -> dict[UUID, int]:
+    if not event_ids:
+        return {}
+    return _count_rows(
+        session.execute(
+            select(
+                TaskEventEvidenceReference.task_event_id,
+                func.count(),
+            )
+            .where(TaskEventEvidenceReference.task_event_id.in_(event_ids))
+            .group_by(TaskEventEvidenceReference.task_event_id)
+        ).tuples().all()
+    )
 
 
 def _blockers_by_task(
@@ -366,6 +512,181 @@ def _blockers_by_task(
     return blockers
 
 
+def _task_state_context(task: Task) -> TaskStateContextResponse:
+    state = TaskState(task.state)
+    if state is TaskState.ESCALATED:
+        resume_state = (
+            None
+            if task.escalation_resume_state is None
+            else TaskState(task.escalation_resume_state)
+        )
+        return TaskStateContextResponse(
+            kind="RESUMABLE_ESCALATION",
+            label="Resumable escalation",
+            detail=(
+                "Automation is paused for a human decision and can resume from "
+                f"{_state_label(resume_state)}."
+                if resume_state is not None
+                else "Automation is paused for a human decision before it can resume."
+            ),
+            resume_state=resume_state,
+        )
+    if state is TaskState.FAILED:
+        return TaskStateContextResponse(
+            kind="TERMINAL",
+            label="Terminal failure",
+            detail="Automation ended in failure. This task cannot resume.",
+        )
+    if state is TaskState.CANCELLED:
+        return TaskStateContextResponse(
+            kind="TERMINAL",
+            label="Terminal cancellation",
+            detail="Automation was cancelled. Late results cannot restart this task.",
+        )
+    if state is TaskState.PR_ACTIVE:
+        return TaskStateContextResponse(
+            kind="VERIFIED_DRAFT_PR",
+            label="Verified draft PR active",
+            detail=(
+                "The draft pull request is bound to a verified candidate head; "
+                "it is not yet ready for human merge."
+            ),
+        )
+    if state is TaskState.READY_FOR_HUMAN_MERGE:
+        return TaskStateContextResponse(
+            kind="HUMAN_MERGE_READY",
+            label="Ready for human merge",
+            detail=(
+                "The exact pull-request head passed its readiness gates. "
+                "A human merge decision is still required."
+            ),
+        )
+    if state is TaskState.HANDED_OFF:
+        return TaskStateContextResponse(
+            kind="AUTOMATION_HANDED_OFF",
+            label="Automation handed off",
+            detail=(
+                "Automation responsibility has ended. Handoff does not mean "
+                "the change was merged, delivered, or released."
+            ),
+        )
+    return TaskStateContextResponse(
+        kind="ACTIVE",
+        label=_state_label(state),
+        detail={
+            TaskState.INTAKE: "The request is captured and waiting for briefing.",
+            TaskState.BRIEFING: "The implementation brief is being prepared.",
+            TaskState.BRIEF_PENDING_APPROVAL: (
+                "The exact brief is waiting for a human decision."
+            ),
+            TaskState.IMPLEMENTING: "Approved implementation work is in progress.",
+            TaskState.VALIDATING: "The current candidate is being validated.",
+            TaskState.REPAIRING: "A bounded repair is in progress before revalidation.",
+        }[state],
+    )
+
+
+def _state_label(state: TaskState) -> str:
+    acronyms = {"PR"}
+    return " ".join(
+        part if part in acronyms else part.title()
+        for part in state.value.split("_")
+    )
+
+
+def _event_response(
+    event: TaskEvent,
+    *,
+    evidence_count: int,
+) -> TaskEventResponse:
+    from_state = (
+        None
+        if event.transition_from_state is None
+        else TaskState(event.transition_from_state)
+    )
+    to_state = (
+        None
+        if event.transition_to_state is None
+        else TaskState(event.transition_to_state)
+    )
+    if event.event_type == TASK_INTAKE_EVENT_TYPE:
+        kind: Literal["CREATED", "STATE_TRANSITION", "APPROVAL", "ACTIVITY"] = (
+            "CREATED"
+        )
+        summary = "Task request captured."
+    elif event.event_type == "TASK_STATE_TRANSITION":
+        kind = "STATE_TRANSITION"
+        summary = (
+            f"State changed from {_state_label(from_state)} "
+            f"to {_state_label(to_state)}."
+            if from_state is not None and to_state is not None
+            else "Task state changed."
+        )
+    elif event.event_type == "APPROVAL_REQUESTED":
+        kind = "APPROVAL"
+        summary = "Human approval requested."
+    elif event.event_type == "APPROVAL_EXPIRED":
+        kind = "APPROVAL"
+        summary = "An approval request expired."
+    elif event.event_type == "APPROVAL_DECIDED":
+        kind = "APPROVAL"
+        summary = "A human approval decision was recorded."
+    else:
+        kind = "ACTIVITY"
+        summary = "Task activity was recorded."
+    return TaskEventResponse(
+        id=event.id,
+        sequence=event.sequence,
+        kind=kind,
+        summary=summary,
+        occurred_at=_as_utc(event.occurred_at),
+        from_state=from_state,
+        to_state=to_state,
+        evidence_count=evidence_count,
+    )
+
+
+def _evidence_response(record: EvidenceRecord) -> TaskEvidenceResponse:
+    status_value: Literal["AVAILABLE", "CORRECTION", "DELETED"]
+    if record.deleted_at is not None:
+        status_value = "DELETED"
+    elif record.correction_of_id is not None:
+        status_value = "CORRECTION"
+    else:
+        status_value = "AVAILABLE"
+    return TaskEvidenceResponse(
+        id=record.id,
+        evidence_type=record.evidence_type,
+        captured_at=_as_utc(record.captured_at),
+        status=status_value,
+    )
+
+
+def _approval_response(request: ApprovalRequest) -> TaskApprovalResponse:
+    labels = {
+        "BRIEF": "Brief approval",
+        "UNSAFE_ACTION": "Unsafe action approval",
+        "RETRY_LIMIT": "Retry-limit decision",
+        "REVIEW_CONFLICT": "Review conflict decision",
+        "REVIEW_RULE": "Review rule decision",
+    }
+    return TaskApprovalResponse(
+        id=request.id,
+        type_label=labels.get(request.request_type, "Human decision"),
+        status=ApprovalStatus(request.status),
+        requesting_state=TaskState(request.requesting_state),
+        resume_state=(
+            None
+            if request.resume_state is None
+            else TaskState(request.resume_state)
+        ),
+        created_at=_as_utc(request.created_at),
+        expires_at=(
+            None if request.expires_at is None else _as_utc(request.expires_at)
+        ),
+    )
+
+
 def _task_response(
     task: Task,
     *,
@@ -378,8 +699,8 @@ def _task_response(
         state=TaskState(task.state),
         repository=task.repository,
         base_revision=task.base_revision,
-        created_at=task.created_at,
-        last_activity_at=last_activity_at,
+        created_at=_as_utc(task.created_at),
+        last_activity_at=_as_utc(last_activity_at),
         blockers=list(blockers),
         cockpit_path=f"/tasks/{task.id}",
     )
@@ -486,6 +807,21 @@ def create_task_router(service: TaskService) -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="tasks unavailable",
+            ) from None
+
+    @router.get("/{task_id}", response_model=TaskCockpitResponse)
+    def task_detail(
+        task_id: UUID,
+        authentication: AuthenticatedTaskSession,
+        response: Response,
+    ) -> TaskCockpitResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return service.detail(task_id, authentication)
+        except (TaskAccessError, TaskNotFoundError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="task unavailable",
             ) from None
 
     @router.post(

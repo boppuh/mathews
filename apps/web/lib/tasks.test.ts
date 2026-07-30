@@ -1,7 +1,13 @@
 import type { TaskSummary } from "@mathews/contracts";
 import { describe, expect, it } from "vitest";
 
-import { mergeLoadedTasks, parseTaskList, parseTaskSummary, shortRevision } from "./tasks";
+import {
+  mergeLoadedTasks,
+  parseTaskCockpit,
+  parseTaskList,
+  parseTaskSummary,
+  shortRevision,
+} from "./tasks";
 
 const task = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -41,6 +47,71 @@ describe("task response parsing", () => {
   it("rejects malformed list envelopes", () => {
     expect(() => parseTaskList([])).toThrow("invalid task list");
     expect(() => parseTaskList({ tasks: "not-an-array" })).toThrow("invalid task list");
+  });
+});
+
+describe("task cockpit parsing", () => {
+  const cockpit = {
+    task,
+    state_context: {
+      kind: "ACTIVE",
+      label: "Intake",
+      detail: "The request is captured and waiting for briefing.",
+      resume_state: null,
+    },
+    events: [
+      {
+        id: "22222222-2222-4222-8222-222222222222",
+        sequence: 1,
+        kind: "CREATED",
+        summary: "Task request captured.",
+        occurred_at: "2026-07-30T12:00:00Z",
+        from_state: null,
+        to_state: null,
+        evidence_count: 1,
+      },
+    ],
+    evidence: [
+      {
+        id: "33333333-3333-4333-8333-333333333333",
+        evidence_type: "task-request",
+        captured_at: "2026-07-30T12:00:00Z",
+        status: "AVAILABLE",
+      },
+    ],
+    approvals: [
+      {
+        id: "44444444-4444-4444-8444-444444444444",
+        type_label: "Brief approval",
+        status: "PENDING",
+        requesting_state: "INTAKE",
+        resume_state: null,
+        created_at: "2026-07-30T12:00:00Z",
+        expires_at: null,
+      },
+    ],
+  };
+
+  it("accepts a safe durable cockpit projection", () => {
+    expect(parseTaskCockpit(cockpit)).toEqual(cockpit);
+  });
+
+  it.each([
+    { ...cockpit, state_context: { ...cockpit.state_context, kind: "MERGED" } },
+    { ...cockpit, events: [{ ...cockpit.events[0], sequence: 0 }] },
+    { ...cockpit, events: [{ ...cockpit.events[0], kind: "RAW_OUTPUT" }] },
+    { ...cockpit, evidence: [{ ...cockpit.evidence[0], evidence_type: "../secret" }] },
+    { ...cockpit, approvals: [{ ...cockpit.approvals[0], status: "UNKNOWN" }] },
+  ])("rejects unsafe cockpit projections", (value) => {
+    expect(() => parseTaskCockpit(value)).toThrow("control plane returned");
+  });
+
+  it("rejects duplicate or out-of-order durable event sequences", () => {
+    const duplicate = {
+      ...cockpit,
+      events: [cockpit.events[0], { ...cockpit.events[0], id: task.id }],
+    };
+    expect(() => parseTaskCockpit(duplicate)).toThrow("event order");
   });
 });
 
