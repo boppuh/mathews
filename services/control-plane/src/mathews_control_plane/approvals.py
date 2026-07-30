@@ -89,6 +89,7 @@ _APPROVING_DECISIONS = frozenset(
     }
 )
 _PRECONDITIONED_DECISIONS = _APPROVING_DECISIONS | {
+    ApprovalDecision.REJECT,
     ApprovalDecision.REQUEST_REVISION
 }
 
@@ -771,6 +772,15 @@ def _decision_projection(
                     brief_revision_request_id=decision_id,
                 ),
             )
+    if (
+        request_type is ApprovalRequestType.REVIEW_RULE
+        and decision is ApprovalDecision.REJECT
+    ):
+        return (
+            ApprovalStatus.REJECTED,
+            TaskTransitionKind.RESUME,
+            _TransitionGates(resume_decision_id=decision_id),
+        )
     if decision in _APPROVING_DECISIONS:
         return (
             ApprovalStatus.APPROVED,

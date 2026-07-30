@@ -610,6 +610,43 @@ def test_rule_candidate_approval_is_non_executable_until_recorded(
     assert candidate.status is RuleCandidateStatus.APPROVED
 
 
+def test_rule_candidate_rejection_records_decision_and_resumes(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+
+    result = service.decide(
+        request_id,
+        decision_id=uuid4(),
+        decision=ApprovalDecision.REJECT,
+        actor_id="local-user",
+    )
+
+    assert result.status is ApprovalStatus.REJECTED
+    assert result.task_state is TaskState.REPAIRING
+    with approval_harness.factory() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+        task = session.get(Task, task_id)
+    assert candidate is not None and task is not None
+    assert candidate.status is RuleCandidateStatus.REJECTED
+    assert task.escalation_resume_state is None
+    assert task.terminal_outcome is None
+
+
 def test_cancelling_rule_review_does_not_reject_candidate(
     approval_harness: ApprovalHarness,
 ) -> None:
