@@ -46,6 +46,7 @@ opaque references:
 
 | Setting | Keychain reference |
 | --- | --- |
+| `MATHEWS_HOST_AUTH_KEY_REF` | Dedicated host/control-plane HMAC key (at least 32 bytes) |
 | `MATHEWS_HERMES_API_KEY_REF` | Hermes API credential |
 | `MATHEWS_GITHUB_PRIVATE_KEY_REF` | GitHub App private key |
 | `MATHEWS_GITHUB_WEBHOOK_SECRET_REF` | GitHub webhook secret |
@@ -76,6 +77,14 @@ Register the repository-scoped App and its exact permissions using
 Configure the single pinned XCTest journey and its typed assertion catalog
 using
 [`libraries/configuration/SIMULATOR_FLOW.md`](libraries/configuration/SIMULATOR_FLOW.md).
+
+The host agent listens only on the configured Unix socket. In production it
+must be started by a per-user launchd LaunchAgent with `--launchd-socket`; the
+control plane and host agent must resolve the same
+`MATHEWS_HOST_AUTH_KEY_REF`, while Hermes receives neither the socket path nor
+the credential. See
+[`services/host-agent/LAUNCHD.md`](services/host-agent/LAUNCHD.md) for the
+installation and lifecycle procedure.
 
 ## Durable local infrastructure
 
