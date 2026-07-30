@@ -73,6 +73,9 @@ uv run --package mathews-host-agent mathews-keychain-check \
 
 Register the repository-scoped App and its exact permissions using
 [`services/control-plane/GITHUB_APP.md`](services/control-plane/GITHUB_APP.md).
+Configure the single pinned XCTest journey and its typed assertion catalog
+using
+[`libraries/configuration/SIMULATOR_FLOW.md`](libraries/configuration/SIMULATOR_FLOW.md).
 
 ## Durable local infrastructure
 

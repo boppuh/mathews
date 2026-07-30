@@ -20,6 +20,7 @@ from mathews_configuration import (
     PreflightCheckCode,
     PreflightStatus,
     ProhibitedOperation,
+    RepositoryConfiguration,
     RepositoryPreflightReport,
 )
 from mathews_control_plane.artifacts import ArtifactStore
@@ -74,7 +75,59 @@ def _repository_configuration_arguments(
         "terminal_state": "task.completed",
         "fixture_id": "primary_fixture",
         "fixture_version": 1,
+        "fixture_digest": f"sha256:{'1' * 64}",
+        "test_account_recipe_id": "primary_account",
+        "test_account_recipe_version": 1,
+        "test_account_recipe_digest": f"sha256:{'2' * 64}",
         "test_account": test_account,
+        "runner_test_identifier": (
+            "MathewsUITests/PrimaryJourneyTests/testPrimaryJourney"
+        ),
+        "app_bundle_identifier": "com.boppuh.mathews",
+        "harness_source_root": "MathewsUITests",
+        "harness_project_path": "MathewsHarness.xcodeproj",
+        "harness_target_identifier": "AAAAAAAAAAAAAAAAAAAAAAAA",
+        "runner_source_file": "MathewsUITests/PrimaryJourneyTests.swift",
+        "harness_files": [
+            {
+                "path": "Mathews.xcworkspace/contents.xcworkspacedata",
+                "digest": f"sha256:{'3' * 64}",
+            },
+            {
+                "path": (
+                    "Mathews.xcworkspace/xcshareddata/xcschemes/Mathews.xcscheme"
+                ),
+                "digest": f"sha256:{'4' * 64}",
+            },
+            {
+                "path": (
+                    "MathewsHarness.xcodeproj/project.pbxproj"
+                ),
+                "digest": f"sha256:{'5' * 64}",
+            },
+            {
+                "path": "MathewsUITests/PrimaryJourneyTests.swift",
+                "digest": f"sha256:{'6' * 64}",
+            },
+        ],
+        "fixture_file": {
+            "path": "Fixtures/primary.json",
+            "digest": f"sha256:{'1' * 64}",
+        },
+        "test_account_recipe_file": {
+            "path": "Fixtures/primary-account.json",
+            "digest": f"sha256:{'2' * 64}",
+        },
+        "required_assertion_ids": [
+            "task-title",
+            "terminal-state",
+            "network-response",
+            "log-event",
+            "no-crash",
+        ],
+        "clean_state_before_each_run": True,
+        "locale_identifier": "en_US_POSIX",
+        "time_zone_identifier": "UTC",
         "clean_state_steps": [
             "SHUTDOWN",
             "ERASE",
@@ -105,6 +158,12 @@ def _repository_configuration_arguments(
                 e2e_flow if kind is OperationKind.SIMULATOR_E2E else None
             ),
         }
+        if kind is OperationKind.SIMULATOR_E2E:
+            assert isinstance(operation["argv"], list)
+            operation["argv"].append(
+                "-only-testing:MathewsUITests/"
+                "PrimaryJourneyTests/testPrimaryJourney"
+            )
         operations.append(operation)
     return {
         "repository_key": "boppuh/mathews",
@@ -137,13 +196,76 @@ def _repository_configuration_arguments(
         "operations": operations,
         "e2e_assertions": [
             {
-                "assertion_id": "terminal_state",
+                "assertion_id": "task-title",
+                "kind": AssertionKind.ELEMENT_VALUE_PRESENT.value,
+                "role": "FLOW_BASELINE",
+                "catalog_key": "task.title",
+                "verifier": {
+                    "accessibility_identifier": "task.title",
+                    "expected_value_fixture_key": "task.title",
+                },
+            },
+            {
+                "assertion_id": "terminal-state",
                 "kind": AssertionKind.NAVIGATION_STATE_REACHED.value,
-                "catalog_key": "task.completed",
-            }
+                "role": "FLOW_BASELINE",
+                "catalog_key": "task.completed.state",
+                "verifier": {
+                    "state_id": "task.completed",
+                    "marker_accessibility_identifier": "task.completed",
+                },
+            },
+            {
+                "assertion_id": "network-response",
+                "kind": AssertionKind.EXPECTED_NETWORK_RESPONSE.value,
+                "role": "FLOW_BASELINE",
+                "catalog_key": "task.created.response",
+                "verifier": {
+                    "endpoint_class": "task.created",
+                    "method": "POST",
+                    "expected_status_code": 201,
+                },
+            },
+            {
+                "assertion_id": "log-event",
+                "kind": AssertionKind.EXPECTED_LOG_EVENT.value,
+                "role": "FLOW_BASELINE",
+                "catalog_key": "task.completed.log",
+                "verifier": {
+                    "subsystem": "com.boppuh.mathews",
+                    "category": "task",
+                    "event_key": "task.completed",
+                    "minimum_count": 1,
+                },
+            },
+            {
+                "assertion_id": "no-crash",
+                "kind": AssertionKind.NO_CRASH.value,
+                "role": "FLOW_BASELINE",
+                "catalog_key": "app.process",
+                "verifier": {"bundle_identifier": "com.boppuh.mathews"},
+            },
+            {
+                "assertion_id": "task-title-change",
+                "kind": AssertionKind.ELEMENT_VALUE_PRESENT.value,
+                "role": "TASK_SELECTABLE",
+                "catalog_key": "task.title.change",
+                "verifier": {
+                    "accessibility_identifier": "task.title",
+                    "expected_value_fixture_key": "task.title",
+                },
+            },
         ],
         "artifact_settings": {"collection_paths": ["artifacts/test"]},
-        "prohibited_paths": [".git"],
+        "prohibited_paths": [
+            ".git",
+            "Mathews.xcworkspace/contents.xcworkspacedata",
+            "Mathews.xcworkspace/xcshareddata/xcschemes/Mathews.xcscheme",
+            "MathewsHarness.xcodeproj/project.pbxproj",
+            "MathewsUITests",
+            "Fixtures/primary.json",
+            "Fixtures/primary-account.json",
+        ],
         "secret_references": [test_account],
     }
 
@@ -153,6 +275,27 @@ def _migration_config(database_url: str) -> Config:
     config = Config(str(service_root / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
     return config
+
+
+def test_postgres_repository_configuration_fixture_is_valid(tmp_path: Path) -> None:
+    arguments = _repository_configuration_arguments(tmp_path)
+    configuration = RepositoryConfiguration.from_dict(
+        uuid4(),
+        {
+            "repository_key": arguments["repository_key"],
+            "version": 1,
+            "repository_settings": arguments["repository_settings"],
+            "git_settings": arguments["git_settings"],
+            "xcode_settings": arguments["xcode_settings"],
+            "operations": arguments["operations"],
+            "e2e_assertions": arguments["e2e_assertions"],
+            "artifact_settings": arguments["artifact_settings"],
+            "prohibited_paths": arguments["prohibited_paths"],
+            "secret_references": arguments["secret_references"],
+        },
+    )
+
+    assert configuration.repository_key == "boppuh/mathews"
 
 
 def _configured_database_url() -> str:
