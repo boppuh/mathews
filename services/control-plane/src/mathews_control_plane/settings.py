@@ -1,16 +1,18 @@
-import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
-from mathews_configuration import SecretReference
+from mathews_configuration import (
+    HostProtocolError,
+    SecretReference,
+    validate_host_identifier,
+)
 from pydantic import AnyHttpUrl, PositiveInt, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 EnvironmentName = Literal["local", "test", "staging", "production"]
-_HOST_KEY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
 
 
 class ConfigurationIncompleteError(RuntimeError):
@@ -135,9 +137,10 @@ class Settings(BaseSettings):
     @field_validator("host_auth_key_id")
     @classmethod
     def host_auth_key_id_is_canonical(cls, value: str) -> str:
-        if _HOST_KEY_ID_PATTERN.fullmatch(value) is None:
-            raise ValueError("host authentication key id is invalid")
-        return value
+        try:
+            return validate_host_identifier(value)
+        except HostProtocolError:
+            raise ValueError("host authentication key id is invalid") from None
 
     @field_validator("web_origin", "hermes_endpoint")
     @classmethod

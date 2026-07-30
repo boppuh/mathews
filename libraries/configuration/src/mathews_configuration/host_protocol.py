@@ -24,7 +24,7 @@ MAX_HOST_RESPONSE_BYTES = 1024 * 1024
 MAX_HOST_REQUEST_LIFETIME_MS = 30_000
 MAX_HOST_CLOCK_SKEW_MS = 5_000
 
-type JsonValue = None | bool | int | str | list[JsonValue] | dict[str, JsonValue]
+type JsonValue = bool | int | str | list[JsonValue] | dict[str, JsonValue] | None
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
 _OPERATION = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,4}\Z")
@@ -306,7 +306,7 @@ class SignedHostResponse:
 class HostMessageAuthenticator:
     """Sign and verify bounded local protocol messages with one fixed HMAC key."""
 
-    __slots__ = ("_key", "key_id", "_clock_ms")
+    __slots__ = ("_clock_ms", "_key", "key_id")
 
     def __init__(
         self,

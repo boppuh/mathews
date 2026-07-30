@@ -161,8 +161,8 @@ def main() -> None:
         reference = SecretReference.parse(args.auth_reference)
         run(
             HostAgentSettings(
-                socket_path=args.socket_path.resolve(),
-                journal_path=args.journal_path.resolve(),
+                socket_path=args.socket_path.expanduser().resolve(),
+                journal_path=args.journal_path.expanduser().resolve(),
                 authentication_reference=reference,
                 authentication_key_id=args.auth_key_id,
                 host_id=args.host_id,

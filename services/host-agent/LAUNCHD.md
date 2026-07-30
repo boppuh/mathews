@@ -25,7 +25,7 @@ socket. There is no TCP listener or generic command endpoint.
    ```dotenv
    MATHEWS_HOST_AUTH_KEY_REF=keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1
    MATHEWS_HOST_AUTH_KEY_ID=host-control-plane-v1
-   MATHEWS_HOST_SOCKET_PATH=~/Library/Application Support/Mathews/host-agent.sock
+   MATHEWS_HOST_SOCKET_PATH="/Users/<you>/Library/Application Support/Mathews/host-agent.sock"
    ```
 
 The credential value must never be placed in an environment file, plist,

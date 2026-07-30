@@ -85,6 +85,31 @@ def test_service_defaults_follow_shared_environment_configuration(
     ]
 
 
+def test_explicit_cli_paths_expand_the_user_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[HostAgentSettings] = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mathews-host-agent",
+            "--socket-path",
+            "~/runtime/host.sock",
+            "--journal-path",
+            "~/runtime/journal.sqlite3",
+        ],
+    )
+    monkeypatch.setattr(agent_module, "run", captured.append)
+
+    main()
+
+    assert captured[0].socket_path == tmp_path / "runtime" / "host.sock"
+    assert captured[0].journal_path == tmp_path / "runtime" / "journal.sqlite3"
+
+
 def test_invalid_environment_host_identity_fails_before_service_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

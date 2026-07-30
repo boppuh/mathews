@@ -283,12 +283,12 @@ class HostRequestDispatcher:
                 execution_fencing_token=decision.result.execution_fencing_token,
             )
 
+        context = HostOperationContext(
+            request=request,
+            _journal=self._journal,
+            _task_guard=task_guard,
+        )
         try:
-            context = HostOperationContext(
-                request=request,
-                _journal=self._journal,
-                _task_guard=task_guard,
-            )
             result = definition.handle(
                 context,
                 arguments,

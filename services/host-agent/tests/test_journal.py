@@ -226,7 +226,7 @@ def test_journal_file_and_parent_must_be_private(tmp_path: Path) -> None:
     HostOperationJournal(journal_path)
 
     assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
-    os.chmod(runtime, 0o755)
+    os.chmod(runtime, 0o755)  # noqa: S103 - deliberately insecure test fixture
     with pytest.raises(HostJournalError, match="UNSAFE_JOURNAL_PATH"):
         HostOperationJournal(runtime / "second.sqlite3")
 
@@ -358,7 +358,9 @@ def test_corrupt_terminal_fields_fail_as_journal_corrupt(
     assert journal.begin(request).action is JournalAction.EXECUTE
     journal.finish(request, result=_success())
     with sqlite3.connect(path) as connection:
-        connection.execute(f"UPDATE operations SET {corruption}")
+        connection.execute(
+            f"UPDATE operations SET {corruption}"  # noqa: S608 - local test literals
+        )
 
     with pytest.raises(HostJournalError, match="JOURNAL_CORRUPT"):
         journal.begin(replace(request, request_id=uuid4()))

@@ -61,6 +61,32 @@ class RecordingSecrets:
         return SecretValue(self.value)
 
 
+class ConnectedClient:
+    def __init__(self, connection: socket.socket) -> None:
+        self._connection = connection
+
+    def __enter__(self) -> "ConnectedClient":
+        return self
+
+    def __exit__(self, *_arguments: object) -> None:
+        self._connection.close()
+
+    def settimeout(self, value: float) -> None:
+        self._connection.settimeout(value)
+
+    def connect(self, _path: str) -> None:
+        pass
+
+    def send(self, value: bytes | memoryview) -> int:
+        return self._connection.send(value)
+
+    def shutdown(self, how: int) -> None:
+        self._connection.shutdown(how)
+
+    def recv(self, length: int) -> bytes:
+        return self._connection.recv(length)
+
+
 def _lease(
     *,
     lease_id: UUID | None = None,
@@ -302,32 +328,10 @@ def test_preflight_response_has_an_operation_aware_deadline(
     )
     server_connection, client_connection = socket.socketpair()
 
-    class ConnectedClient:
-        def __enter__(self) -> "ConnectedClient":
-            return self
-
-        def __exit__(self, *_arguments: object) -> None:
-            client_connection.close()
-
-        def settimeout(self, value: float) -> None:
-            client_connection.settimeout(value)
-
-        def connect(self, _path: str) -> None:
-            pass
-
-        def send(self, value: bytes | memoryview) -> int:
-            return client_connection.send(value)
-
-        def shutdown(self, how: int) -> None:
-            client_connection.shutdown(how)
-
-        def recv(self, length: int) -> bytes:
-            return client_connection.recv(length)
-
     monkeypatch.setattr(
         socket,
         "socket",
-        lambda *_arguments, **_keywords: ConnectedClient(),
+        lambda *_arguments, **_keywords: ConnectedClient(client_connection),
     )
 
     def delayed_replay() -> None:
@@ -357,3 +361,96 @@ def test_preflight_response_has_an_operation_aware_deadline(
     assert not server_thread.is_alive()
     assert response.status is HostResponseStatus.OK
     assert response.replayed is True
+
+
+def test_complete_response_does_not_require_peer_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_connection, client_connection = socket.socketpair()
+    release_server = threading.Event()
+    response = b"complete-response"
+    monkeypatch.setattr(
+        socket,
+        "socket",
+        lambda *_arguments, **_keywords: ConnectedClient(client_connection),
+    )
+
+    def lingering_server() -> None:
+        with server_connection:
+            header = server_connection.recv(4)
+            (length,) = struct.unpack("!I", header)
+            request = bytearray()
+            while len(request) < length:
+                request.extend(server_connection.recv(length - len(request)))
+            assert request
+            server_connection.sendall(struct.pack("!I", len(response)) + response)
+            assert release_server.wait(timeout=2)
+
+    server_thread = threading.Thread(target=lingering_server)
+    server_thread.start()
+    gateway = LocalHostGateway(
+        tmp_path / "host.sock",
+        authenticator=HostMessageAuthenticator(
+            SecretValue("a" * 32),
+            key_id="control-plane-v1",
+            clock_ms=lambda: NOW_MS,
+        ),
+    )
+
+    try:
+        received = gateway._exchange(
+            b"request",
+            response_timeout_seconds=0.2,
+        )
+    finally:
+        release_server.set()
+        server_thread.join(timeout=2)
+
+    assert not server_thread.is_alive()
+    assert received == response
+
+
+def test_trailing_response_bytes_are_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_connection, client_connection = socket.socketpair()
+    monkeypatch.setattr(
+        socket,
+        "socket",
+        lambda *_arguments, **_keywords: ConnectedClient(client_connection),
+    )
+
+    def server_with_trailing_data() -> None:
+        with server_connection:
+            header = server_connection.recv(4)
+            (length,) = struct.unpack("!I", header)
+            request = bytearray()
+            while len(request) < length:
+                request.extend(server_connection.recv(length - len(request)))
+            assert request
+            response = b"complete-response"
+            server_connection.sendall(
+                struct.pack("!I", len(response)) + response + b"x"
+            )
+
+    server_thread = threading.Thread(target=server_with_trailing_data)
+    server_thread.start()
+    gateway = LocalHostGateway(
+        tmp_path / "host.sock",
+        authenticator=HostMessageAuthenticator(
+            SecretValue("a" * 32),
+            key_id="control-plane-v1",
+            clock_ms=lambda: NOW_MS,
+        ),
+    )
+
+    with pytest.raises(HostGatewayError, match="INVALID_RESPONSE_FRAME"):
+        gateway._exchange(
+            b"request",
+            response_timeout_seconds=0.2,
+        )
+    server_thread.join(timeout=2)
+
+    assert not server_thread.is_alive()

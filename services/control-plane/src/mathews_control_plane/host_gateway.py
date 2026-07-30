@@ -119,9 +119,12 @@ class LocalHostGateway:
                 connection.shutdown(socket.SHUT_WR)
                 response_deadline = time.monotonic() + response_timeout_seconds
                 response = _receive_frame(connection, deadline=response_deadline)
-                connection.settimeout(_remaining(response_deadline))
-                if connection.recv(1):
-                    raise HostGatewayError("INVALID_RESPONSE_FRAME")
+                connection.settimeout(min(0.05, _remaining(response_deadline)))
+                try:
+                    if connection.recv(1):
+                        raise HostGatewayError("INVALID_RESPONSE_FRAME")
+                except TimeoutError:
+                    pass
                 return response
         except OSError:
             raise HostGatewayError("HOST_UNAVAILABLE") from None
