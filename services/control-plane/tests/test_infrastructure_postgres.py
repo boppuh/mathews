@@ -1,8 +1,11 @@
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
+from typing import TypedDict
 from uuid import uuid4
 
 import pytest
@@ -10,6 +13,15 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from mathews_configuration import (
+    AssertionKind,
+    OperationKind,
+    PreflightCheck,
+    PreflightCheckCode,
+    PreflightStatus,
+    ProhibitedOperation,
+    RepositoryPreflightReport,
+)
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     AuthenticationService,
@@ -25,11 +37,115 @@ from mathews_control_plane.database import (
     session_scope,
 )
 from mathews_control_plane.domain_models import TaskEvent
+from mathews_control_plane.repository_configuration import (
+    begin_preflight_attempt,
+    capture_preflight_report,
+    create_repository_configuration,
+    repository_configuration_digest,
+    require_preflight_ready,
+)
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import IntegrityError
 
 _DATABASE_URL_ENV = "POSTGRES_TEST_DATABASE_URL"
+
+
+class _RepositoryConfigurationArguments(TypedDict):
+    repository_key: str
+    repository_settings: dict[str, object]
+    git_settings: dict[str, object]
+    xcode_settings: dict[str, object]
+    operations: list[object]
+    e2e_assertions: list[object]
+    artifact_settings: dict[str, object]
+    prohibited_paths: list[object]
+    secret_references: list[object]
+
+
+def _repository_configuration_arguments(
+    root: Path,
+) -> _RepositoryConfigurationArguments:
+    test_account = "keychain://mathews-tests/primary-account"
+    e2e_flow = {
+        "flow_id": "primary_journey",
+        "version": 1,
+        "entry_point": "app.launch",
+        "terminal_state": "task.completed",
+        "fixture_id": "primary_fixture",
+        "fixture_version": 1,
+        "test_account": test_account,
+        "clean_state_steps": [
+            "SHUTDOWN",
+            "ERASE",
+            "BOOT",
+            "INSTALL_CANDIDATE",
+        ],
+        "expected_network_signals": ["task.created"],
+        "expected_log_signals": ["task.completed"],
+        "acceptable_warnings": [],
+    }
+    operations: list[object] = []
+    for kind in OperationKind:
+        operation: dict[str, object] = {
+            "operation_id": kind.value.lower(),
+            "kind": kind.value,
+            "argv": [
+                "xcodebuild",
+                "build" if kind is OperationKind.BUILD else "test",
+                "-workspace",
+                "Mathews.xcworkspace",
+                "-scheme",
+                "Mathews",
+                "-destination",
+                "MATHEWS_CONFIGURED_SIMULATOR",
+            ],
+            "timeout_seconds": 600,
+            "e2e_flow": (
+                e2e_flow if kind is OperationKind.SIMULATOR_E2E else None
+            ),
+        }
+        operations.append(operation)
+    return {
+        "repository_key": "boppuh/mathews",
+        "repository_settings": {
+            "root": str(root),
+            "prohibited_operations": [
+                operation.value for operation in ProhibitedOperation
+            ],
+        },
+        "git_settings": {
+            "default_base_ref": "refs/remotes/origin/main",
+            "task_branch_template": "mathews/{task_id}",
+            "remote_name": "origin",
+            "author": {"name": "Mathews", "email": "mathews@example.test"},
+            "committer": {"name": "Mathews", "email": "mathews@example.test"},
+        },
+        "xcode_settings": {
+            "container_kind": "WORKSPACE",
+            "container_path": "Mathews.xcworkspace",
+            "scheme": "Mathews",
+            "simulator": {
+                "runtime_identifier": (
+                    "com.apple.CoreSimulator.SimRuntime.iOS-26-0"
+                ),
+                "device_type_identifier": (
+                    "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"
+                ),
+            },
+        },
+        "operations": operations,
+        "e2e_assertions": [
+            {
+                "assertion_id": "terminal_state",
+                "kind": AssertionKind.NAVIGATION_STATE_REACHED.value,
+                "catalog_key": "task.completed",
+            }
+        ],
+        "artifact_settings": {"collection_paths": ["artifacts/test"]},
+        "prohibited_paths": [".git"],
+        "secret_references": [test_account],
+    }
 
 
 def _migration_config(database_url: str) -> Config:
@@ -122,6 +238,50 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
             )
             task_id = created.id
             root_correlation_id = created.root_correlation_id
+            repository_configuration = create_repository_configuration(
+                session,
+                **_repository_configuration_arguments(
+                    tmp_path / "target-repository"
+                ),
+                owner_id="local-user",
+                actor_id="postgres-test",
+                root_correlation_id=root_correlation_id,
+            )
+            repository_configuration_id = repository_configuration.id
+            repository_configuration_version = repository_configuration.version
+            repository_digest = repository_configuration_digest(
+                repository_configuration
+            )
+            base_sha = "b" * 40
+            preflight_attempt = begin_preflight_attempt(
+                session,
+                store,
+                configuration_id=repository_configuration_id,
+                owner_id="local-user",
+                actor_id="postgres-test",
+                root_correlation_id=root_correlation_id,
+            )
+            preflight_report = RepositoryPreflightReport(
+                attempt_id=preflight_attempt.attempt_id,
+                configuration_id=repository_configuration_id,
+                configuration_version=repository_configuration_version,
+                configuration_digest=repository_digest,
+                status=PreflightStatus.PASSED,
+                checks=tuple(
+                    PreflightCheck.for_status(code, PreflightStatus.PASSED)
+                    for code in PreflightCheckCode
+                ),
+                resolved_base_sha=base_sha,
+            )
+            captured_preflight = capture_preflight_report(
+                session,
+                store,
+                report=preflight_report,
+                owner_id="local-user",
+                actor_id="postgres-test",
+                root_correlation_id=root_correlation_id,
+            )
+            preflight_evidence_id = captured_preflight.evidence_id
             session.add(
                 TaskEvent(
                     task_id=task_id,
@@ -185,14 +345,70 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         recreated_authentication_service = AuthenticationService(recreated_factory)
         with recreated_factory() as session:
             retrieved = get_task_record(session, task_id)
+            readiness = require_preflight_ready(
+                session,
+                recreated_store,
+                repository_key="boppuh/mathews",
+                configuration_id=repository_configuration_id,
+                configuration_version=repository_configuration_version,
+                configuration_digest=repository_digest,
+                resolved_base_sha=base_sha,
+            )
         authenticated = recreated_authentication_service.authenticate(issued_session.session_token)
 
         assert retrieved is not None
         assert retrieved.summary == "PostgreSQL and artifact durability smoke"
+        assert readiness.evidence_id == preflight_evidence_id
+        assert readiness.binding.resolved_base_sha == base_sha
         assert artifact.address == f"sha256:{expected_digest}"
         assert recreated_store.get_bytes(artifact.address) == payload
         assert authenticated is not None
         assert recreated_authentication_service.bootstrap_status().bootstrap_required is False
+
+        readiness_lock_acquired = Event()
+        release_readiness_lock = Event()
+        writer_started = Event()
+
+        def hold_readiness_lock() -> None:
+            with session_scope(recreated_factory) as session:
+                require_preflight_ready(
+                    session,
+                    recreated_store,
+                    repository_key="boppuh/mathews",
+                    configuration_id=repository_configuration_id,
+                    configuration_version=repository_configuration_version,
+                    configuration_digest=repository_digest,
+                    resolved_base_sha=base_sha,
+                )
+                readiness_lock_acquired.set()
+                if not release_readiness_lock.wait(timeout=5):
+                    raise TimeoutError("test did not release the readiness lock")
+
+        def create_next_configuration() -> int:
+            writer_started.set()
+            with session_scope(recreated_factory) as session:
+                return create_repository_configuration(
+                    session,
+                    **_repository_configuration_arguments(
+                        tmp_path / "target-repository"
+                    ),
+                    owner_id="local-user",
+                    actor_id="postgres-test",
+                    root_correlation_id=uuid4(),
+                ).version
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            holder = executor.submit(hold_readiness_lock)
+            assert readiness_lock_acquired.wait(timeout=5)
+            writer = executor.submit(create_next_configuration)
+            assert writer_started.wait(timeout=5)
+            try:
+                with pytest.raises(FutureTimeoutError):
+                    writer.result(timeout=0.2)
+            finally:
+                release_readiness_lock.set()
+            holder.result(timeout=5)
+            assert writer.result(timeout=5) == 2
 
         recreated_authentication_service.logout(authenticated)
         assert (
