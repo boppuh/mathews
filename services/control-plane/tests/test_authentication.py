@@ -492,8 +492,11 @@ def test_default_deny_protects_tasks_artifacts_sse_and_disabled_docs(
     assert harness.client.options("/api/tasks").status_code == 401
 
     _bootstrap(harness)
+    tasks = harness.client.get("/api/tasks")
+    assert tasks.status_code == 200
+    assert tasks.json() == {"tasks": []}
+    assert tasks.headers["cache-control"] == "no-store"
     for path in (
-        "/api/tasks",
         "/api/artifacts/sha256:missing",
         "/api/events",
         "/openapi.json",
