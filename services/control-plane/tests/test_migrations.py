@@ -512,6 +512,18 @@ def test_job_loop_migration_enforces_fenced_provenance_and_guarded_downgrade(
             checkpoint_payload={"step": "published"},
         )
 
+        with pytest.raises(IntegrityError, match="invalid background job projection"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE background_jobs SET checkpoint_version = 1, "
+                        "last_fencing_token = :token WHERE id = :job_id"
+                    ),
+                    {
+                        "job_id": scheduled.job_id.hex,
+                        "token": grant.fencing_token,
+                    },
+                )
         with pytest.raises(IntegrityError, match="cannot heartbeat"):
             with engine.begin() as connection:
                 connection.execute(

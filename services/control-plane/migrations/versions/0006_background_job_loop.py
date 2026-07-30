@@ -580,6 +580,9 @@ def _create_postgresql_triggers() -> None:
             IF TG_OP = 'INSERT' THEN
                 RETURN NEW;
             END IF;
+            IF NEW.checkpoint_version < OLD.checkpoint_version THEN
+                RAISE EXCEPTION 'invalid background job projection';
+            END IF;
             IF NEW.id <> OLD.id
                OR NEW.task_id IS DISTINCT FROM OLD.task_id
                OR NEW.job_type <> OLD.job_type

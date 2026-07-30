@@ -605,6 +605,25 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         first_job_grant = job_grants[0]
         assert first_job_grant.job_id == scheduled_job.job_id
 
+        first_checkpoint = job_service.checkpoint(
+            first_job_grant,
+            expected_version=0,
+            idempotency_key="postgres-checkpoint:current",
+            payload={"step": "claimed"},
+        )
+        assert first_checkpoint.sequence == 1
+        with pytest.raises(DBAPIError, match="invalid background job projection"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE background_jobs SET checkpoint_version = 0, "
+                        "last_fencing_token = :token WHERE id = :job_id"
+                    ),
+                    {
+                        "job_id": first_job_grant.job_id,
+                        "token": first_job_grant.fencing_token,
+                    },
+                )
         time.sleep(1.1)
         recovered_job_grant = claim_job("postgres-worker-recovered")
         assert recovered_job_grant is not None
@@ -614,7 +633,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         with pytest.raises(BackgroundJobLeaseLostError):
             job_service.checkpoint(
                 first_job_grant,
-                expected_version=0,
+                expected_version=1,
                 idempotency_key="postgres-stale-checkpoint",
                 payload={"stale": True},
             )

@@ -50,18 +50,27 @@ def build_worker(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Mathews control-plane worker")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--once",
         action="store_true",
         help="Run one startup probe and exit",
+    )
+    mode.add_argument(
+        "--poll-once",
+        action="store_true",
+        help="Execute one durable job poll and exit",
     )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     logger.info("worker started", extra={"environment": settings.environment})
+    if args.once:
+        logger.info(probe())
+        return
     worker, engine = build_worker(settings)
     try:
-        if args.once:
+        if args.poll_once:
             logger.info("worker poll completed", extra={"outcome": worker.run_once()})
             return
         while True:
