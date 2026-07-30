@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from typing import TypedDict
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
@@ -37,7 +37,13 @@ from mathews_control_plane.database import (
     get_task_record,
     session_scope,
 )
-from mathews_control_plane.domain_models import EvidenceRecord, TaskEvent
+from mathews_control_plane.domain_models import (
+    EvidenceRecord,
+    PolicyVersion,
+    Task,
+    TaskEvent,
+    TaskState,
+)
 from mathews_control_plane.evidence import (
     EvidenceAccessClass,
     EvidenceRetentionClass,
@@ -51,7 +57,13 @@ from mathews_control_plane.repository_configuration import (
     repository_configuration_digest,
     require_preflight_ready,
 )
-from sqlalchemy import inspect, text
+from mathews_control_plane.task_state_machine import (
+    TaskTransitionConflictError,
+    TaskTransitionKind,
+    TaskTransitionResult,
+    TaskTransitionService,
+)
+from sqlalchemy import inspect, select, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
@@ -340,8 +352,8 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         authentication_service = AuthenticationService(factory)
         with engine.connect() as connection:
             current_revision = MigrationContext.configure(connection).get_current_revision()
-        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0004"]
-        assert current_revision == "0004"
+        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0005"]
+        assert current_revision == "0005"
         inspector = inspect(engine)
         validation_run_foreign_keys = inspector.get_foreign_keys("validation_runs")
         validation_run_foreign_tables = {
@@ -444,6 +456,19 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
                     root_correlation_id=root_correlation_id,
                 )
             )
+            session.add(
+                PolicyVersion(
+                    lineage_key="mvp",
+                    version=1,
+                    predecessor_id=None,
+                    workflow_thresholds={},
+                    approved_by="local-user",
+                    approved_at=datetime.now(UTC),
+                    owner_id="local-user",
+                    actor_id="postgres-test",
+                    root_correlation_id=root_correlation_id,
+                )
+            )
         with engine.connect() as connection:
             request_evidence_id = connection.execute(
                 text(
@@ -475,6 +500,117 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
                         root_correlation_id=root_correlation_id,
                     )
                 )
+        transition_service = TaskTransitionService(
+            factory,
+            store,
+            principal_id="postgres-test",
+        )
+
+        def transition_concurrently(
+            kind: TaskTransitionKind,
+        ) -> TaskTransitionResult | TaskTransitionConflictError:
+            try:
+                return transition_service.transition(
+                    task_id,
+                    transition_id=uuid4(),
+                    expected_state=TaskState.INTAKE,
+                    kind=kind,
+                    reason_code=kind.value,
+                    evidence_ids=(request_evidence_id,),
+                )
+            except TaskTransitionConflictError as error:
+                return error
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            transition_results = list(
+                executor.map(
+                    transition_concurrently,
+                    (
+                        TaskTransitionKind.START_BRIEFING,
+                        TaskTransitionKind.CANCEL,
+                    ),
+                )
+            )
+        accepted_transitions = [
+            result
+            for result in transition_results
+            if isinstance(result, TaskTransitionResult)
+        ]
+        stale_transitions = [
+            result
+            for result in transition_results
+            if isinstance(result, TaskTransitionConflictError)
+        ]
+        assert len(accepted_transitions) == 1
+        assert len(stale_transitions) == 1
+        with factory() as session:
+            transitioned_task = session.get(Task, task_id)
+        assert transitioned_task is not None
+        assert transitioned_task.state in {
+            TaskState.BRIEFING,
+            TaskState.CANCELLED,
+        }
+
+        collision_inputs: list[tuple[UUID, UUID]] = []
+        with session_scope(factory) as session:
+            for index in range(2):
+                collision_task = create_task_record(
+                    session,
+                    store,
+                    repository="boppuh/mathews",
+                    base_revision=f"{index + 2}" * 40,
+                    requester="local-user",
+                    raw_request=f"Global transition collision {index}",
+                    summary=f"Global transition collision {index}",
+                    owner_id="local-user",
+                    actor_id="postgres-test",
+                )
+                session.flush()
+                collision_evidence_id = session.scalar(
+                    select(EvidenceRecord.id).where(
+                        EvidenceRecord.task_id == collision_task.id
+                    )
+                )
+                assert collision_evidence_id is not None
+                collision_inputs.append(
+                    (collision_task.id, collision_evidence_id)
+                )
+        shared_transition_id = uuid4()
+
+        def collide_transition_id(
+            task_and_evidence: tuple[UUID, UUID],
+        ) -> TaskTransitionResult | TaskTransitionConflictError:
+            collision_task_id, collision_evidence_id = task_and_evidence
+            try:
+                return transition_service.transition(
+                    collision_task_id,
+                    transition_id=shared_transition_id,
+                    expected_state=TaskState.INTAKE,
+                    kind=TaskTransitionKind.START_BRIEFING,
+                    reason_code="START_BRIEFING",
+                    evidence_ids=(collision_evidence_id,),
+                )
+            except TaskTransitionConflictError as error:
+                return error
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            collision_results = list(
+                executor.map(collide_transition_id, collision_inputs)
+            )
+        assert (
+            sum(
+                isinstance(result, TaskTransitionResult)
+                for result in collision_results
+            )
+            == 1
+        )
+        assert (
+            sum(
+                isinstance(result, TaskTransitionConflictError)
+                for result in collision_results
+            )
+            == 1
+        )
         artifact = store.put_bytes(payload)
         bootstrap_token = generate_bootstrap_token(factory)
 

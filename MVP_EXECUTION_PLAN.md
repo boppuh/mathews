@@ -14,13 +14,14 @@ complete here unless its backlog definition of done is satisfied on `main`.
 ## Current position
 
 - Completed: `0.1` application workspace, `0.2` configuration and secrets,
-  `0.3` durable local infrastructure, `0.4` local authentication, and `1.1`
-  domain schema, plus `3.1` validated repository configuration and read-only
-  preflight, `5.1` deterministic simulator-flow contracts, and `6.1`
-  least-privilege GitHub App authentication.
-- Remaining: 32 of 40 MVP tasks.
+  `0.3` durable local infrastructure, `0.4` local authentication, `1.1` domain
+  schema, and `1.2` minimal evidence safety foundation, plus `3.1` validated
+  repository configuration and read-only preflight, `5.1` deterministic
+  simulator-flow contracts, and `6.1` least-privilege GitHub App
+  authentication.
+- Remaining: 31 of 40 MVP tasks.
 - Active next wave: Wave 3, durable workflow core.
-- Next completion target: `1.2`.
+- Next completion target: `1.3`.
 
 ## Operating model
 

@@ -46,6 +46,21 @@ class TaskState(StrEnum):
 TASK_STATE_VALUES = tuple(state.value for state in TaskState)
 
 
+def _hex_only_sql(column: str) -> str:
+    expression = column
+    for character in "0123456789abcdef":
+        expression = f"replace({expression}, '{character}', '')"
+    return f"length({expression}) = 0"
+
+
+class TaskTerminalOutcome(StrEnum):
+    """Safe terminal codes; explanatory content belongs in evidence."""
+
+    AUTOMATION_HANDED_OFF = "AUTOMATION_HANDED_OFF"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
 class BriefDecisionDisposition(StrEnum):
     AUTO_ACCEPTED_BY_POLICY = "AUTO_ACCEPTED_BY_POLICY"
     HUMAN_APPROVAL_REQUIRED = "HUMAN_APPROVAL_REQUIRED"
@@ -268,16 +283,95 @@ class TaskEvent(RecordContext, Base):
     __table_args__ = (
         CheckConstraint("sequence > 0", name="sequence_positive"),
         UniqueConstraint("task_id", "sequence", name="uq_task_events_task_sequence"),
+        UniqueConstraint("task_id", "id", name="uq_task_events_task_id"),
+        UniqueConstraint("transition_id", name="uq_task_events_transition_id"),
+        ForeignKeyConstraint(
+            ["policy_lineage_key", "policy_version_id"],
+            ["policy_versions.lineage_key", "policy_versions.id"],
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        CheckConstraint(
+            "("
+            "event_type = 'TASK_STATE_TRANSITION' "
+            "AND transition_id IS NOT NULL "
+            "AND transition_fingerprint IS NOT NULL "
+            "AND transition_kind IS NOT NULL "
+            "AND transition_from_state IS NOT NULL "
+            "AND transition_to_state IS NOT NULL "
+            "AND transition_reason_code IS NOT NULL "
+            "AND policy_lineage_key IS NOT NULL "
+            "AND policy_version_id IS NOT NULL"
+            ") OR ("
+            "event_type <> 'TASK_STATE_TRANSITION' "
+            "AND transition_id IS NULL "
+            "AND transition_fingerprint IS NULL "
+            "AND transition_kind IS NULL "
+            "AND transition_from_state IS NULL "
+            "AND transition_to_state IS NULL "
+            "AND transition_reason_code IS NULL "
+            "AND policy_lineage_key IS NULL "
+            "AND policy_version_id IS NULL "
+            "AND gate_head_sha IS NULL"
+            ")",
+            name="transition_shape",
+        ),
+        CheckConstraint(
+            "transition_kind IS NULL OR transition_kind IN ("
+            "'START_BRIEFING', 'AUTO_ACCEPT_BRIEF', 'REQUEST_BRIEF_APPROVAL', "
+            "'REVISE_BRIEF', 'APPROVE_EXACT_BRIEF', 'BEGIN_VALIDATION', "
+            "'BEGIN_REPAIR', 'REVALIDATE', 'OPEN_VERIFIED_DRAFT_PR', "
+            "'MARK_MERGE_READY', 'INVALIDATE_READINESS', 'ACKNOWLEDGE_HANDOFF', "
+            "'ESCALATE', 'RESUME', 'CANCEL', 'FAIL', 'SCOPE_STEER'"
+            ")",
+            name="transition_kind",
+        ),
+        CheckConstraint(
+            "("
+            "transition_kind IN ("
+            "'OPEN_VERIFIED_DRAFT_PR', 'MARK_MERGE_READY', 'ACKNOWLEDGE_HANDOFF'"
+            ") AND gate_head_sha IS NOT NULL"
+            ") OR ("
+            "transition_kind NOT IN ("
+            "'OPEN_VERIFIED_DRAFT_PR', 'MARK_MERGE_READY', 'ACKNOWLEDGE_HANDOFF'"
+            ") AND gate_head_sha IS NULL"
+            ") OR transition_kind IS NULL",
+            name="transition_gate_head_shape",
+        ),
+        CheckConstraint(
+            "transition_fingerprint IS NULL OR length(transition_fingerprint) = 64",
+            name="transition_fingerprint_length",
+        ),
+        CheckConstraint(
+            "gate_head_sha IS NULL OR ("
+            "length(gate_head_sha) IN (40, 64) AND "
+            f"{_hex_only_sql('gate_head_sha')}"
+            ")",
+            name="gate_head_sha_length",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     task_id: Mapped[UUID] = mapped_column(
-        Uuid, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+        Uuid, ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
     )
     sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    transition_id: Mapped[UUID | None] = mapped_column(Uuid)
+    transition_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    transition_kind: Mapped[str | None] = mapped_column(String(64))
+    transition_from_state: Mapped[TaskState | None] = mapped_column(
+        _enum(TaskState, name="task_event_transition_from_state", length=32)
+    )
+    transition_to_state: Mapped[TaskState | None] = mapped_column(
+        _enum(TaskState, name="task_event_transition_to_state", length=32)
+    )
+    transition_reason_code: Mapped[str | None] = mapped_column(String(100))
+    policy_lineage_key: Mapped[str | None] = mapped_column(String(255))
+    policy_version_id: Mapped[UUID | None] = mapped_column(Uuid)
+    gate_head_sha: Mapped[str | None] = mapped_column(String(64))
 
 
 class EvidenceRecord(RecordContext, Base):
@@ -456,6 +550,41 @@ class EvidenceDerivative(RecordContext, Base):
     content_address: Mapped[str | None] = mapped_column(String(255))
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TaskEventEvidenceReference(RecordContext, Base):
+    """Ordered, task-bound evidence provenance for one transition event."""
+
+    __tablename__ = "task_event_evidence_references"
+    __table_args__ = (
+        CheckConstraint("position > 0", name="position_positive"),
+        UniqueConstraint(
+            "task_event_id",
+            "position",
+            name="uq_task_event_evidence_position",
+        ),
+        UniqueConstraint(
+            "task_event_id",
+            "evidence_id",
+            name="uq_task_event_evidence_membership",
+        ),
+        ForeignKeyConstraint(
+            ["task_id", "task_event_id"],
+            ["task_events.task_id", "task_events.id"],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["evidence_id"],
+            ["evidence_records.id"],
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    task_event_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    evidence_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class ValidationContract(RecordContext, Base):
