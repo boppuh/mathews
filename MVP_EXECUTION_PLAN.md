@@ -13,11 +13,11 @@ complete here unless its backlog definition of done is satisfied on `main`.
 
 ## Current position
 
-- Completed: `0.1` application workspace, `0.2` configuration and secrets, and
-  `0.3` durable local infrastructure.
-- Remaining: 37 of 40 MVP tasks.
+- Completed: `0.1` application workspace, `0.2` configuration and secrets,
+  `0.3` durable local infrastructure, and `0.4` local authentication.
+- Remaining: 36 of 40 MVP tasks.
 - Active next wave: Wave 2, trust boundary and durable schemas.
-- Next completion target: `0.4`.
+- Next completion target: `1.1`.
 
 ## Operating model
 

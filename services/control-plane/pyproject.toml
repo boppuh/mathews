@@ -5,6 +5,7 @@ description = "Authoritative Mathews control-plane API and worker"
 requires-python = ">=3.13"
 dependencies = [
   "alembic>=1.14,<2",
+  "argon2-cffi>=25,<26",
   "fastapi>=0.115,<1",
   "mathews-configuration",
   "psycopg[binary]>=3.2,<4",
@@ -15,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 mathews-api = "mathews_control_plane.__main__:main"
+mathews-auth-bootstrap-token = "mathews_control_plane.authentication:bootstrap_token_main"
 mathews-config-check = "mathews_control_plane.configuration:main"
 mathews-worker = "mathews_control_plane.worker:main"
 

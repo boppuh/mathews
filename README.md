@@ -96,6 +96,32 @@ npm run test:postgres
 The integration test creates a uniquely named disposable schema, applies the
 migration chain only inside that schema, and drops the schema during cleanup.
 
+## Local authentication
+
+After applying migrations, issue the one-time bootstrap token:
+
+```bash
+npm run auth:bootstrap-token
+```
+
+The command prints the raw token once and stores only its digest. Do not save the
+token in `.env`, shell history, logs, or source control. Open the web UI at
+`http://localhost:3000`, paste the token, and choose the local operator password.
+The bootstrap token is consumed atomically when the password is created.
+
+Mathews stores an Argon2id password hash and hashed, server-side session tokens
+in PostgreSQL. Browser sessions use Secure, host-only, SameSite cookies; unsafe
+requests also require an exact trusted origin and a session-bound CSRF token.
+Use `localhost` for the browser and browser-facing API URL even though the API
+process binds to `127.0.0.1`, because mixing those hostnames breaks strict
+same-site cookie behavior.
+
+This boundary protects the loopback HTTP interface from anonymous processes and
+hostile websites. A process already running as the same operating-system user
+may be able to inspect that user's environment, browser profile, or database;
+use a separate OS account or sandbox when that stronger local boundary is
+required.
+
 ## Run locally
 
 ```bash
