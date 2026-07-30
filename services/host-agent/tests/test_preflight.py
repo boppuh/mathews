@@ -1203,6 +1203,50 @@ def test_preflight_rejects_unusable_or_credential_bearing_recipes(
     ).status is PreflightStatus.BLOCKED
 
 
+def test_preflight_accepts_every_configured_fixture_key_character(
+    tmp_path: Path,
+) -> None:
+    root, _sha = _repository_fixture(tmp_path)
+    fixture_key = "ready:title+@v1"
+    _commit_fixture_change(
+        root,
+        "Fixtures/primary.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fixture_id": "default",
+                "fixture_version": 1,
+                "values": {fixture_key: "Ready"},
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    configuration = _configuration(root)
+    assertions: list[AssertionCatalogEntry] = []
+    for assertion in configuration.assertion_catalog:
+        if assertion.assertion_id in {"ready_title", "task_ready_title"}:
+            assert isinstance(assertion.verifier, ElementValueVerifier)
+            assertion = replace(
+                assertion,
+                verifier=replace(
+                    assertion.verifier,
+                    expected_value_fixture_key=fixture_key,
+                ),
+            )
+        assertions.append(assertion)
+    configuration = replace(
+        configuration,
+        assertion_catalog=tuple(assertions),
+    )
+
+    report = RepositoryPreflightRunner(
+        commands=GitAndSimulatorProbe(_simulator_payload())
+    ).run(configuration, attempt_id=uuid4())
+
+    assert report.ready is True, report.to_dict()
+
+
 def test_preflight_fails_closed_when_simulator_availability_is_omitted(
     tmp_path: Path,
 ) -> None:

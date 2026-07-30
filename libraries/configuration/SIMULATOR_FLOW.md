@@ -168,10 +168,12 @@ claims.
 - the matching catalog assertion selections.
 
 Compilation copies each assertion kind and verifier catalog key from the
-immutable repository catalog. Unknown assertions, omitted criteria, duplicated
-bindings, baseline substitutions, weaker/extra selections, configuration drift,
-brief drift, and extra serialized fields fail closed. A direct constructor
-cannot mint an accepted-brief projection or task-contract digest.
+immutable repository catalog and sorts bindings by criterion/assertion
+identifier, so equivalent selections have one canonical JSON form and digest.
+Unknown assertions, omitted criteria, duplicated or noncanonical bindings,
+baseline substitutions, weaker/extra selections, configuration drift, brief
+drift, and extra serialized fields fail closed. A direct constructor cannot
+mint an accepted-brief projection or task-contract digest.
 
 `AcceptedBriefAssertionSource.from_approval_record` consumes a typed
 `PersistedBriefApprovalRecord` and rejects every disposition except

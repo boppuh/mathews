@@ -354,6 +354,18 @@ class TaskAssertionContract:
             raise RepositoryConfigurationError(
                 "criterion/assertion bindings must be unique"
             )
+        if self.bindings != tuple(
+            sorted(
+                self.bindings,
+                key=lambda binding: (
+                    binding.acceptance_criterion_id,
+                    binding.assertion_id,
+                ),
+            )
+        ):
+            raise RepositoryConfigurationError(
+                "criterion/assertion bindings must use canonical identifier order"
+            )
         bound_criteria = {
             binding.acceptance_criterion_id for binding in self.bindings
         }
@@ -438,7 +450,15 @@ class TaskAssertionContract:
             fixture_digest=flow.fixture_digest,
             required_assertion_ids=flow.required_assertion_ids,
             acceptance_criterion_ids=criteria,
-            bindings=tuple(bindings),
+            bindings=tuple(
+                sorted(
+                    bindings,
+                    key=lambda binding: (
+                        binding.acceptance_criterion_id,
+                        binding.assertion_id,
+                    ),
+                )
+            ),
             _factory_token=_TASK_CONTRACT_FACTORY_TOKEN,
         )
         contract.validate_against(configuration, accepted_brief)

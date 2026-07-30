@@ -676,6 +676,26 @@ def test_task_assertions_are_total_typed_and_bound_to_exact_brief_and_config() -
         json.loads(contract.to_json()),
     ) == contract
     assert contract.digest.startswith("sha256:")
+    permuted = TaskAssertionContract.for_configuration(
+        configuration,
+        accepted_brief=brief,
+        assertion_selections=(
+            ("criterion.stability", "changed_terminal_state"),
+            ("criterion.user-outcome", "changed_task_title"),
+        ),
+    )
+    assert permuted == contract
+    assert permuted.digest == contract.digest
+    noncanonical_payload = contract.to_dict()
+    serialized_bindings = noncanonical_payload["bindings"]
+    assert isinstance(serialized_bindings, list)
+    noncanonical_payload["bindings"] = list(reversed(serialized_bindings))
+    with pytest.raises(RepositoryConfigurationError, match="canonical"):
+        TaskAssertionContract.from_dict(
+            configuration,
+            brief,
+            noncanonical_payload,
+        )
 
     changed_brief = AcceptedBriefAssertionSource.from_approval_record(
         PersistedBriefApprovalRecord(

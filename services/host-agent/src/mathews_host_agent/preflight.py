@@ -51,6 +51,7 @@ _MAX_PINNED_FILE_BYTES = 10_000_000
 _MAX_MANIFEST_BYTES = 100_000
 _MAX_FIXTURE_VALUES = 256
 _GIT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_FIXTURE_KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,254}\Z")
 _SCHEME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}\Z")
 _GIT_OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -1698,7 +1699,7 @@ def _fixture_manifest_is_valid(
     normalized_values = cast(dict[object, object], values)
     if any(
         not isinstance(key, str)
-        or _GIT_NAME_PATTERN.fullmatch(key) is None
+        or _FIXTURE_KEY_PATTERN.fullmatch(key) is None
         or not isinstance(value, str)
         or not value
         or len(value) > 1_024
