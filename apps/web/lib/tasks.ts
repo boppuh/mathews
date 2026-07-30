@@ -132,7 +132,7 @@ function parseStateContext(value: unknown): TaskStateContext {
   };
 }
 
-function parseTaskEvent(value: unknown): TaskEventSummary {
+export function parseTaskEvent(value: unknown): TaskEventSummary {
   if (
     !isRecord(value) ||
     typeof value.id !== "string" ||

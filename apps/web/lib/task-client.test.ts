@@ -5,6 +5,7 @@ import {
   LatestTaskListLoader,
   TaskRequestError,
   taskClient,
+  taskEventStreamUrl,
 } from "./task-client";
 
 const task = {
@@ -24,6 +25,10 @@ afterEach(() => {
 });
 
 describe("taskClient", () => {
+  it("builds the task-scoped SSE endpoint URL", () => {
+    expect(taskEventStreamUrl(task.id)).toBe(`http://localhost:8000/api/tasks/${task.id}/events`);
+  });
+
   it("loads the credentialed work queue", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ tasks: [task] }), {
@@ -231,5 +236,21 @@ describe("LatestTaskDetailLoader", () => {
     rejectOlder?.(new TaskRequestError("stale failure", 503));
 
     await expect(olderResult).resolves.toBeUndefined();
+  });
+
+  it("invalidates an in-flight cockpit response during cleanup", async () => {
+    let resolveRequest: ((value: typeof cockpit) => void) | undefined;
+    const request = new Promise<typeof cockpit>((resolve) => {
+      resolveRequest = resolve;
+    });
+    const loader = new LatestTaskDetailLoader();
+    const result = loader.load(task.id, undefined, {
+      detail: vi.fn().mockReturnValue(request),
+    });
+
+    loader.invalidate();
+    resolveRequest?.(cockpit);
+
+    await expect(result).resolves.toBeUndefined();
   });
 });

@@ -11,6 +11,10 @@ import { parseTaskCockpit, parseTaskList, parseTaskSummary } from "./tasks";
 const CSRF_COOKIE_NAME = "__Host-mathews-csrf";
 const controlPlaneUrl = normalizeControlPlaneUrl(process.env.NEXT_PUBLIC_CONTROL_PLANE_URL);
 
+export function taskEventStreamUrl(taskId: string): string {
+  return `${controlPlaneUrl}/api/tasks/${encodeURIComponent(taskId)}/events`;
+}
+
 export class TaskRequestError extends Error {
   constructor(
     message: string,
@@ -95,6 +99,10 @@ export type TaskDetailClient = Pick<typeof taskClient, "detail">;
 
 export class LatestTaskDetailLoader {
   private generation = 0;
+
+  invalidate(): void {
+    this.generation += 1;
+  }
 
   async load(
     taskId: string,

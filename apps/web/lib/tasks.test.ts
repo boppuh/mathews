@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   mergeLoadedTasks,
   parseTaskCockpit,
+  parseTaskEvent,
   parseTaskList,
   parseTaskSummary,
   shortRevision,
@@ -94,6 +95,7 @@ describe("task cockpit parsing", () => {
 
   it("accepts a safe durable cockpit projection", () => {
     expect(parseTaskCockpit(cockpit)).toEqual(cockpit);
+    expect(parseTaskEvent(cockpit.events[0])).toEqual(cockpit.events[0]);
   });
 
   it.each([

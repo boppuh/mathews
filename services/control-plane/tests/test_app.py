@@ -20,8 +20,10 @@ def test_health() -> None:
         "/health",
         headers={
             "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "Last-Event-ID",
             "Origin": "http://localhost:3000",
         },
     )
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert "Last-Event-ID" in preflight.headers["access-control-allow-headers"]
