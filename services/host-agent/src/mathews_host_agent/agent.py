@@ -96,16 +96,21 @@ def run(settings: HostAgentSettings) -> None:
         server.serve_forever(listener, should_stop=stopped.is_set)
 
 
+def _environment_or_default(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    return default if value is None or not value.strip() else value
+
+
 def main() -> None:
     default_directory = Path.home() / "Library" / "Application Support" / "Mathews"
     default_socket_path = Path(
-        os.environ.get(
+        _environment_or_default(
             "MATHEWS_HOST_SOCKET_PATH",
             str(default_directory / "host-agent.sock"),
         )
     ).expanduser()
     default_journal_path = Path(
-        os.environ.get(
+        _environment_or_default(
             "MATHEWS_HOST_JOURNAL_PATH",
             str(default_directory / "host-agent.sqlite3"),
         )
@@ -133,7 +138,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--auth-reference",
-        default=os.environ.get(
+        default=_environment_or_default(
             "MATHEWS_HOST_AUTH_KEY_REF",
             _DEFAULT_AUTH_REFERENCE,
         ),

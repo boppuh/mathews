@@ -110,6 +110,28 @@ def test_explicit_cli_paths_expand_the_user_home(
     assert captured[0].journal_path == tmp_path / "runtime" / "journal.sqlite3"
 
 
+def test_blank_host_environment_values_use_safe_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[HostAgentSettings] = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MATHEWS_HOST_SOCKET_PATH", "")
+    monkeypatch.setenv("MATHEWS_HOST_JOURNAL_PATH", "  ")
+    monkeypatch.setenv("MATHEWS_HOST_AUTH_KEY_REF", "")
+    monkeypatch.setattr(sys, "argv", ["mathews-host-agent"])
+    monkeypatch.setattr(agent_module, "run", captured.append)
+
+    main()
+
+    default_directory = tmp_path / "Library" / "Application Support" / "Mathews"
+    assert captured[0].socket_path == default_directory / "host-agent.sock"
+    assert captured[0].journal_path == default_directory / "host-agent.sqlite3"
+    assert captured[0].authentication_reference == SecretReference.parse(
+        "keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1"
+    )
+
+
 def test_invalid_environment_host_identity_fails_before_service_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
