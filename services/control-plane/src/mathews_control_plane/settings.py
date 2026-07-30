@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlsplit, urlunsplit
 
 from mathews_configuration import SecretReference
 from pydantic import AnyHttpUrl, PositiveInt, SecretStr, field_validator
@@ -194,7 +195,8 @@ def _safe_url(value: AnyHttpUrl | None) -> str | None:
         return None
     if value.username is not None or value.password is not None:
         return "[REDACTED URL]"
-    return str(value)
+    parsed = urlsplit(str(value))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 @lru_cache

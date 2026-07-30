@@ -70,6 +70,20 @@ def test_keychain_failure_never_exposes_command_output() -> None:
     assert leaked_value not in repr(error.value)
 
 
+def test_keychain_access_failure_is_not_reported_as_missing() -> None:
+    leaked_value = "credential-from-error-stream"
+
+    def runner(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 51, leaked_value, leaked_value)
+
+    provider = KeychainSecretProvider(platform_name="darwin", runner=runner)
+
+    with pytest.raises(KeychainUnavailableError) as error:
+        provider.get(SecretReference.parse("keychain://service/account"))
+    assert leaked_value not in str(error.value)
+    assert leaked_value not in repr(error.value)
+
+
 def test_keychain_timeout_suppresses_low_level_output() -> None:
     leaked_value = "partial-credential-output"
 

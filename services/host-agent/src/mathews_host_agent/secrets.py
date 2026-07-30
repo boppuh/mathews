@@ -9,6 +9,9 @@ from mathews_configuration import SecretProvider, SecretReference, SecretValue
 
 SecurityRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 
+# security(1) exposes errSecItemNotFound (-25300) as an 8-bit process status.
+_ITEM_NOT_FOUND_EXIT_CODE = 44
+
 
 class KeychainProviderError(RuntimeError):
     """Base error that never embeds command output or credential bytes."""
@@ -60,8 +63,10 @@ class KeychainSecretProvider(SecretProvider):
         except (OSError, subprocess.TimeoutExpired):
             raise KeychainUnavailableError("macOS Keychain could not be queried") from None
 
-        if result.returncode != 0:
+        if result.returncode == _ITEM_NOT_FOUND_EXIT_CODE:
             raise SecretNotFoundError("secret reference was not found in macOS Keychain")
+        if result.returncode != 0:
+            raise KeychainUnavailableError("macOS Keychain query failed")
 
         value = result.stdout.rstrip("\r\n")
         if not value:

@@ -115,9 +115,7 @@ def test_diagnostic_urls_reject_embedded_credentials(field_name: str) -> None:
     credential = "do-not-log-this-secret"
 
     with pytest.raises(ValidationError, match="URL credentials are not allowed") as error:
-        Settings.model_validate(
-            {field_name: f"https://user:{credential}@example.test"}
-        )
+        Settings.model_validate({field_name: f"https://user:{credential}@example.test"})
 
     assert credential not in str(error.value)
 
@@ -136,6 +134,23 @@ def test_safe_summary_redacts_url_credentials_if_validation_is_bypassed() -> Non
 
     assert credential not in summary
     assert summary.count("[REDACTED URL]") == 2
+
+
+def test_safe_summary_strips_url_query_and_fragment_data() -> None:
+    from mathews_control_plane.settings import Settings
+
+    credential = "do-not-log-this-secret"
+    credential_url = AnyHttpUrl(f"https://example.test/safe/path?api_key={credential}#{credential}")
+    settings = Settings.model_construct(
+        web_origin=credential_url,
+        hermes_endpoint=credential_url,
+    )
+
+    summary = settings.safe_summary()
+
+    assert credential not in str(summary)
+    assert summary["web_origin"] == "https://example.test/safe/path"
+    assert summary["hermes_endpoint"] == "https://example.test/safe/path"
 
 
 def test_configuration_report_redacts_database_credentials() -> None:
