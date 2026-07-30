@@ -17,6 +17,10 @@ from mathews_control_plane.database import (
     create_database_engine,
     create_session_factory,
 )
+from mathews_control_plane.reliability import (
+    StartupRecoveryResult,
+    StartupRecoveryService,
+)
 from mathews_control_plane.settings import Settings, settings
 
 logger = logging.getLogger("mathews.worker")
@@ -63,6 +67,18 @@ def _poll_delay(outcome: WorkerRunOutcome) -> float | None:
     return None
 
 
+def recover_worker_startup(
+    runtime_settings: Settings,
+    engine: Engine,
+) -> StartupRecoveryResult:
+    """Reconcile durable external state before the worker may claim work."""
+
+    return StartupRecoveryService(
+        create_session_factory(engine),
+        ArtifactStore(runtime_settings.artifact_root),
+    ).recover()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Mathews control-plane worker")
     mode = parser.add_mutually_exclusive_group()
@@ -85,6 +101,21 @@ def main() -> None:
         return
     worker, engine = build_worker(settings)
     try:
+        recovery = recover_worker_startup(settings, engine)
+        logger.info(
+            "worker startup recovery completed",
+            extra={
+                "completed_cancellations": len(
+                    recovery.completed_cancellation_ids
+                ),
+                "escalated_jobs": len(recovery.escalated_job_ids),
+                "reconciled_targets": len(
+                    recovery.reconciled_target_ids
+                ),
+                "recovered_jobs": len(recovery.recovered_job_ids),
+                "resolved_outages": len(recovery.resolved_outage_ids),
+            },
+        )
         if args.poll_once:
             logger.info("worker poll completed", extra={"outcome": worker.run_once()})
             return

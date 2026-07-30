@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database import SessionFactory
@@ -24,13 +25,28 @@ from mathews_control_plane.domain_models import (
     BackgroundJobEffect,
     BackgroundJobEffectStatus,
     BackgroundJobFencingCounter,
+    BackgroundJobIgnoredResult,
     BackgroundJobLease,
     BackgroundJobStatus,
     BackgroundJobTaskTransition,
+    BackgroundJobToolGrant,
+    DependencyOutageAttempt,
+    DependencyService,
+    OwnedHostProcess,
+    OwnedHostProcessStatus,
+    ReconciliationStatus,
+    ReconciliationTarget,
+    ReconciliationTargetKind,
     Task,
     TaskState,
 )
-from mathews_control_plane.evidence import redact_evidence_content
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+    redact_evidence_content,
+)
 from mathews_control_plane.task_state_machine import (
     ClosedTaskTransitionGateEvaluator,
     TaskTransitionGateEvaluator,
@@ -43,9 +59,11 @@ MAX_LEASE_SECONDS = 300
 MAX_RETRY_SECONDS = 86_400
 MAX_JOB_IDENTIFIER_LENGTH = 100
 MAX_IDEMPOTENCY_KEY_LENGTH = 255
+MAX_RECOVERY_BATCH_SIZE = 1000
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,99}\Z")
+_LOGGER = logging.getLogger(__name__)
 
 
 class BackgroundJobError(RuntimeError):
@@ -86,6 +104,15 @@ class TerminalBackgroundJobError(BackgroundJobError):
     def __init__(self, error_code: str) -> None:
         self.error_code = _required_error_code(error_code)
         super().__init__(self.error_code)
+
+
+class DependencyOutageError(BackgroundJobError):
+    """A host, Hermes, or GitHub failure governed by bounded outage retry."""
+
+    def __init__(self, service: DependencyService, error_code: str) -> None:
+        self.service = service
+        self.error_code = _required_error_code(error_code)
+        super().__init__(f"{service.value}:{self.error_code}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +197,42 @@ class JobFailureDisposition:
     next_attempt_at: datetime | None
     exhausted: bool
     retry_delay: timedelta | None
+    escalation_request_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolGrantResult:
+    """Stable identity for one lease-bound Hermes capability."""
+
+    grant_id: UUID
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedProcessResult:
+    """Stable identity for one host-owned process group."""
+
+    process_id: UUID
+    ownership_nonce: UUID
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IgnoredResult:
+    """Evidence reference for a late result that could not mutate job truth."""
+
+    ignored_result_id: UUID
+    evidence_id: UUID
+    reason_code: str
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationTargetResult:
+    """Stable identity for an external state startup must observe."""
+
+    target_id: UUID
+    replayed: bool
 
 
 class WorkerRunOutcome(StrEnum):
@@ -178,6 +241,7 @@ class WorkerRunOutcome(StrEnum):
     IDLE = "IDLE"
     SUCCEEDED = "SUCCEEDED"
     RETRY_SCHEDULED = "RETRY_SCHEDULED"
+    ESCALATED = "ESCALATED"
     FAILED = "FAILED"
     LEASE_LOST = "LEASE_LOST"
 
@@ -286,6 +350,47 @@ def _fingerprint(value: Mapping[str, object]) -> str:
         ensure_ascii=True,
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _bounded_evidence_payload(
+    value: Mapping[str, object],
+    *,
+    maximum_bytes: int = 256 * 1024,
+) -> dict[str, object]:
+    """Keep operational evidence below the envelope limit without losing identity."""
+
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError):
+        raise InvalidBackgroundJobError(
+            "background job evidence is not JSON serializable"
+        ) from None
+    if len(encoded) <= maximum_bytes:
+        return dict(value)
+    bounded: dict[str, object] = {}
+    for key in sorted(value)[:64]:
+        child = value[key]
+        if child is None or isinstance(child, bool | int | float):
+            bounded[key] = child
+        elif isinstance(child, str):
+            bounded[key] = child[:2048]
+        else:
+            bounded[key] = {
+                "truncated": True,
+                "value_type": type(child).__name__,
+            }
+    bounded["_truncation"] = {
+        "byte_count": len(encoded),
+        "field_count": len(value),
+        "truncated": True,
+    }
+    return bounded
 
 
 def _schedule_fingerprint(
@@ -485,6 +590,16 @@ class BackgroundJobService:
                     job_type=normalized_type,
                     fingerprint=fingerprint,
                 )
+            if TaskState(task.state) in {
+                TaskState.BRIEF_PENDING_APPROVAL,
+                TaskState.ESCALATED,
+                TaskState.HANDED_OFF,
+                TaskState.FAILED,
+                TaskState.CANCELLED,
+            }:
+                raise BackgroundJobConflictError(
+                    "background job task is not runnable"
+                )
             _ensure_fencing_counter(session)
             job = BackgroundJob(
                 task_id=task.id,
@@ -545,11 +660,47 @@ class BackgroundJobService:
         )
         with self._factory() as session, session.begin():
             _begin_serialized(session)
+            outage_job = aliased(BackgroundJob)
             while True:
                 scan_time = _as_utc(self._clock())
                 eligible = and_(
                     BackgroundJob.task_id.is_not(None),
                     BackgroundJob.cancellation_requested_at.is_(None),
+                    exists().where(
+                        Task.id == BackgroundJob.task_id,
+                        Task.state.not_in(
+                            (
+                                TaskState.BRIEF_PENDING_APPROVAL,
+                                TaskState.ESCALATED,
+                                TaskState.HANDED_OFF,
+                                TaskState.FAILED,
+                                TaskState.CANCELLED,
+                            )
+                        ),
+                    ),
+                    ~exists().where(
+                        DependencyOutageAttempt.exhausted.is_(True),
+                        DependencyOutageAttempt.resolved_at.is_(None),
+                        outage_job.id
+                        == DependencyOutageAttempt.job_id,
+                        outage_job.task_id == BackgroundJob.task_id,
+                    ),
+                    ~exists().where(
+                        or_(
+                            ReconciliationTarget.job_id
+                            == BackgroundJob.id,
+                            ReconciliationTarget.task_id
+                            == BackgroundJob.task_id,
+                        ),
+                        ReconciliationTarget.status.in_(
+                            (
+                                ReconciliationStatus.PENDING,
+                                ReconciliationStatus.UPDATED,
+                                ReconciliationStatus.RETRY_REQUIRED,
+                                ReconciliationStatus.QUARANTINED,
+                            )
+                        ),
+                    ),
                     or_(
                         and_(
                             BackgroundJob.status == BackgroundJobStatus.QUEUED,
@@ -671,6 +822,333 @@ class BackgroundJobService:
                 job.updated_at = now
                 session.flush()
                 return _grant(job, lease, recovered=recovered)
+
+    def reconcile_expired_leases(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[UUID, ...]:
+        """Release expired ownership without issuing any replacement effect."""
+
+        if not 1 <= limit <= MAX_RECOVERY_BATCH_SIZE:
+            raise InvalidBackgroundJobError(
+                "background job recovery limit must be between 1 and 1000"
+            )
+        recovered: list[UUID] = []
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            now = _as_utc(self._clock())
+            query = (
+                select(BackgroundJob)
+                .where(
+                    BackgroundJob.status == BackgroundJobStatus.RUNNING,
+                    BackgroundJob.lease_expires_at.is_not(None),
+                    BackgroundJob.lease_expires_at <= now,
+                )
+                .order_by(
+                    BackgroundJob.lease_expires_at,
+                    BackgroundJob.created_at,
+                    BackgroundJob.id,
+                )
+                .limit(limit)
+            )
+            if session.get_bind().dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            else:
+                query = query.with_for_update()
+            for job in session.scalars(query):
+                lease = session.scalar(
+                    select(BackgroundJobLease)
+                    .where(
+                        BackgroundJobLease.id == job.current_lease_id,
+                        BackgroundJobLease.job_id == job.id,
+                        BackgroundJobLease.fencing_token
+                        == job.current_fencing_token,
+                    )
+                    .with_for_update()
+                )
+                if lease is None or lease.released_at is not None:
+                    raise BackgroundJobConflictError(
+                        "background job active lease projection is corrupt"
+                    )
+                cancelled = job.cancellation_requested_at is not None
+                exhausted = job.attempt_count >= job.max_attempts
+                lease.released_at = now
+                lease.release_reason = "CANCELLED" if cancelled else "EXPIRED"
+                lease.failure_code = (
+                    "CANCELLATION_REQUESTED"
+                    if cancelled
+                    else (
+                        "LEASE_EXPIRED_ATTEMPTS_EXHAUSTED"
+                        if exhausted
+                        else "LEASE_EXPIRED"
+                    )
+                )
+                lease.cancellation_acknowledged_at = now if cancelled else None
+                lease.actor_id = self._principal_id
+                lease.updated_at = now
+                session.flush((lease,))
+                if cancelled:
+                    target_status = BackgroundJobStatus.CANCELLED
+                    completed_at = now
+                elif exhausted:
+                    target_status = BackgroundJobStatus.FAILED
+                    completed_at = now
+                else:
+                    target_status = BackgroundJobStatus.QUEUED
+                    completed_at = None
+                    job.available_at = now
+                _finish_job(
+                    job,
+                    status=target_status,
+                    error_code=lease.failure_code,
+                    token=lease.fencing_token,
+                    completed_at=completed_at or now,
+                    principal_id=self._principal_id,
+                )
+                if target_status is BackgroundJobStatus.QUEUED:
+                    job.completed_at = None
+                session.flush((job,))
+                recovered.append(job.id)
+        return tuple(recovered)
+
+    def issue_tool_grant(
+        self,
+        grant: JobLeaseGrant,
+        *,
+        grant_key: str,
+        capability_scope: Mapping[str, object],
+    ) -> ToolGrantResult:
+        """Persist a Hermes capability only while its lease fence is current."""
+
+        normalized_key = _required_identifier(
+            grant_key,
+            field="tool grant key",
+            maximum=MAX_IDEMPOTENCY_KEY_LENGTH,
+        )
+        normalized_scope = _safe_payload(
+            capability_scope,
+            field="tool grant scope",
+        )
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            job, lease, now = _current_lease(
+                session,
+                grant,
+                clock=self._clock,
+            )
+            existing = session.scalar(
+                select(BackgroundJobToolGrant)
+                .where(
+                    BackgroundJobToolGrant.job_id == job.id,
+                    BackgroundJobToolGrant.grant_key == normalized_key,
+                )
+                .with_for_update()
+            )
+            if existing is not None:
+                if (
+                    existing.lease_id != lease.id
+                    or existing.fencing_token != lease.fencing_token
+                    or existing.capability_scope != normalized_scope
+                ):
+                    raise BackgroundJobConflictError(
+                        "background job tool grant key conflicts"
+                    )
+                return ToolGrantResult(grant_id=existing.id, replayed=True)
+            tool_grant = BackgroundJobToolGrant(
+                job_id=job.id,
+                lease_id=lease.id,
+                fencing_token=lease.fencing_token,
+                grant_key=normalized_key,
+                capability_scope=normalized_scope,
+                issued_at=now,
+                owner_id=job.owner_id,
+                actor_id=self._principal_id,
+                root_correlation_id=job.root_correlation_id,
+                causation_id=lease.id,
+                parent_correlation_id=job.id,
+            )
+            session.add(tool_grant)
+            session.flush()
+            return ToolGrantResult(grant_id=tool_grant.id, replayed=False)
+
+    def register_owned_process(
+        self,
+        grant: JobLeaseGrant,
+        *,
+        host_id: str,
+        pid: int,
+        process_group_id: int,
+        birth_token: str,
+        ownership_nonce: UUID,
+    ) -> OwnedProcessResult:
+        """Bind an exact host process identity to the current lease fence."""
+
+        normalized_host = _required_identifier(
+            host_id,
+            field="host",
+            maximum=255,
+        )
+        normalized_birth = _required_identifier(
+            birth_token,
+            field="process birth token",
+            maximum=255,
+        )
+        if pid <= 1 or process_group_id <= 1:
+            raise InvalidBackgroundJobError(
+                "background job process identity is unsafe"
+            )
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            job, lease, now = _current_lease(
+                session,
+                grant,
+                clock=self._clock,
+            )
+            existing = session.scalar(
+                select(OwnedHostProcess)
+                .where(OwnedHostProcess.ownership_nonce == ownership_nonce)
+                .with_for_update()
+            )
+            if existing is not None:
+                if (
+                    existing.job_id != job.id
+                    or existing.lease_id != lease.id
+                    or existing.fencing_token != lease.fencing_token
+                    or existing.host_id != normalized_host
+                    or existing.pid != pid
+                    or existing.process_group_id != process_group_id
+                    or existing.birth_token != normalized_birth
+                ):
+                    raise BackgroundJobConflictError(
+                        "background job process ownership conflicts"
+                    )
+                return OwnedProcessResult(
+                    process_id=existing.id,
+                    ownership_nonce=existing.ownership_nonce,
+                    replayed=True,
+                )
+            process = OwnedHostProcess(
+                job_id=job.id,
+                lease_id=lease.id,
+                fencing_token=lease.fencing_token,
+                host_id=normalized_host,
+                pid=pid,
+                process_group_id=process_group_id,
+                birth_token=normalized_birth,
+                ownership_nonce=ownership_nonce,
+                status=OwnedHostProcessStatus.RUNNING,
+                started_at=now,
+                owner_id=job.owner_id,
+                actor_id=self._principal_id,
+                root_correlation_id=job.root_correlation_id,
+                causation_id=lease.id,
+                parent_correlation_id=job.id,
+            )
+            session.add(process)
+            session.flush()
+            expected_payload = {
+                "birth_token": process.birth_token,
+                "host_id": process.host_id,
+                "job_id": str(process.job_id),
+                "ownership_nonce": str(process.ownership_nonce),
+                "pid": process.pid,
+                "process_group_id": process.process_group_id,
+            }
+            session.add(
+                ReconciliationTarget(
+                    task_id=job.task_id,
+                    job_id=job.id,
+                    kind=ReconciliationTargetKind.HOST_PROCESS,
+                    target_key=f"process:{process.id}",
+                    expected_payload=expected_payload,
+                    expected_fingerprint=_fingerprint(expected_payload),
+                    status=ReconciliationStatus.PENDING,
+                    reconciliation_version=0,
+                    owner_id=job.owner_id,
+                    actor_id=self._principal_id,
+                    root_correlation_id=job.root_correlation_id,
+                    causation_id=process.id,
+                    parent_correlation_id=job.id,
+                )
+            )
+            session.flush()
+            return OwnedProcessResult(
+                process_id=process.id,
+                ownership_nonce=process.ownership_nonce,
+                replayed=False,
+            )
+
+    def register_reconciliation_target(
+        self,
+        grant: JobLeaseGrant,
+        *,
+        kind: ReconciliationTargetKind,
+        target_key: str,
+        expected_payload: Mapping[str, object],
+    ) -> ReconciliationTargetResult:
+        """Register exact external state before relying on it after restart."""
+
+        normalized_key = _required_identifier(
+            target_key,
+            field="reconciliation target key",
+            maximum=MAX_IDEMPOTENCY_KEY_LENGTH,
+        )
+        payload = _safe_payload(
+            expected_payload,
+            field="reconciliation expected state",
+        )
+        fingerprint = _fingerprint(payload)
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            job, lease, _now = _current_lease(
+                session,
+                grant,
+                clock=self._clock,
+            )
+            existing = session.scalar(
+                select(ReconciliationTarget)
+                .where(
+                    ReconciliationTarget.kind == kind,
+                    ReconciliationTarget.target_key == normalized_key,
+                )
+                .with_for_update()
+            )
+            if existing is not None:
+                if (
+                    existing.task_id != job.task_id
+                    or existing.job_id != job.id
+                    or existing.expected_fingerprint != fingerprint
+                    or existing.expected_payload != payload
+                ):
+                    raise BackgroundJobConflictError(
+                        "background job reconciliation target conflicts"
+                    )
+                return ReconciliationTargetResult(
+                    target_id=existing.id,
+                    replayed=True,
+                )
+            target = ReconciliationTarget(
+                task_id=job.task_id,
+                job_id=job.id,
+                kind=kind,
+                target_key=normalized_key,
+                expected_payload=payload,
+                expected_fingerprint=fingerprint,
+                status=ReconciliationStatus.PENDING,
+                reconciliation_version=0,
+                owner_id=job.owner_id,
+                actor_id=self._principal_id,
+                root_correlation_id=job.root_correlation_id,
+                causation_id=lease.id,
+                parent_correlation_id=job.id,
+            )
+            session.add(target)
+            session.flush()
+            return ReconciliationTargetResult(
+                target_id=target.id,
+                replayed=False,
+            )
 
     def heartbeat(
         self,
@@ -889,6 +1367,184 @@ class BackgroundJobService:
                 now=now,
             )
 
+    def record_ignored_result(
+        self,
+        grant: JobLeaseGrant,
+        *,
+        idempotency_key: str,
+        effect_id: UUID | None,
+        result: EffectExecutionResult,
+    ) -> IgnoredResult:
+        """Store a fenced late result as evidence without changing job state."""
+
+        normalized_key = _required_identifier(
+            idempotency_key,
+            field="ignored result idempotency key",
+            maximum=MAX_IDEMPOTENCY_KEY_LENGTH,
+        )
+        bounded_result = _bounded_evidence_payload(result.payload)
+        prepared_result = redact_evidence_content(
+            bounded_result,
+            media_type="application/json",
+        )
+        normalized_result = prepared_result.value
+        if not isinstance(normalized_result, dict):
+            raise InvalidBackgroundJobError(
+                "background job ignored effect result is invalid"
+            )
+        fingerprint = _fingerprint(
+            {
+                "effect_id": None if effect_id is None else str(effect_id),
+                "lease_id": str(grant.lease_id),
+                "result_fingerprint": _fingerprint(result.payload),
+                "succeeded": result.succeeded,
+            }
+        )
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            job = session.scalar(
+                select(BackgroundJob)
+                .where(BackgroundJob.id == grant.job_id)
+                .with_for_update()
+            )
+            lease = session.scalar(
+                select(BackgroundJobLease)
+                .where(
+                    BackgroundJobLease.id == grant.lease_id,
+                    BackgroundJobLease.job_id == grant.job_id,
+                    BackgroundJobLease.lease_owner == grant.worker_id,
+                    BackgroundJobLease.attempt == grant.attempt,
+                    BackgroundJobLease.fencing_token == grant.fencing_token,
+                )
+                .with_for_update()
+            )
+            if (
+                job is None
+                or lease is None
+                or job.task_id != grant.task_id
+            ):
+                raise BackgroundJobNotFoundError(
+                    "background job historical lease is unavailable"
+                )
+            still_current = (
+                job.status is BackgroundJobStatus.RUNNING
+                and job.current_lease_id == grant.lease_id
+                and job.current_fencing_token == grant.fencing_token
+                and job.cancellation_requested_at is None
+                and lease.released_at is None
+            )
+            if still_current:
+                raise BackgroundJobConflictError(
+                    "background job result is not fenced"
+                )
+            if effect_id is not None:
+                effect = session.scalar(
+                    select(BackgroundJobEffect.id).where(
+                        BackgroundJobEffect.id == effect_id,
+                        BackgroundJobEffect.job_id == job.id,
+                    )
+                )
+                if effect is None:
+                    raise BackgroundJobNotFoundError(
+                        "background job effect is unavailable"
+                    )
+            existing = session.scalar(
+                select(BackgroundJobIgnoredResult)
+                .where(
+                    BackgroundJobIgnoredResult.idempotency_key
+                    == normalized_key
+                )
+                .with_for_update()
+            )
+            reason_code = (
+                "CANCELLED"
+                if job.cancellation_requested_at is not None
+                else "FENCED"
+            )
+            if existing is not None:
+                if (
+                    existing.job_id != job.id
+                    or existing.lease_id != lease.id
+                    or existing.fencing_token != lease.fencing_token
+                    or existing.effect_id != effect_id
+                    or existing.result_fingerprint != fingerprint
+                    or existing.reason_code != reason_code
+                ):
+                    raise BackgroundJobConflictError(
+                        "background job ignored result key conflicts"
+                    )
+                return IgnoredResult(
+                    ignored_result_id=existing.id,
+                    evidence_id=existing.evidence_id,
+                    reason_code=existing.reason_code,
+                    replayed=True,
+                )
+            now = _as_utc(self._clock())
+            ignored_id = uuid5(
+                NAMESPACE_URL,
+                f"mathews:ignored-result:{normalized_key}",
+            )
+            evidence_id = uuid5(
+                NAMESPACE_URL,
+                f"mathews:ignored-result-evidence:{normalized_key}",
+            )
+            captured = capture_evidence(
+                session,
+                self._artifact_store,
+                payload={
+                    "effect_id": (
+                        None if effect_id is None else str(effect_id)
+                    ),
+                    "fencing_token": grant.fencing_token,
+                    "job_id": str(job.id),
+                    "lease_id": str(lease.id),
+                    "reason_code": reason_code,
+                    "result": _bounded_evidence_payload(
+                        normalized_result
+                    ),
+                    "succeeded": result.succeeded,
+                },
+                media_type="application/json",
+                source_kind=EvidenceSourceKind.RESULT,
+                evidence_type="ignored-job-result",
+                origin=f"background-job:{job.id}:late-result",
+                access_classification=EvidenceAccessClass.TASK_OWNER,
+                retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+                owner_id=job.owner_id,
+                actor_id=self._principal_id,
+                root_correlation_id=job.root_correlation_id,
+                task_id=job.task_id,
+                causation_id=lease.id,
+                parent_correlation_id=job.id,
+                evidence_id=evidence_id,
+                captured_at=now,
+            )
+            ignored = BackgroundJobIgnoredResult(
+                id=ignored_id,
+                job_id=job.id,
+                lease_id=lease.id,
+                fencing_token=lease.fencing_token,
+                effect_id=effect_id,
+                idempotency_key=normalized_key,
+                result_fingerprint=fingerprint,
+                evidence_id=captured.record.id,
+                reason_code=reason_code,
+                received_at=now,
+                owner_id=job.owner_id,
+                actor_id=self._principal_id,
+                root_correlation_id=job.root_correlation_id,
+                causation_id=lease.id,
+                parent_correlation_id=job.id,
+            )
+            session.add(ignored)
+            session.flush()
+            return IgnoredResult(
+                ignored_result_id=ignored.id,
+                evidence_id=ignored.evidence_id,
+                reason_code=ignored.reason_code,
+                replayed=False,
+            )
+
     def complete(
         self,
         grant: JobLeaseGrant,
@@ -958,47 +1614,399 @@ class BackgroundJobService:
                 grant,
                 clock=self._clock,
             )
-            policy = RetryPolicy(
-                max_attempts=job.max_attempts,
-                base_delay_seconds=job.retry_base_seconds,
-                max_delay_seconds=job.retry_max_seconds,
+            return _release_failed_attempt(
+                session,
+                job,
+                lease,
+                grant=grant,
+                error_code=normalized_code,
+                retryable=retryable,
+                principal_id=self._principal_id,
+                now=now,
             )
-            can_retry = retryable and job.attempt_count < job.max_attempts
-            delay = (
-                deterministic_retry_delay(job.id, job.attempt_count, policy) if can_retry else None
+
+    def fail_dependency_attempt(
+        self,
+        grant: JobLeaseGrant,
+        *,
+        service: DependencyService,
+        error_code: str,
+    ) -> JobFailureDisposition:
+        """Persist a dependency retry and escalate exact exhausted state."""
+
+        normalized_code = _required_error_code(error_code)
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            job, lease, now = _current_lease(
+                session,
+                grant,
+                clock=self._clock,
             )
-            retry_at = None if delay is None else now + delay
-            lease.released_at = now
-            lease.release_reason = "RETRY" if can_retry else "FAILED"
-            lease.retry_at = retry_at
-            lease.failure_code = normalized_code
-            lease.actor_id = self._principal_id
-            lease.updated_at = now
+            outage_id = uuid5(
+                NAMESPACE_URL,
+                f"mathews:outage:{job.id}:{job.attempt_count}",
+            )
+            evidence_id = uuid5(
+                NAMESPACE_URL,
+                f"mathews:outage-evidence:{job.id}:{job.attempt_count}",
+            )
+            captured = capture_evidence(
+                session,
+                self._artifact_store,
+                payload={
+                    "attempt": job.attempt_count,
+                    "checkpoint_fingerprint": (
+                        None
+                        if job.checkpoint is None
+                        else _fingerprint(job.checkpoint)
+                    ),
+                    "checkpoint_version": job.checkpoint_version,
+                    "error_code": normalized_code,
+                    "job_id": str(job.id),
+                    "service": service.value,
+                },
+                media_type="application/json",
+                source_kind=EvidenceSourceKind.EXTERNAL_EVENT,
+                evidence_type="dependency-outage",
+                origin=f"background-job:{job.id}:outage:{job.attempt_count}",
+                access_classification=EvidenceAccessClass.TASK_OWNER,
+                retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+                owner_id=job.owner_id,
+                actor_id=self._principal_id,
+                root_correlation_id=job.root_correlation_id,
+                task_id=job.task_id,
+                causation_id=lease.id,
+                parent_correlation_id=job.id,
+                evidence_id=evidence_id,
+                captured_at=now,
+            )
+            disposition = _release_failed_attempt(
+                session,
+                job,
+                lease,
+                grant=grant,
+                error_code=normalized_code,
+                retryable=True,
+                principal_id=self._principal_id,
+                now=now,
+            )
+            session.add(
+                DependencyOutageAttempt(
+                    id=outage_id,
+                    job_id=job.id,
+                    lease_id=lease.id,
+                    fencing_token=lease.fencing_token,
+                    attempt=lease.attempt,
+                    service=service,
+                    error_code=normalized_code,
+                    checkpoint_evidence_id=captured.record.id,
+                    exhausted=disposition.exhausted,
+                    occurred_at=now,
+                    owner_id=job.owner_id,
+                    actor_id=self._principal_id,
+                    root_correlation_id=job.root_correlation_id,
+                    causation_id=lease.id,
+                    parent_correlation_id=job.id,
+                )
+            )
             session.flush()
-            if can_retry:
-                if retry_at is None:
-                    raise BackgroundJobConflictError("background job retry schedule is unavailable")
-                job.status = BackgroundJobStatus.QUEUED
-                job.available_at = retry_at
-                job.completed_at = None
+            job_id = job.id
+        if not disposition.exhausted:
+            return disposition
+        request_id = self.reconcile_outage_escalation(job_id)
+        return replace(
+            disposition,
+            escalation_request_id=request_id,
+        )
+
+    def reconcile_outage_escalation(self, job_id: UUID) -> UUID | None:
+        """Idempotently create the retry-limit approval for an exhausted outage."""
+
+        from mathews_control_plane.approvals import (
+            ApprovalError,
+            ApprovalRetryAttempt,
+            ApprovalService,
+            BlockedOperation,
+        )
+        from mathews_control_plane.domain_models import ApprovalRequestType
+
+        with self._factory() as session:
+            job = session.get(BackgroundJob, job_id)
+            if job is None or job.task_id is None:
+                raise BackgroundJobNotFoundError(
+                    "background job outage is unavailable"
+                )
+            task = session.get(Task, job.task_id)
+            attempts = tuple(
+                session.scalars(
+                    select(DependencyOutageAttempt)
+                    .where(DependencyOutageAttempt.job_id == job.id)
+                    .order_by(
+                        DependencyOutageAttempt.attempt,
+                        DependencyOutageAttempt.id,
+                    )
+                )
+            )
+            if task is None or not attempts or not attempts[-1].exhausted:
+                raise BackgroundJobConflictError(
+                    "background job outage is not exhausted"
+                )
+            latest = attempts[-1]
+            if latest.approval_request_id is not None:
+                return latest.approval_request_id
+            if TaskState(task.state) in {
+                TaskState.HANDED_OFF,
+                TaskState.FAILED,
+                TaskState.CANCELLED,
+            }:
+                return None
+            expected_state = TaskState(task.state)
+            request_id = uuid5(
+                NAMESPACE_URL,
+                f"mathews:outage-approval:{latest.id}",
+            )
+            evidence_ids = tuple(
+                attempt.checkpoint_evidence_id for attempt in attempts
+            )
+            retry_history = tuple(
+                ApprovalRetryAttempt(
+                    attempt=attempt.attempt,
+                    error_code=attempt.error_code,
+                    occurred_at=attempt.occurred_at,
+                    checkpoint_evidence_id=attempt.checkpoint_evidence_id,
+                )
+                for attempt in attempts
+            )
+            blocked_operation = BlockedOperation(
+                operation_name=(
+                    f"dependency.{DependencyService(latest.service).value.lower()}.resume"
+                ),
+                idempotency_key=f"outage:{job.id}:{latest.attempt}",
+                input_fingerprint=job.input_fingerprint,
+                checkpoint_evidence_id=latest.checkpoint_evidence_id,
+            )
+            task_id = task.id
+            reason_code = (
+                f"{DependencyService(latest.service).value}_RETRY_LIMIT"
+            )
+        try:
+            ApprovalService(
+                self._factory,
+                self._artifact_store,
+                principal_id=self._principal_id,
+                clock=self._clock,
+            ).request(
+                task_id,
+                request_id=request_id,
+                expected_state=expected_state,
+                request_type=ApprovalRequestType.RETRY_LIMIT,
+                reason_code=reason_code,
+                subject_type="BLOCKED_OPERATION",
+                subject_id=None,
+                blocked_operation=blocked_operation,
+                retry_history=retry_history,
+                evidence_ids=evidence_ids,
+                expires_at=_as_utc(latest.occurred_at)
+                + timedelta(days=30),
+            )
+        except ApprovalError as error:
+            _LOGGER.warning(
+                "outage escalation remains pending",
+                extra={
+                    "error_type": type(error).__name__,
+                    "job_id": str(job_id),
+                },
+            )
+            return None
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            latest_row = session.scalar(
+                select(DependencyOutageAttempt)
+                .where(DependencyOutageAttempt.id == latest.id)
+                .with_for_update()
+            )
+            if latest_row is None:
+                raise BackgroundJobConflictError(
+                    "background job outage disappeared"
+                )
+            if latest_row.approval_request_id not in {None, request_id}:
+                raise BackgroundJobConflictError(
+                    "background job outage approval conflicts"
+                )
+            latest_row.approval_request_id = request_id
+            latest_row.actor_id = self._principal_id
+            latest_row.updated_at = _as_utc(self._clock())
+            session.flush()
+        return request_id
+
+    def reconcile_pending_outage_escalations(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[UUID, ...]:
+        """Retry durable exhausted escalations left incomplete by a restart."""
+
+        if not 1 <= limit <= MAX_RECOVERY_BATCH_SIZE:
+            raise InvalidBackgroundJobError(
+                "background job recovery limit must be between 1 and 1000"
+            )
+        with self._factory() as session:
+            job_ids = tuple(
+                session.scalars(
+                    select(DependencyOutageAttempt.job_id)
+                    .where(
+                        DependencyOutageAttempt.exhausted.is_(True),
+                        DependencyOutageAttempt.approval_request_id.is_(None),
+                    )
+                    .order_by(DependencyOutageAttempt.occurred_at)
+                    .limit(limit)
+                )
+            )
+        reconciled: list[UUID] = []
+        for candidate in dict.fromkeys(job_ids):
+            if self.reconcile_outage_escalation(candidate) is not None:
+                reconciled.append(candidate)
+        return tuple(reconciled)
+
+    def reconcile_outage_decisions(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[UUID, ...]:
+        """Resume an approved outage as a new immutable job generation."""
+
+        from mathews_control_plane.domain_models import (
+            ApprovalDecision,
+            ApprovalRequest,
+            ApprovalStatus,
+        )
+
+        if not 1 <= limit <= MAX_RECOVERY_BATCH_SIZE:
+            raise InvalidBackgroundJobError(
+                "background job recovery limit must be between 1 and 1000"
+            )
+        reconciled: list[UUID] = []
+        terminal_decided = False
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            query = (
+                select(DependencyOutageAttempt)
+                .join(
+                    ApprovalRequest,
+                    ApprovalRequest.id
+                    == DependencyOutageAttempt.approval_request_id,
+                )
+                .where(
+                    DependencyOutageAttempt.exhausted.is_(True),
+                    DependencyOutageAttempt.resolved_at.is_(None),
+                    ApprovalRequest.status != ApprovalStatus.PENDING,
+                )
+                .order_by(DependencyOutageAttempt.occurred_at)
+                .limit(limit)
+            )
+            if session.get_bind().dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
             else:
-                job.status = BackgroundJobStatus.FAILED
-                job.completed_at = now
-            job.current_lease_id = None
-            job.current_fencing_token = None
-            job.lease_owner = None
-            job.lease_expires_at = None
-            job.last_fencing_token = grant.fencing_token
-            job.last_error_code = normalized_code
-            job.actor_id = self._principal_id
-            job.updated_at = now
-            session.flush()
-            return JobFailureDisposition(
-                status=BackgroundJobStatus.QUEUED if can_retry else BackgroundJobStatus.FAILED,
-                next_attempt_at=retry_at,
-                exhausted=retryable and not can_retry,
-                retry_delay=delay,
-            )
+                query = query.with_for_update()
+            for outage in session.scalars(query):
+                request = session.get(
+                    ApprovalRequest,
+                    outage.approval_request_id,
+                )
+                job = session.scalar(
+                    select(BackgroundJob)
+                    .where(BackgroundJob.id == outage.job_id)
+                    .with_for_update()
+                )
+                if (
+                    request is None
+                    or request.decision_id is None
+                    or request.decision is None
+                    or job is None
+                    or job.task_id is None
+                ):
+                    raise BackgroundJobConflictError(
+                        "background job outage decision is corrupt"
+                    )
+                now = _as_utc(self._clock())
+                decision = ApprovalDecision(request.decision)
+                resumed_job: BackgroundJob | None = None
+                if decision is ApprovalDecision.RETRY:
+                    resume_key = f"outage-resume:{request.decision_id}"
+                    resumed_job = session.scalar(
+                        select(BackgroundJob).where(
+                            BackgroundJob.idempotency_key == resume_key
+                        )
+                    )
+                    if resumed_job is None:
+                        policy = RetryPolicy(
+                            max_attempts=job.max_attempts,
+                            base_delay_seconds=job.retry_base_seconds,
+                            max_delay_seconds=job.retry_max_seconds,
+                        )
+                        resumed_job = BackgroundJob(
+                            task_id=job.task_id,
+                            job_type=job.job_type,
+                            input_payload=dict(job.input_payload),
+                            input_fingerprint=_schedule_fingerprint(
+                                task_id=job.task_id,
+                                job_type=job.job_type,
+                                payload=job.input_payload,
+                                policy=policy,
+                                requested_available_at=None,
+                            ),
+                            status=BackgroundJobStatus.QUEUED,
+                            idempotency_key=resume_key,
+                            attempt_count=0,
+                            max_attempts=policy.max_attempts,
+                            retry_base_seconds=policy.base_delay_seconds,
+                            retry_max_seconds=policy.max_delay_seconds,
+                            available_at=now,
+                            checkpoint=(
+                                None
+                                if job.checkpoint is None
+                                else dict(job.checkpoint)
+                            ),
+                            checkpoint_version=job.checkpoint_version,
+                            owner_id=job.owner_id,
+                            actor_id=self._principal_id,
+                            root_correlation_id=job.root_correlation_id,
+                            causation_id=request.decision_id,
+                            parent_correlation_id=job.id,
+                        )
+                        session.add(resumed_job)
+                        session.flush()
+                    elif (
+                        resumed_job.task_id != job.task_id
+                        or resumed_job.parent_correlation_id != job.id
+                    ):
+                        raise BackgroundJobConflictError(
+                            "background job outage resume key conflicts"
+                        )
+                elif decision in {
+                    ApprovalDecision.ABANDON,
+                    ApprovalDecision.CANCEL,
+                }:
+                    terminal_decided = True
+                outage.resolved_at = now
+                outage.decision_id = request.decision_id
+                outage.resumed_job_id = (
+                    None if resumed_job is None else resumed_job.id
+                )
+                outage.actor_id = self._principal_id
+                outage.updated_at = now
+                session.flush()
+                reconciled.append(outage.id)
+        if terminal_decided:
+            from mathews_control_plane.reliability import CancellationService
+
+            CancellationService(
+                self._factory,
+                self._artifact_store,
+                principal_id=self._principal_id,
+                clock=self._clock,
+            ).reconcile_unfenced_terminal_tasks(limit=limit)
+        return tuple(reconciled)
 
     def pending_effects(
         self,
@@ -1043,6 +2051,15 @@ class BackgroundJobService:
     ) -> TaskTransitionResult:
         with self._factory() as session, session.begin():
             _begin_serialized(session)
+            task = session.scalar(
+                select(Task)
+                .where(Task.id == grant.task_id)
+                .with_for_update()
+            )
+            if task is None:
+                raise BackgroundJobNotFoundError(
+                    "background job task is unavailable"
+                )
             job, lease, now = _current_lease(
                 session,
                 grant,
@@ -1104,6 +2121,68 @@ def _lease_duration(value: timedelta) -> timedelta:
             "background job lease duration must be between 1 and 300 seconds"
         )
     return timedelta(microseconds=int(seconds * 1_000_000))
+
+
+def _release_failed_attempt(
+    session: Session,
+    job: BackgroundJob,
+    lease: BackgroundJobLease,
+    *,
+    grant: JobLeaseGrant,
+    error_code: str,
+    retryable: bool,
+    principal_id: str,
+    now: datetime,
+) -> JobFailureDisposition:
+    policy = RetryPolicy(
+        max_attempts=job.max_attempts,
+        base_delay_seconds=job.retry_base_seconds,
+        max_delay_seconds=job.retry_max_seconds,
+    )
+    can_retry = retryable and job.attempt_count < job.max_attempts
+    delay = (
+        deterministic_retry_delay(job.id, job.attempt_count, policy)
+        if can_retry
+        else None
+    )
+    retry_at = None if delay is None else now + delay
+    lease.released_at = now
+    lease.release_reason = "RETRY" if can_retry else "FAILED"
+    lease.retry_at = retry_at
+    lease.failure_code = error_code
+    lease.actor_id = principal_id
+    lease.updated_at = now
+    session.flush((lease,))
+    if can_retry:
+        if retry_at is None:
+            raise BackgroundJobConflictError(
+                "background job retry schedule is unavailable"
+            )
+        job.status = BackgroundJobStatus.QUEUED
+        job.available_at = retry_at
+        job.completed_at = None
+    else:
+        job.status = BackgroundJobStatus.FAILED
+        job.completed_at = now
+    job.current_lease_id = None
+    job.current_fencing_token = None
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.last_fencing_token = grant.fencing_token
+    job.last_error_code = error_code
+    job.actor_id = principal_id
+    job.updated_at = now
+    session.flush((job,))
+    return JobFailureDisposition(
+        status=(
+            BackgroundJobStatus.QUEUED
+            if can_retry
+            else BackgroundJobStatus.FAILED
+        ),
+        next_attempt_at=retry_at,
+        exhausted=retryable and not can_retry,
+        retry_delay=delay,
+    )
 
 
 def _current_lease(
@@ -1341,14 +2420,25 @@ class LeasedJobContext:
                     "prepared background job effect requires reconciliation"
                 )
             observation = reconciled
-        checkpoint = self.service.record_effect_result(
-            self.grant,
-            effect_id=prepared.effect_id,
-            result=observation,
-            expected_checkpoint_version=self.grant.checkpoint_version,
-            checkpoint_idempotency_key=checkpoint_idempotency_key,
-            checkpoint_payload=checkpoint_payload,
-        )
+        try:
+            checkpoint = self.service.record_effect_result(
+                self.grant,
+                effect_id=prepared.effect_id,
+                result=observation,
+                expected_checkpoint_version=self.grant.checkpoint_version,
+                checkpoint_idempotency_key=checkpoint_idempotency_key,
+                checkpoint_payload=checkpoint_payload,
+            )
+        except BackgroundJobLeaseLostError:
+            self.service.record_ignored_result(
+                self.grant,
+                idempotency_key=(
+                    f"{self.grant.job_id}:ignored:{prepared.effect_id}"
+                ),
+                effect_id=prepared.effect_id,
+                result=observation,
+            )
+            raise
         self.grant = replace(
             self.grant,
             checkpoint=dict(checkpoint_payload),
@@ -1419,6 +2509,22 @@ class DurableJobWorker:
             return (
                 WorkerRunOutcome.RETRY_SCHEDULED
                 if disposition.status == BackgroundJobStatus.QUEUED
+                else WorkerRunOutcome.FAILED
+            )
+        except DependencyOutageError as error:
+            try:
+                disposition = self._service.fail_dependency_attempt(
+                    context.grant,
+                    service=error.service,
+                    error_code=error.error_code,
+                )
+            except BackgroundJobLeaseLostError:
+                return WorkerRunOutcome.LEASE_LOST
+            if disposition.status is BackgroundJobStatus.QUEUED:
+                return WorkerRunOutcome.RETRY_SCHEDULED
+            return (
+                WorkerRunOutcome.ESCALATED
+                if disposition.escalation_request_id is not None
                 else WorkerRunOutcome.FAILED
             )
         except RetryableBackgroundJobError as error:

@@ -124,6 +124,36 @@ class BackgroundJobEffectStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class DependencyService(StrEnum):
+    HOST = "HOST"
+    HERMES = "HERMES"
+    GITHUB = "GITHUB"
+
+
+class OwnedHostProcessStatus(StrEnum):
+    RUNNING = "RUNNING"
+    TERMINATION_REQUESTED = "TERMINATION_REQUESTED"
+    TERMINATED = "TERMINATED"
+    GONE = "GONE"
+
+
+class ReconciliationTargetKind(StrEnum):
+    HERMES_RUN = "HERMES_RUN"
+    HOST_PROCESS = "HOST_PROCESS"
+    BRANCH_HEAD = "BRANCH_HEAD"
+    PR_HEAD = "PR_HEAD"
+    WEBHOOK_CURSOR = "WEBHOOK_CURSOR"
+
+
+class ReconciliationStatus(StrEnum):
+    PENDING = "PENDING"
+    CURRENT = "CURRENT"
+    UPDATED = "UPDATED"
+    QUARANTINED = "QUARANTINED"
+    RETRY_REQUIRED = "RETRY_REQUIRED"
+    CANCELLED = "CANCELLED"
+
+
 def _enum(enum_class: type[StrEnum], *, name: str, length: int = 64) -> Enum:
     return Enum(
         enum_class,
@@ -1479,6 +1509,372 @@ class BackgroundJobTaskTransition(RecordContext, Base):
     task_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     task_event_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BackgroundJobToolGrant(RecordContext, Base):
+    """Lease-bound Hermes capability that cancellation can durably revoke."""
+
+    __tablename__ = "background_job_tool_grants"
+    __table_args__ = (
+        CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        CheckConstraint(
+            "(revoked_at IS NULL AND revoke_reason IS NULL) "
+            "OR (revoked_at IS NOT NULL AND revoke_reason IS NOT NULL)",
+            name="revocation_shape",
+        ),
+        UniqueConstraint(
+            "job_id",
+            "grant_key",
+            name="uq_background_job_tool_grants_job_key",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "lease_id", "fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_background_job_tool_grants_lease",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    grant_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    capability_scope: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoke_reason: Mapped[str | None] = mapped_column(String(100))
+
+
+class OwnedHostProcess(RecordContext, Base):
+    """Exact host process-group identity created for one fenced job lease."""
+
+    __tablename__ = "owned_host_processes"
+    __table_args__ = (
+        CheckConstraint("pid > 1", name="pid_safe"),
+        CheckConstraint("process_group_id > 1", name="process_group_id_safe"),
+        CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        CheckConstraint(
+            "(status = 'RUNNING' "
+            "AND termination_requested_at IS NULL "
+            "AND terminated_at IS NULL) "
+            "OR (status = 'TERMINATION_REQUESTED' "
+            "AND termination_requested_at IS NOT NULL "
+            "AND terminated_at IS NULL) "
+            "OR (status IN ('TERMINATED', 'GONE') "
+            "AND termination_requested_at IS NOT NULL "
+            "AND terminated_at IS NOT NULL)",
+            name="status_shape",
+        ),
+        UniqueConstraint(
+            "host_id",
+            "pid",
+            "birth_token",
+            name="uq_owned_host_processes_identity",
+        ),
+        UniqueConstraint(
+            "ownership_nonce",
+            name="uq_owned_host_processes_ownership_nonce",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "lease_id", "fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_owned_host_processes_lease",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    host_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    pid: Mapped[int] = mapped_column(Integer, nullable=False)
+    process_group_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    birth_token: Mapped[str] = mapped_column(String(255), nullable=False)
+    ownership_nonce: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    status: Mapped[OwnedHostProcessStatus] = mapped_column(
+        _enum(OwnedHostProcessStatus, name="owned_host_process_status"),
+        nullable=False,
+        default=OwnedHostProcessStatus.RUNNING,
+        server_default=OwnedHostProcessStatus.RUNNING.value,
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    termination_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    terminated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    partial_evidence_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+    )
+    cleanup_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class BackgroundJobIgnoredResult(RecordContext, Base):
+    """Evidence-only result rejected by a cancellation or newer lease fence."""
+
+    __tablename__ = "background_job_ignored_results"
+    __table_args__ = (
+        CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        CheckConstraint(
+            "reason_code IN ('CANCELLED', 'FENCED')",
+            name="reason_code",
+        ),
+        CheckConstraint(
+            "length(result_fingerprint) = 64",
+            name="result_fingerprint_length",
+        ),
+        CheckConstraint(
+            _hex_only_sql("result_fingerprint"),
+            name="result_fingerprint_hex",
+        ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_background_job_ignored_results_idempotency_key",
+        ),
+        UniqueConstraint(
+            "evidence_id",
+            name="uq_background_job_ignored_results_evidence",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "lease_id", "fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_background_job_ignored_results_lease",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    effect_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("background_job_effects.id", ondelete="RESTRICT"),
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    result_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    reason_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DependencyOutageAttempt(RecordContext, Base):
+    """One retryable dependency failure and its optional escalation resolution."""
+
+    __tablename__ = "dependency_outage_attempts"
+    __table_args__ = (
+        CheckConstraint("attempt > 0", name="attempt_positive"),
+        CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        CheckConstraint(
+            "service IN ('HOST', 'HERMES', 'GITHUB')",
+            name="service",
+        ),
+        CheckConstraint(
+            "(exhausted = false AND approval_request_id IS NULL) "
+            "OR exhausted = true",
+            name="approval_only_when_exhausted",
+        ),
+        CheckConstraint(
+            "(resolved_at IS NULL AND decision_id IS NULL "
+            "AND resumed_job_id IS NULL) "
+            "OR (resolved_at IS NOT NULL AND decision_id IS NOT NULL)",
+            name="resolution_shape",
+        ),
+        UniqueConstraint(
+            "job_id",
+            "attempt",
+            name="uq_dependency_outage_attempts_job_attempt",
+        ),
+        UniqueConstraint(
+            "approval_request_id",
+            name="uq_dependency_outage_attempts_approval_request",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "lease_id", "fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_dependency_outage_attempts_lease",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    service: Mapped[DependencyService] = mapped_column(
+        _enum(DependencyService, name="dependency_service"),
+        nullable=False,
+    )
+    error_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    checkpoint_evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    exhausted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    approval_request_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("approval_requests.id", ondelete="RESTRICT"),
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_id: Mapped[UUID | None] = mapped_column(Uuid)
+    resumed_job_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+    )
+
+
+class TaskCancellation(RecordContext, Base):
+    """Idempotent terminal work fence and cleanup completion projection."""
+
+    __tablename__ = "task_cancellations"
+    __table_args__ = (
+        CheckConstraint(
+            "length(request_fingerprint) = 64",
+            name="request_fingerprint_length",
+        ),
+        CheckConstraint(
+            _hex_only_sql("request_fingerprint"),
+            name="request_fingerprint_hex",
+        ),
+        UniqueConstraint("task_id", name="uq_task_cancellations_task"),
+        UniqueConstraint(
+            "transition_event_id",
+            name="uq_task_cancellations_transition_event",
+        ),
+        ForeignKeyConstraint(
+            ["task_id", "transition_event_id"],
+            ["task_events.task_id", "task_events.id"],
+            name="fk_task_cancellations_transition_event",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("tasks.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    partial_evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    transition_event_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    cleanup_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class ReconciliationTarget(RecordContext, Base):
+    """Durable expected state for one startup-only external observation."""
+
+    __tablename__ = "reconciliation_targets"
+    __table_args__ = (
+        CheckConstraint(
+            "length(expected_fingerprint) = 64",
+            name="expected_fingerprint_length",
+        ),
+        CheckConstraint(
+            _hex_only_sql("expected_fingerprint"),
+            name="expected_fingerprint_hex",
+        ),
+        CheckConstraint(
+            "reconciliation_version >= 0",
+            name="reconciliation_version_non_negative",
+        ),
+        UniqueConstraint(
+            "kind",
+            "target_key",
+            name="uq_reconciliation_targets_kind_key",
+        ),
+        Index(
+            "ix_reconciliation_targets_startup",
+            "status",
+            "kind",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    task_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("tasks.id", ondelete="RESTRICT"),
+    )
+    job_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+    )
+    kind: Mapped[ReconciliationTargetKind] = mapped_column(
+        _enum(ReconciliationTargetKind, name="reconciliation_target_kind"),
+        nullable=False,
+    )
+    target_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    expected_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    expected_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    status: Mapped[ReconciliationStatus] = mapped_column(
+        _enum(ReconciliationStatus, name="reconciliation_status"),
+        nullable=False,
+        default=ReconciliationStatus.PENDING,
+        server_default=ReconciliationStatus.PENDING.value,
+    )
+    reconciliation_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
 
 
 class WebhookDelivery(RecordContext, Base):

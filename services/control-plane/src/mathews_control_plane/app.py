@@ -30,6 +30,7 @@ from mathews_control_plane.evidence import (
     EvidenceService,
     create_evidence_router,
 )
+from mathews_control_plane.reliability import StartupRecoveryService
 from mathews_control_plane.settings import Settings, settings
 
 
@@ -48,6 +49,7 @@ def create_app(
     authentication_service: AuthenticationService | None = None,
     evidence_service: EvidenceService | None = None,
     approval_service: ApprovalService | None = None,
+    startup_recovery_service: StartupRecoveryService | None = None,
 ) -> FastAPI:
     """Create a default-deny API with an injectable persistence boundary."""
 
@@ -79,6 +81,11 @@ def create_app(
             session_factory,
             artifact_store,
         )
+    if startup_recovery_service is None:
+        startup_recovery_service = StartupRecoveryService(
+            session_factory,
+            artifact_store,
+        )
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
@@ -93,6 +100,9 @@ def create_app(
             == approval_batch_size
         ):
             pass
+        # Read and reconcile every durable external boundary before any worker
+        # may issue a new effect after restart.
+        await run_in_threadpool(startup_recovery_service.recover)
         # A committed deletion request is an unreadable durable fence. Resume
         # bounded physical cleanup before accepting traffic after any restart.
         batch_size = 100
@@ -119,6 +129,7 @@ def create_app(
     application.state.authentication_service = authentication_service
     application.state.evidence_service = evidence_service
     application.state.approval_service = approval_service
+    application.state.startup_recovery_service = startup_recovery_service
     application.include_router(create_authentication_router(authentication_service))
     application.include_router(create_evidence_router(evidence_service))
 

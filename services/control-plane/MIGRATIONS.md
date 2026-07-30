@@ -35,3 +35,8 @@ uv run --package mathews-control-plane alembic \
 The URL must be supplied through configuration rather than placed in
 `alembic.ini` or command-line arguments so credentials do not enter source
 control or shell history.
+
+Revision `0008` adds cancellation, dependency-outage, owned-process, and
+startup-reconciliation provenance. Its downgrade is intentionally refused once
+any of those records exist; removing the tables would discard the evidence
+needed to prove a cancellation fence or safely resume an outage.

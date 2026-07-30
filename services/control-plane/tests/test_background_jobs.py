@@ -16,6 +16,7 @@ from mathews_control_plane.background_jobs import (
     BackgroundJobHandler,
     BackgroundJobLeaseLostError,
     BackgroundJobService,
+    DependencyOutageError,
     DurableJobWorker,
     EffectExecutionResult,
     InvalidBackgroundJobError,
@@ -43,6 +44,7 @@ from mathews_control_plane.domain_models import (
     BackgroundJobLease,
     BackgroundJobStatus,
     BackgroundJobTaskTransition,
+    DependencyService,
     EvidenceRecord,
     PolicyVersion,
     Task,
@@ -905,3 +907,33 @@ def test_worker_classifies_handler_failures(
         worker_id="worker-1",
     )
     assert worker.run_once() is expected
+
+
+def test_worker_escalates_exhausted_dependency_outage(
+    job_harness: JobHarness,
+) -> None:
+    job_id = _schedule(
+        job_harness,
+        policy=RetryPolicy(max_attempts=1),
+    )
+
+    def handler(_context: LeasedJobContext) -> None:
+        raise DependencyOutageError(
+            DependencyService.HOST,
+            "HOST_UNAVAILABLE",
+        )
+
+    worker = DurableJobWorker(
+        job_harness.service(),
+        {"task-action": cast(BackgroundJobHandler, handler)},
+        worker_id="worker-1",
+    )
+
+    assert worker.run_once() is WorkerRunOutcome.ESCALATED
+    with job_harness.factory() as session:
+        job = session.get(BackgroundJob, job_id)
+        task = (
+            None if job is None else session.get(Task, job.task_id)
+        )
+    assert job is not None and job.status is BackgroundJobStatus.FAILED
+    assert task is not None and task.state is TaskState.ESCALATED

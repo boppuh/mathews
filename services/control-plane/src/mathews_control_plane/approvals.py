@@ -23,9 +23,12 @@ from mathews_control_plane.domain_models import (
     ApprovalRequest,
     ApprovalRequestType,
     ApprovalStatus,
+    BackgroundJob,
+    BackgroundJobStatus,
     Brief,
     BriefApprovalDecision,
     BriefDecisionDisposition,
+    DependencyOutageAttempt,
     EvidenceRecord,
     PolicyVersion,
     RuleCandidate,
@@ -745,6 +748,38 @@ def _durable_preconditions_are_current(
             and candidate.task_id == task.id
             and candidate.status is RuleCandidateStatus.EVALUATED
             and candidate.evaluation_result is not None
+        )
+    if (
+        request_type is ApprovalRequestType.RETRY_LIMIT
+        and blocked_operation is not None
+        and blocked_operation.operation_name.startswith("dependency.")
+    ):
+        outage = session.scalar(
+            select(DependencyOutageAttempt)
+            .where(
+                DependencyOutageAttempt.approval_request_id == request.id,
+                DependencyOutageAttempt.exhausted.is_(True),
+                DependencyOutageAttempt.resolved_at.is_(None),
+                DependencyOutageAttempt.checkpoint_evidence_id
+                == blocked_operation.checkpoint_evidence_id,
+            )
+            .with_for_update()
+        )
+        if outage is None:
+            return False
+        job = session.scalar(
+            select(BackgroundJob)
+            .where(BackgroundJob.id == outage.job_id)
+            .with_for_update()
+        )
+        return bool(
+            job is not None
+            and job.task_id == task.id
+            and job.status is BackgroundJobStatus.FAILED
+            and job.input_fingerprint
+            == blocked_operation.input_fingerprint
+            and blocked_operation.idempotency_key
+            == f"outage:{job.id}:{outage.attempt}"
         )
     return True
 

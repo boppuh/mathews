@@ -47,6 +47,8 @@ from mathews_control_plane.database import (
 from mathews_control_plane.domain_models import (
     ApprovalDecision,
     ApprovalRequestType,
+    BackgroundJob,
+    BackgroundJobStatus,
     EvidenceRecord,
     PolicyVersion,
     Task,
@@ -59,6 +61,7 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
 )
+from mathews_control_plane.reliability import CancellationService
 from mathews_control_plane.repository_configuration import (
     begin_preflight_attempt,
     capture_preflight_report,
@@ -346,8 +349,8 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         authentication_service = AuthenticationService(factory)
         with engine.connect() as connection:
             current_revision = MigrationContext.configure(connection).get_current_revision()
-        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0007"]
-        assert current_revision == "0007"
+        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0008"]
+        assert current_revision == "0008"
         inspector = inspect(engine)
         validation_run_foreign_keys = inspector.get_foreign_keys("validation_runs")
         validation_run_foreign_tables = {
@@ -635,10 +638,23 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
             store,
             principal_id="postgres-test",
         )
+        with session_scope(factory) as session:
+            job_task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="9" * 40,
+                requester="local-user",
+                raw_request="Exercise PostgreSQL job leasing",
+                summary="Exercise job leasing",
+                owner_id="local-user",
+                actor_id="postgres-test",
+            )
+            job_task_id = job_task.id
         scheduled_job = job_service.schedule(
-            task_id=task_id,
+            task_id=job_task_id,
             job_type="postgres-race",
-            idempotency_key=f"postgres-race:{task_id}",
+            idempotency_key=f"postgres-race:{job_task_id}",
             input_payload={"operation": "verify-claim"},
         )
 
@@ -690,6 +706,71 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
                 idempotency_key="postgres-stale-checkpoint",
                 payload={"stale": True},
             )
+
+        with session_scope(factory) as session:
+            cancellation_task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="8" * 40,
+                requester="local-user",
+                raw_request="Exercise PostgreSQL cancellation guards",
+                summary="Exercise cancellation guards",
+                owner_id="local-user",
+                actor_id="postgres-test",
+            )
+            cancellation_task_id = cancellation_task.id
+        running_cancellation = job_service.schedule(
+            task_id=cancellation_task_id,
+            job_type="postgres-running-cancellation",
+            idempotency_key=(
+                f"postgres-running-cancellation:{cancellation_task_id}"
+            ),
+            input_payload={"state": "running"},
+        )
+        cancellation_grant = job_service.claim_next(
+            worker_id="postgres-cancellation-worker",
+            lease_duration=timedelta(seconds=30),
+            job_types=("postgres-running-cancellation",),
+        )
+        assert cancellation_grant is not None
+        queued_cancellation = job_service.schedule(
+            task_id=cancellation_task_id,
+            job_type="postgres-queued-cancellation",
+            idempotency_key=(
+                f"postgres-queued-cancellation:{cancellation_task_id}"
+            ),
+            input_payload={"state": "queued"},
+        )
+        cancellation = CancellationService(
+            factory,
+            store,
+            principal_id="postgres-test",
+        ).cancel_task(
+            cancellation_task_id,
+            cancellation_id=uuid4(),
+            expected_state=TaskState.INTAKE,
+            reason_code="USER_CANCELLED",
+        )
+        assert cancellation.cleanup_complete is True
+        with factory() as session:
+            cancelled_jobs = tuple(
+                session.scalars(
+                    select(BackgroundJob).where(
+                        BackgroundJob.id.in_(
+                            (
+                                running_cancellation.job_id,
+                                queued_cancellation.job_id,
+                            )
+                        )
+                    )
+                )
+            )
+        assert len(cancelled_jobs) == 2
+        assert all(
+            job.status is BackgroundJobStatus.CANCELLED
+            for job in cancelled_jobs
+        )
 
         artifact = store.put_bytes(payload)
         bootstrap_token = generate_bootstrap_token(factory)
