@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def local_settings_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in tuple(os.environ):
         if name.startswith("MATHEWS_"):

@@ -1,0 +1,13 @@
+[project]
+name = "mathews-configuration"
+version = "0.1.0"
+description = "Shared configuration and secret-reference contracts for Mathews"
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mathews_configuration"]

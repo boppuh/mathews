@@ -3,10 +3,13 @@ name = "mathews-host-agent"
 version = "0.1.0"
 description = "Narrow local macOS execution agent for Mathews"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+  "mathews-configuration",
+]
 
 [project.scripts]
 mathews-host-agent = "mathews_host_agent.agent:main"
+mathews-keychain-check = "mathews_host_agent.secrets:main"
 
 [build-system]
 requires = ["hatchling"]

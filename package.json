@@ -29,13 +29,13 @@
     "dev:worker": "uv run --package mathews-control-plane mathews-worker",
     "lint": "npm run lint:js && npm run lint:python",
     "lint:js": "biome check apps packages scripts",
-    "lint:python": "uv run ruff check services",
+    "lint:python": "uv run ruff check libraries/configuration services",
     "test": "npm run test:js && npm run test:python",
     "test:js": "npm run test --workspaces --if-present",
     "test:python": "uv run pytest",
     "typecheck": "npm run typecheck:js && npm run typecheck:python",
     "typecheck:js": "npm run typecheck --workspaces --if-present",
-    "typecheck:python": "uv run mypy services"
+    "typecheck:python": "uv run mypy libraries/configuration services"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.6",

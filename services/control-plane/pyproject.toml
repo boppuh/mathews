@@ -5,12 +5,14 @@ description = "Authoritative Mathews control-plane API and worker"
 requires-python = ">=3.13"
 dependencies = [
   "fastapi>=0.115,<1",
+  "mathews-configuration",
   "pydantic-settings>=2.8,<3",
   "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.scripts]
 mathews-api = "mathews_control_plane.__main__:main"
+mathews-config-check = "mathews_control_plane.configuration:main"
 mathews-worker = "mathews_control_plane.worker:main"
 
 [build-system]
