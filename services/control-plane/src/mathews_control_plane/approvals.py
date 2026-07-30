@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -90,8 +91,9 @@ _APPROVING_DECISIONS = frozenset(
 )
 _PRECONDITIONED_DECISIONS = _APPROVING_DECISIONS | {
     ApprovalDecision.REJECT,
-    ApprovalDecision.REQUEST_REVISION
+    ApprovalDecision.REQUEST_REVISION,
 }
+_LOGGER = logging.getLogger(__name__)
 
 
 class ApprovalError(RuntimeError):
@@ -1255,42 +1257,70 @@ class ApprovalService:
         if not 1 <= limit <= 1000:
             raise InvalidApprovalError("approval expiry limit is invalid")
         now = _as_utc(self._clock())
-        with self._factory() as session:
-            request_rows = tuple(
-                session.execute(
-                    select(ApprovalRequest.id, ApprovalRequest.expires_at)
-                    .where(
-                        ApprovalRequest.status == ApprovalStatus.PENDING,
-                        ApprovalRequest.expires_at.is_not(None),
-                        ApprovalRequest.expires_at <= now,
-                        ApprovalRequest.request_fingerprint
-                        != _UNINITIALIZED_FINGERPRINT,
-                        ApprovalRequest.precondition_fingerprint
-                        != _UNINITIALIZED_FINGERPRINT,
-                    )
-                    .order_by(
-                        ApprovalRequest.expires_at,
-                        ApprovalRequest.id,
-                    )
-                    .limit(limit)
-                )
-            )
         results: list[ApprovalDecisionResult] = []
-        for request_id, expires_at in request_rows:
-            if expires_at is None:
-                continue
-            decision_id = uuid5(
-                NAMESPACE_URL,
-                f"mathews:approval-expiry:{request_id}:{_as_utc(expires_at).isoformat()}",
-            )
-            results.append(
-                self.decide(
-                    request_id,
-                    decision_id=decision_id,
-                    decision=ApprovalDecision.EXPIRE,
-                    actor_id=self._principal_id,
+        cursor: tuple[datetime, UUID] | None = None
+        while len(results) < limit:
+            with self._factory() as session:
+                query = select(
+                    ApprovalRequest.id,
+                    ApprovalRequest.expires_at,
+                ).where(
+                    ApprovalRequest.status == ApprovalStatus.PENDING,
+                    ApprovalRequest.expires_at.is_not(None),
+                    ApprovalRequest.expires_at <= now,
+                    ApprovalRequest.request_fingerprint
+                    != _UNINITIALIZED_FINGERPRINT,
+                    ApprovalRequest.precondition_fingerprint
+                    != _UNINITIALIZED_FINGERPRINT,
                 )
-            )
+                if cursor is not None:
+                    cursor_expiry, cursor_id = cursor
+                    query = query.where(
+                        or_(
+                            ApprovalRequest.expires_at > cursor_expiry,
+                            and_(
+                                ApprovalRequest.expires_at == cursor_expiry,
+                                ApprovalRequest.id > cursor_id,
+                            ),
+                        )
+                    )
+                request_rows = tuple(
+                    session.execute(
+                        query.order_by(
+                            ApprovalRequest.expires_at,
+                            ApprovalRequest.id,
+                        ).limit(limit)
+                    )
+                )
+            if not request_rows:
+                break
+            for request_id, expires_at in request_rows:
+                if expires_at is None:
+                    continue
+                normalized_expiry = _as_utc(expires_at)
+                cursor = (normalized_expiry, request_id)
+                decision_id = uuid5(
+                    NAMESPACE_URL,
+                    "mathews:approval-expiry:"
+                    f"{request_id}:{normalized_expiry.isoformat()}",
+                )
+                try:
+                    results.append(
+                        self.decide(
+                            request_id,
+                            decision_id=decision_id,
+                            decision=ApprovalDecision.EXPIRE,
+                            actor_id=self._principal_id,
+                        )
+                    )
+                except ApprovalError as error:
+                    _LOGGER.warning(
+                        "Skipped stale approval expiry %s (%s)",
+                        request_id,
+                        type(error).__name__,
+                    )
+                if len(results) == limit:
+                    break
         return tuple(results)
 
     @staticmethod

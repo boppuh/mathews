@@ -94,18 +94,24 @@ def _create_task(
             actor_id="local-user",
         )
         task.state = state
-        session.add(
-            PolicyVersion(
-                lineage_key="mvp",
-                version=1,
-                workflow_thresholds={},
-                approved_by="local-user",
-                approved_at=_NOW - timedelta(minutes=1),
-                owner_id="local-user",
-                actor_id="local-user",
-                root_correlation_id=task.root_correlation_id,
+        if session.scalar(
+            select(PolicyVersion.id).where(
+                PolicyVersion.lineage_key == "mvp",
+                PolicyVersion.version == 1,
             )
-        )
+        ) is None:
+            session.add(
+                PolicyVersion(
+                    lineage_key="mvp",
+                    version=1,
+                    workflow_thresholds={},
+                    approved_by="local-user",
+                    approved_at=_NOW - timedelta(minutes=1),
+                    owner_id="local-user",
+                    actor_id="local-user",
+                    root_correlation_id=task.root_correlation_id,
+                )
+            )
         session.flush()
         evidence_id = session.scalar(
             select(EvidenceRecord.id).where(
@@ -759,6 +765,74 @@ def test_expiry_reconciliation_skips_uninitialized_legacy_rows(
     assert request is not None
     assert request.status is ApprovalStatus.PENDING
     assert request.decision_id is None
+
+
+def test_expiry_reconciliation_skips_stale_row_and_continues(
+    approval_harness: ApprovalHarness,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = [_NOW]
+    stale_task_id, stale_evidence_id, _subject_id = _create_task(
+        approval_harness,
+        state=TaskState.IMPLEMENTING,
+    )
+    valid_task_id, valid_evidence_id, _subject_id = _create_task(
+        approval_harness,
+        state=TaskState.VALIDATING,
+    )
+    service = _service(approval_harness, clock=clock)
+    stale_request_id, _result = _request(
+        service,
+        task_id=stale_task_id,
+        evidence_id=stale_evidence_id,
+        expected_state=TaskState.IMPLEMENTING,
+        request_type=ApprovalRequestType.UNSAFE_ACTION,
+        request_id=UUID(int=1),
+        expires_at=_NOW + timedelta(minutes=1),
+    )
+    valid_request_id, _result = _request(
+        service,
+        task_id=valid_task_id,
+        evidence_id=valid_evidence_id,
+        expected_state=TaskState.VALIDATING,
+        request_type=ApprovalRequestType.RETRY_LIMIT,
+        request_id=UUID(int=2),
+        expires_at=_NOW + timedelta(minutes=2),
+    )
+    with approval_harness.factory.begin() as session:
+        stale_task = session.get(Task, stale_task_id)
+        assert stale_task is not None
+        stale_task.state = TaskState.FAILED
+        stale_task.escalation_resume_state = None
+        stale_task.terminal_outcome = TaskState.FAILED.value
+    clock[0] = _NOW + timedelta(minutes=3)
+
+    with caplog.at_level("WARNING"):
+        results = service.expire_due(limit=1)
+
+    assert [result.request_id for result in results] == [
+        valid_request_id
+    ]
+    assert str(stale_request_id) in caplog.text
+    with approval_harness.factory() as session:
+        stale_request = session.get(ApprovalRequest, stale_request_id)
+        valid_request = session.get(ApprovalRequest, valid_request_id)
+    assert stale_request is not None and valid_request is not None
+    assert stale_request.status is ApprovalStatus.PENDING
+    assert valid_request.status is ApprovalStatus.EXPIRED
+    application = create_app(
+        Settings(
+            database_url=SecretStr(str(approval_harness.engine.url)),
+            artifact_root=approval_harness.store.root,
+        ),
+        session_factory=approval_harness.factory,
+        authentication_service=AuthenticationService(
+            approval_harness.factory
+        ),
+        approval_service=service,
+    )
+    with TestClient(application, base_url="https://localhost"):
+        pass
 
 
 def test_decision_rejects_request_and_decision_evidence_over_combined_cap(
