@@ -1,6 +1,7 @@
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,8 +24,10 @@ from mathews_control_plane.database import (
     get_task_record,
     session_scope,
 )
-from sqlalchemy import text
+from mathews_control_plane.domain_models import TaskEvent
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import IntegrityError
 
 _DATABASE_URL_ENV = "POSTGRES_TEST_DATABASE_URL"
 
@@ -72,15 +75,71 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         authentication_service = AuthenticationService(factory)
         with engine.connect() as connection:
             current_revision = MigrationContext.configure(connection).get_current_revision()
-        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0002"]
-        assert current_revision == "0002"
+        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0003"]
+        assert current_revision == "0003"
+        inspector = inspect(engine)
+        validation_run_foreign_tables = {
+            foreign_key["referred_table"]
+            for foreign_key in inspector.get_foreign_keys("validation_runs")
+        }
+        assert {
+            "tasks",
+            "validation_contracts",
+            "repository_configurations",
+            "evidence_records",
+        } <= validation_run_foreign_tables
+        assert {
+            tuple(constraint["column_names"])
+            for constraint in inspector.get_unique_constraints("task_events")
+        } >= {("task_id", "sequence")}
+        assert {
+            tuple(constraint["column_names"])
+            for constraint in inspector.get_unique_constraints("background_job_leases")
+        } >= {("fencing_token",), ("idempotency_key",)}
+        assert {
+            tuple(constraint["column_names"])
+            for constraint in inspector.get_unique_constraints("webhook_deliveries")
+        } >= {("provider", "provider_delivery_id")}
 
         with session_scope(factory) as session:
             created = create_task_record(
                 session,
+                repository="boppuh/mathews",
+                base_revision="a" * 40,
+                requester="local-user",
+                raw_request="PostgreSQL and artifact durability smoke",
                 summary="PostgreSQL and artifact durability smoke",
+                owner_id="local-user",
+                actor_id="postgres-test",
             )
             task_id = created.id
+            root_correlation_id = created.root_correlation_id
+            session.add(
+                TaskEvent(
+                    task_id=task_id,
+                    sequence=1,
+                    event_type="CREATED",
+                    payload={},
+                    occurred_at=datetime.now(UTC),
+                    owner_id="local-user",
+                    actor_id="postgres-test",
+                    root_correlation_id=root_correlation_id,
+                )
+            )
+        with pytest.raises(IntegrityError):
+            with session_scope(factory) as session:
+                session.add(
+                    TaskEvent(
+                        task_id=task_id,
+                        sequence=1,
+                        event_type="DUPLICATE",
+                        payload={},
+                        occurred_at=datetime.now(UTC),
+                        owner_id="local-user",
+                        actor_id="postgres-test",
+                        root_correlation_id=root_correlation_id,
+                    )
+                )
         artifact = store.put_bytes(payload)
         bootstrap_token = generate_bootstrap_token(factory)
 
@@ -118,9 +177,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         recreated_authentication_service = AuthenticationService(recreated_factory)
         with recreated_factory() as session:
             retrieved = get_task_record(session, task_id)
-        authenticated = recreated_authentication_service.authenticate(
-            issued_session.session_token
-        )
+        authenticated = recreated_authentication_service.authenticate(issued_session.session_token)
 
         assert retrieved is not None
         assert retrieved.summary == "PostgreSQL and artifact durability smoke"
@@ -131,9 +188,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
 
         recreated_authentication_service.logout(authenticated)
         assert (
-            AuthenticationService(recreated_factory).authenticate(
-                issued_session.session_token
-            )
+            AuthenticationService(recreated_factory).authenticate(issued_session.session_token)
             is None
         )
     finally:
