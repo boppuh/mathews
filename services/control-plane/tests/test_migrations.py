@@ -1042,6 +1042,16 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         )
         assert expired_grant is not None
         time.sleep(1.1)
+        ignored = realtime_jobs.record_ignored_result(
+            expired_grant,
+            idempotency_key="expired-recovery:late-result",
+            effect_id=None,
+            result=EffectExecutionResult(
+                succeeded=True,
+                payload={"result": "late"},
+            ),
+        )
+        assert ignored.reason_code == "FENCED"
         assert realtime_jobs.reconcile_expired_leases() == (expired.job_id,)
         jobs.register_reconciliation_target(
             grant,

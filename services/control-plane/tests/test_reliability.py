@@ -458,6 +458,16 @@ def test_stale_outage_recovery_gets_a_fresh_deterministic_expiry(
         service=DependencyService.GITHUB,
         error_code="GITHUB_UNAVAILABLE",
     )
+    with pytest.raises(
+        BackgroundJobConflictError,
+        match="unresolved outage",
+    ):
+        jobs.schedule(
+            task_id=task_id,
+            job_type="must-not-queue",
+            idempotency_key="stale-outage:blocked",
+            input_payload={"service": "github"},
+        )
     monkeypatch.setattr(
         jobs,
         "reconcile_outage_escalation",

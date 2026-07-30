@@ -1374,6 +1374,9 @@ class StartupRecoveryService:
                 ) in snapshots:
                     adapter = adapters.get(kind)
                     if adapter is None:
+                        # Restart recovery is deliberately fail closed. A
+                        # deployment must inject the boundary adapter before
+                        # work depending on this exact target may resume.
                         observation = ReconciliationObservation(
                             status=ReconciliationStatus.RETRY_REQUIRED,
                             observed_payload={},

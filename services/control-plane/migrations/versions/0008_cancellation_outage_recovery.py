@@ -450,6 +450,8 @@ def _create_sqlite_reliability_guards() -> None:
                       OR job.current_lease_id <> NEW.lease_id
                       OR job.current_fencing_token <> NEW.fencing_token
                       OR lease.released_at IS NOT NULL
+                      OR job.lease_expires_at <= NEW.received_at
+                      OR lease.expires_at <= NEW.received_at
                   )
             ) THEN RAISE(
                 ABORT,
@@ -827,6 +829,9 @@ def _create_postgresql_reliability_guards() -> None:
                                   OR job.current_fencing_token
                                       <> NEW.fencing_token
                                   OR lease.released_at IS NOT NULL
+                                  OR job.lease_expires_at
+                                      <= NEW.received_at
+                                  OR lease.expires_at <= NEW.received_at
                               )
                         ) THEN
                         RAISE EXCEPTION

@@ -601,6 +601,24 @@ class BackgroundJobService:
                 raise BackgroundJobConflictError(
                     "background job task is not runnable"
                 )
+            unresolved_outage = session.scalar(
+                select(DependencyOutageAttempt.id)
+                .join(
+                    BackgroundJob,
+                    BackgroundJob.id
+                    == DependencyOutageAttempt.job_id,
+                )
+                .where(
+                    BackgroundJob.task_id == task.id,
+                    DependencyOutageAttempt.exhausted.is_(True),
+                    DependencyOutageAttempt.resolved_at.is_(None),
+                )
+                .limit(1)
+            )
+            if unresolved_outage is not None:
+                raise BackgroundJobConflictError(
+                    "background job task has an unresolved outage"
+                )
             _ensure_fencing_counter(session)
             job = BackgroundJob(
                 task_id=task.id,
@@ -1445,12 +1463,16 @@ class BackgroundJobService:
                 raise BackgroundJobNotFoundError(
                     "background job historical lease is unavailable"
                 )
+            now = _as_utc(self._clock())
             still_current = (
                 job.status is BackgroundJobStatus.RUNNING
                 and job.current_lease_id == grant.lease_id
                 and job.current_fencing_token == grant.fencing_token
                 and job.cancellation_requested_at is None
                 and lease.released_at is None
+                and job.lease_expires_at is not None
+                and _as_utc(job.lease_expires_at) > now
+                and _as_utc(lease.expires_at) > now
             )
             if still_current:
                 raise BackgroundJobConflictError(
@@ -1498,7 +1520,6 @@ class BackgroundJobService:
                     reason_code=existing.reason_code,
                     replayed=True,
                 )
-            now = _as_utc(self._clock())
             ignored_id = uuid5(
                 NAMESPACE_URL,
                 f"mathews:ignored-result:{normalized_key}",
