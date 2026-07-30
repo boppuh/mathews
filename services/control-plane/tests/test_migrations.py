@@ -24,12 +24,18 @@ from mathews_control_plane.database import (
 )
 from mathews_control_plane.domain_models import (
     ApprovalDecision,
+    ApprovalRequest,
     ApprovalRequestType,
+    BackgroundJob,
+    BackgroundJobStatus,
+    DependencyService,
     EvidenceRecord,
     PolicyVersion,
+    ReconciliationTargetKind,
     TaskEvent,
     TaskState,
 )
+from mathews_control_plane.reliability import CancellationService
 from mathews_control_plane.task_state_machine import (
     TaskTransitionKind,
     TaskTransitionService,
@@ -45,8 +51,10 @@ EXPECTED_HEAD_TABLES = {
     "background_job_checkpoints",
     "background_job_effects",
     "background_job_fencing_counter",
+    "background_job_ignored_results",
     "background_job_leases",
     "background_job_task_transitions",
+    "background_job_tool_grants",
     "background_jobs",
     "brief_approval_decisions",
     "briefs",
@@ -55,20 +63,32 @@ EXPECTED_HEAD_TABLES = {
     "evidence_derivatives",
     "evidence_records",
     "evidence_tombstones",
+    "dependency_outage_attempts",
     "local_users",
     "policy_version_prompt_templates",
     "policy_version_review_rules",
     "policy_versions",
     "prompt_template_versions",
     "repository_configurations",
+    "reconciliation_targets",
     "review_rules",
     "rule_candidates",
     "task_events",
     "task_event_evidence_references",
+    "task_cancellations",
     "tasks",
     "validation_contracts",
     "validation_runs",
     "webhook_deliveries",
+    "owned_host_processes",
+}
+RELIABILITY_TABLES = {
+    "background_job_ignored_results",
+    "background_job_tool_grants",
+    "dependency_outage_attempts",
+    "owned_host_processes",
+    "reconciliation_targets",
+    "task_cancellations",
 }
 
 
@@ -948,7 +968,258 @@ def test_job_loop_migration_enforces_fenced_provenance_and_guarded_downgrade(
         match="fenced background job provenance",
     ):
         command.downgrade(config, "0005")
+    assert _table_names(database_url) == EXPECTED_HEAD_TABLES - RELIABILITY_TABLES
+
+
+def test_cancellation_revision_fences_queued_and_running_jobs(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    factory = create_session_factory(engine)
+    store = ArtifactStore(tmp_path / "artifacts")
+    now = datetime.now(UTC)
+    try:
+        with factory.begin() as session:
+            task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="1" * 40,
+                requester="local-user",
+                raw_request="Cancel migrated durable jobs",
+                summary="Cancel durable jobs",
+                owner_id="local-user",
+                actor_id="local-user",
+            )
+            session.add(
+                PolicyVersion(
+                    lineage_key="mvp",
+                    version=1,
+                    predecessor_id=None,
+                    workflow_thresholds={},
+                    approved_by="local-user",
+                    approved_at=now,
+                    owner_id=task.owner_id,
+                    actor_id="local-user",
+                    root_correlation_id=task.root_correlation_id,
+                )
+            )
+            task_id = task.id
+        jobs = BackgroundJobService(factory, store, clock=lambda: now)
+        running = jobs.schedule(
+            task_id=task_id,
+            job_type="running-cancellation",
+            idempotency_key="running-cancellation:1",
+            input_payload={"state": "running"},
+        )
+        grant = jobs.claim_next(
+            worker_id="migration-worker",
+            lease_duration=timedelta(seconds=60),
+            job_types=("running-cancellation",),
+        )
+        assert grant is not None
+        queued = jobs.schedule(
+            task_id=task_id,
+            job_type="queued-cancellation",
+            idempotency_key="queued-cancellation:1",
+            input_payload={"state": "queued"},
+        )
+        realtime_jobs = BackgroundJobService(factory, store)
+        expired = realtime_jobs.schedule(
+            task_id=task_id,
+            job_type="expired-recovery",
+            idempotency_key="expired-recovery:1",
+            input_payload={"state": "expired"},
+            retry_policy=RetryPolicy(max_attempts=2),
+        )
+        expired_grant = realtime_jobs.claim_next(
+            worker_id="expired-recovery-worker",
+            lease_duration=timedelta(seconds=1),
+            job_types=("expired-recovery",),
+        )
+        assert expired_grant is not None
+        time.sleep(1.1)
+        ignored = realtime_jobs.record_ignored_result(
+            expired_grant,
+            idempotency_key="expired-recovery:late-result",
+            effect_id=None,
+            result=EffectExecutionResult(
+                succeeded=True,
+                payload={"result": "late"},
+            ),
+        )
+        assert ignored.reason_code == "FENCED"
+        assert realtime_jobs.reconcile_expired_leases() == (expired.job_id,)
+        jobs.register_reconciliation_target(
+            grant,
+            kind=ReconciliationTargetKind.BRANCH_HEAD,
+            target_key="branch-head:migration-cancellation",
+            expected_payload={"head": "a" * 40},
+        )
+
+        cancellation_id = uuid4()
+        cancellation_service = CancellationService(
+            factory,
+            store,
+            clock=lambda: now,
+        )
+        cancelled = cancellation_service.cancel_task(
+            task_id,
+            cancellation_id=cancellation_id,
+            expected_state=TaskState.INTAKE,
+            reason_code="USER_CANCELLED",
+        )
+
+        assert cancelled.cleanup_complete is True
+        replayed = cancellation_service.cancel_task(
+            task_id,
+            cancellation_id=cancellation_id,
+            expected_state=TaskState.INTAKE,
+            reason_code="USER_CANCELLED",
+        )
+        assert replayed.replayed is True
+        assert replayed.cleanup_complete is True
+        with factory() as session:
+            running_row = session.get(BackgroundJob, running.job_id)
+            queued_row = session.get(BackgroundJob, queued.job_id)
+        assert running_row is not None and queued_row is not None
+        states = {
+            running.job_id: running_row.status,
+            queued.job_id: queued_row.status,
+        }
+        assert states == {
+            running.job_id: BackgroundJobStatus.CANCELLED,
+            queued.job_id: BackgroundJobStatus.CANCELLED,
+        }
+        with pytest.raises(
+            IntegrityError,
+            match="task cancellation completion",
+        ):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE task_cancellations "
+                        "SET reason_code = 'REWRITTEN' WHERE id = :id"
+                    ),
+                    {"id": cancellation_id.hex},
+                )
+        with pytest.raises(
+            IntegrityError,
+            match="reliability provenance cannot be deleted",
+        ):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "DELETE FROM task_cancellations WHERE id = :id"
+                    ),
+                    {"id": cancellation_id.hex},
+                )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(
+        RuntimeError,
+        match="cancellation or outage provenance",
+    ):
+        command.downgrade(config, "0007")
     assert _table_names(database_url) == EXPECTED_HEAD_TABLES
+
+
+def test_outage_escalation_and_resume_operate_through_migrated_guards(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    factory = create_session_factory(engine)
+    store = ArtifactStore(tmp_path / "artifacts")
+    now = datetime.now(UTC)
+    try:
+        with factory.begin() as session:
+            task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="1" * 40,
+                requester="local-user",
+                raw_request="Exercise migrated outage semantics",
+                summary="Exercise outage semantics",
+                owner_id="local-user",
+                actor_id="local-user",
+            )
+            session.add(
+                PolicyVersion(
+                    lineage_key="mvp",
+                    version=1,
+                    predecessor_id=None,
+                    workflow_thresholds={},
+                    approved_by="local-user",
+                    approved_at=now,
+                    owner_id=task.owner_id,
+                    actor_id="local-user",
+                    root_correlation_id=task.root_correlation_id,
+                )
+            )
+            task_id = task.id
+        jobs = BackgroundJobService(factory, store, clock=lambda: now)
+        scheduled = jobs.schedule(
+            task_id=task_id,
+            job_type="github-outage",
+            idempotency_key="github-outage:1",
+            input_payload={"operation": "publish"},
+            retry_policy=RetryPolicy(max_attempts=1),
+        )
+        grant = jobs.claim_next(
+            worker_id="migration-worker",
+            lease_duration=timedelta(seconds=60),
+        )
+        assert grant is not None
+        jobs.checkpoint(
+            grant,
+            expected_version=0,
+            idempotency_key="github-outage:checkpoint",
+            payload={"head": "a" * 40},
+        )
+
+        exhausted = jobs.fail_dependency_attempt(
+            grant,
+            service=DependencyService.GITHUB,
+            error_code="GITHUB_UNAVAILABLE",
+        )
+
+        assert exhausted.escalation_request_id is not None
+        with factory() as session:
+            request = session.get(
+                ApprovalRequest,
+                exhausted.escalation_request_id,
+            )
+        assert request is not None
+        ApprovalService(factory, store, clock=lambda: now).decide(
+            request.id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.RETRY,
+            actor_id="local-user",
+        )
+        assert len(jobs.reconcile_outage_decisions()) == 1
+        with factory() as session:
+            generations = tuple(
+                session.scalars(
+                    select(BackgroundJob)
+                    .where(BackgroundJob.task_id == task_id)
+                    .order_by(BackgroundJob.created_at)
+                )
+            )
+        assert len(generations) == 2
+        assert generations[0].id == scheduled.job_id
+        assert generations[0].status is BackgroundJobStatus.FAILED
+        assert generations[1].status is BackgroundJobStatus.QUEUED
+        assert generations[1].checkpoint == {"head": "a" * 40}
+    finally:
+        engine.dispose()
 
 
 def test_evidence_revision_explicitly_fences_revision_0003_preflight_rows(

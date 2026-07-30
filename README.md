@@ -130,6 +130,35 @@ fences pending approvals from earlier schema revisions as cancelled; any
 remaining zero-fingerprint legacy rows are excluded from automatic expiry and
 execution.
 
+## Cancellation, outages, and restart recovery
+
+Cancellation is a durable task transition, not a worker hint. The cancellation
+service captures bounded checkpoint fingerprints and pending-effect identities
+as redacted evidence, revokes active job leases and Hermes tool grants in the
+same transaction, and marks every queued or running job `CANCELLED`. Results
+arriving through an older lease are retained as `ignored-job-result` evidence
+and cannot advance a checkpoint, effect, or task state.
+
+Host processes are registered with an exact job lease, PID, process-group ID,
+birth token, and ownership nonce. The host process manager re-observes that full
+identity before calling `killpg`; a missing or reused PID is recorded as gone
+without signalling it. Termination output and policy-permitted workspace cleanup
+are retained as evidence, and both operations replay with stable idempotency
+keys after a crash.
+
+Host, Hermes, and GitHub outages use the job's persisted bounded backoff. Each
+failed attempt captures its service, error code, retry number, and last
+checkpoint. Exhaustion creates a deterministic `RETRY_LIMIT` approval and moves
+the task to `ESCALATED`; `RETRY` resumes the recorded task state by creating a
+new immutable job generation from the prior checkpoint, while abandon or cancel
+remains explicit.
+
+Before the API accepts traffic, startup recovery releases expired leases,
+finishes incomplete outage escalation/decision work, resumes cancellation
+cleanup, and observes registered Hermes runs, host processes, branch heads, PR
+heads, and webhook cursors. Missing adapters leave a durable `RETRY_REQUIRED`
+record and do not authorize a new external effect.
+
 ## Local authentication
 
 After applying migrations, issue the one-time bootstrap token:

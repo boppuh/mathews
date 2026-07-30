@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import time
+from collections.abc import Mapping
 
 from sqlalchemy import Engine
 
@@ -16,6 +17,14 @@ from mathews_control_plane.background_jobs import (
 from mathews_control_plane.database import (
     create_database_engine,
     create_session_factory,
+)
+from mathews_control_plane.domain_models import ReconciliationTargetKind
+from mathews_control_plane.reliability import (
+    OwnedProcessTerminator,
+    OwnedWorkspaceCleaner,
+    ReconciliationAdapter,
+    StartupRecoveryResult,
+    StartupRecoveryService,
 )
 from mathews_control_plane.settings import Settings, settings
 
@@ -63,6 +72,30 @@ def _poll_delay(outcome: WorkerRunOutcome) -> float | None:
     return None
 
 
+def recover_worker_startup(
+    runtime_settings: Settings,
+    engine: Engine,
+    *,
+    adapters: Mapping[
+        ReconciliationTargetKind,
+        ReconciliationAdapter,
+    ]
+    | None = None,
+    terminator: OwnedProcessTerminator | None = None,
+    cleaner: OwnedWorkspaceCleaner | None = None,
+) -> StartupRecoveryResult:
+    """Reconcile durable external state before the worker may claim work."""
+
+    return StartupRecoveryService(
+        create_session_factory(engine),
+        ArtifactStore(runtime_settings.artifact_root),
+    ).recover(
+        adapters=adapters,
+        terminator=terminator,
+        cleaner=cleaner,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Mathews control-plane worker")
     mode = parser.add_mutually_exclusive_group()
@@ -85,6 +118,21 @@ def main() -> None:
         return
     worker, engine = build_worker(settings)
     try:
+        recovery = recover_worker_startup(settings, engine)
+        logger.info(
+            "worker startup recovery completed",
+            extra={
+                "completed_cancellations": len(
+                    recovery.completed_cancellation_ids
+                ),
+                "escalated_jobs": len(recovery.escalated_job_ids),
+                "reconciled_targets": len(
+                    recovery.reconciled_target_ids
+                ),
+                "recovered_jobs": len(recovery.recovered_job_ids),
+                "resolved_outages": len(recovery.resolved_outage_ids),
+            },
+        )
         if args.poll_once:
             logger.info("worker poll completed", extra={"outcome": worker.run_once()})
             return

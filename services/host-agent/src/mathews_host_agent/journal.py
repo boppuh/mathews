@@ -81,7 +81,7 @@ class HostOperationJournal:
     ) -> None:
         self._path = path
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
-        _prepare_journal_file(path)
+        prepare_journal_file(path)
         self._initialize()
 
     def begin(self, request: HostRequestMessage) -> JournalDecision:
@@ -600,7 +600,7 @@ class HostOperationJournal:
         return connection
 
 
-def _prepare_journal_file(path: Path) -> None:
+def prepare_journal_file(path: Path) -> None:
     if not path.is_absolute():
         raise HostJournalError("UNSAFE_JOURNAL_PATH")
     parent = path.parent

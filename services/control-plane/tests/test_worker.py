@@ -15,6 +15,7 @@ def test_worker_probe() -> None:
     assert _poll_delay(WorkerRunOutcome.FAILED) == 0.5
     assert _poll_delay(WorkerRunOutcome.LEASE_LOST) == 0.5
     assert _poll_delay(WorkerRunOutcome.RETRY_SCHEDULED) == 0.5
+    assert _poll_delay(WorkerRunOutcome.ESCALATED) is None
     assert _poll_delay(WorkerRunOutcome.SUCCEEDED) is None
 
 
