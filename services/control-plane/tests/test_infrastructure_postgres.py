@@ -78,16 +78,24 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         assert ScriptDirectory.from_config(migration_config).get_heads() == ["0003"]
         assert current_revision == "0003"
         inspector = inspect(engine)
+        validation_run_foreign_keys = inspector.get_foreign_keys("validation_runs")
         validation_run_foreign_tables = {
             foreign_key["referred_table"]
-            for foreign_key in inspector.get_foreign_keys("validation_runs")
+            for foreign_key in validation_run_foreign_keys
         }
         assert {
             "tasks",
             "validation_contracts",
-            "repository_configurations",
             "evidence_records",
         } <= validation_run_foreign_tables
+        assert any(
+            foreign_key["constrained_columns"]
+            == ["validation_contract_id", "repository_configuration_id"]
+            and foreign_key["referred_table"] == "validation_contracts"
+            and foreign_key["referred_columns"]
+            == ["id", "repository_configuration_id"]
+            for foreign_key in validation_run_foreign_keys
+        )
         assert {
             tuple(constraint["column_names"])
             for constraint in inspector.get_unique_constraints("task_events")
