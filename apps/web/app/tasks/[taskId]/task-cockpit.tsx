@@ -2,10 +2,10 @@
 
 import { TASK_STATES, type TaskCockpitResponse, type TaskEventKind } from "@mathews/contracts";
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { stageLabel } from "../../../lib/stages";
-import { TaskRequestError, taskClient } from "../../../lib/task-client";
+import { LatestTaskDetailLoader, TaskRequestError } from "../../../lib/task-client";
 import { shortRevision } from "../../../lib/tasks";
 
 type CockpitState =
@@ -47,12 +47,19 @@ function failureMessage(error: unknown): string {
 
 export function TaskCockpit({ taskId }: { taskId: string }) {
   const [state, setState] = useState<CockpitState>({ status: "loading" });
+  const detailLoader = useRef<LatestTaskDetailLoader | null>(null);
+  if (detailLoader.current === null) {
+    detailLoader.current = new LatestTaskDetailLoader();
+  }
 
   const loadCockpit = useCallback(
     async (signal?: AbortSignal) => {
       setState({ status: "loading" });
       try {
-        const cockpit = await taskClient.detail(taskId, signal);
+        const cockpit = await detailLoader.current?.load(taskId, signal);
+        if (!cockpit) {
+          return;
+        }
         setState({ status: "ready", cockpit });
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {

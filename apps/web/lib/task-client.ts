@@ -91,6 +91,28 @@ export const taskClient = {
 };
 
 export type TaskListClient = Pick<typeof taskClient, "list">;
+export type TaskDetailClient = Pick<typeof taskClient, "detail">;
+
+export class LatestTaskDetailLoader {
+  private generation = 0;
+
+  async load(
+    taskId: string,
+    signal?: AbortSignal,
+    client: TaskDetailClient = taskClient,
+  ): Promise<TaskCockpitResponse | undefined> {
+    const requestGeneration = ++this.generation;
+    try {
+      const result = await client.detail(taskId, signal);
+      return requestGeneration === this.generation ? result : undefined;
+    } catch (error) {
+      if (requestGeneration !== this.generation) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+}
 
 export class LatestTaskListLoader {
   private generation = 0;
