@@ -38,6 +38,34 @@ if (process.env.MATHEWS_SKIP_POSTGRES !== "1") {
   }
 }
 
+const migrations = spawnSync(
+  "uv",
+  [
+    "run",
+    "--package",
+    "mathews-control-plane",
+    "alembic",
+    "-c",
+    "services/control-plane/alembic.ini",
+    "upgrade",
+    "head",
+  ],
+  {
+    cwd: workspaceRoot,
+    env: process.env,
+    stdio: "inherit",
+  },
+);
+
+if (migrations.error?.code === "ENOENT") {
+  console.error("uv is required to apply control-plane database migrations.");
+  process.exit(1);
+}
+
+if (migrations.status !== 0) {
+  process.exit(migrations.status ?? 1);
+}
+
 const services = [
   {
     name: "web",
