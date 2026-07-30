@@ -1069,22 +1069,30 @@ class ApprovalService:
         try:
             with self._factory() as session, session.begin():
                 _begin_serialized(session)
-                request = session.scalar(
-                    select(ApprovalRequest)
+                approval_task_id = session.scalar(
+                    select(ApprovalRequest.task_id)
                     .where(ApprovalRequest.id == request_id)
-                    .with_for_update()
                 )
-                if request is None:
+                if approval_task_id is None:
                     raise ApprovalNotFoundError(
                         "approval request is unavailable"
                     )
                 task = session.scalar(
                     select(Task)
-                    .where(Task.id == request.task_id)
+                    .where(Task.id == approval_task_id)
                     .with_for_update()
                 )
                 if task is None:
                     raise ApprovalNotFoundError("task is unavailable")
+                request = session.scalar(
+                    select(ApprovalRequest)
+                    .where(ApprovalRequest.id == request_id)
+                    .with_for_update()
+                )
+                if request is None or request.task_id != task.id:
+                    raise ApprovalConflictError(
+                        "approval request changed while acquiring locks"
+                    )
                 now = _as_utc(self._clock())
                 effective_decision = (
                     ApprovalDecision.EXPIRE

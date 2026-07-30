@@ -16,6 +16,7 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _ZERO_FINGERPRINT = "0" * 64
+_LEGACY_FENCE_ACTOR = "migration-0007-legacy-fence"
 _TASK_STATES = (
     "INTAKE",
     "BRIEFING",
@@ -41,12 +42,14 @@ def _hex_only_sql(column: str) -> str:
 
 def _create_sqlite_triggers() -> None:
     op.execute(
-        """
+        f"""
         CREATE TRIGGER approval_requests_validate_insert
         BEFORE INSERT ON approval_requests
         BEGIN
             SELECT CASE WHEN
-                (
+                NEW.request_fingerprint = '{_ZERO_FINGERPRINT}'
+                OR NEW.precondition_fingerprint = '{_ZERO_FINGERPRINT}'
+                OR (
                     NEW.status = 'PENDING'
                     AND (
                         NEW.decision IS NOT NULL
@@ -134,14 +137,16 @@ def _create_sqlite_triggers() -> None:
 
 def _create_postgresql_triggers() -> None:
     op.execute(
-        """
+        f"""
         CREATE FUNCTION validate_approval_request()
         RETURNS trigger
         LANGUAGE plpgsql
         AS $$
         BEGIN
             IF (
-                (
+                NEW.request_fingerprint = '{_ZERO_FINGERPRINT}'
+                OR NEW.precondition_fingerprint = '{_ZERO_FINGERPRINT}'
+                OR (
                     NEW.status = 'PENDING'
                     AND (
                         NEW.decision IS NOT NULL
@@ -178,41 +183,45 @@ def _create_postgresql_triggers() -> None:
             ) THEN
                 RAISE EXCEPTION 'invalid approval request projection';
             END IF;
-            IF TG_OP = 'UPDATE' AND (
-                NEW.id IS DISTINCT FROM OLD.id
-                OR NEW.task_id IS DISTINCT FROM OLD.task_id
-                OR NEW.request_type IS DISTINCT FROM OLD.request_type
-                OR NEW.subject_type IS DISTINCT FROM OLD.subject_type
-                OR NEW.subject_id IS DISTINCT FROM OLD.subject_id
-                OR NEW.reason IS DISTINCT FROM OLD.reason
-                OR NEW.options::text IS DISTINCT FROM OLD.options::text
-                OR NEW.supporting_evidence_ids::text
-                    IS DISTINCT FROM OLD.supporting_evidence_ids::text
-                OR NEW.requesting_state IS DISTINCT FROM OLD.requesting_state
-                OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
-                OR NEW.request_fingerprint
-                    IS DISTINCT FROM OLD.request_fingerprint
-                OR NEW.precondition_fingerprint
-                    IS DISTINCT FROM OLD.precondition_fingerprint
-                OR NEW.resume_state IS DISTINCT FROM OLD.resume_state
-                OR NEW.blocked_operation::text
-                    IS DISTINCT FROM OLD.blocked_operation::text
-                OR NEW.retry_history::text IS DISTINCT FROM OLD.retry_history::text
-                OR NEW.owner_id IS DISTINCT FROM OLD.owner_id
-                OR NEW.root_correlation_id IS DISTINCT FROM OLD.root_correlation_id
-                OR NEW.causation_id IS DISTINCT FROM OLD.causation_id
-                OR NEW.parent_correlation_id
-                    IS DISTINCT FROM OLD.parent_correlation_id
-                OR NEW.created_at IS DISTINCT FROM OLD.created_at
-                OR OLD.status <> 'PENDING'
-                OR NEW.status = 'PENDING'
-                OR NEW.decision IS NULL
-                OR NEW.decision_id IS NULL
-                OR NEW.decision_fingerprint IS NULL
-                OR NEW.decided_by IS NULL
-                OR NEW.decided_at IS NULL
-            ) THEN
-                RAISE EXCEPTION 'invalid approval request update';
+            IF TG_OP = 'UPDATE' THEN
+                IF (
+                    NEW.id IS DISTINCT FROM OLD.id
+                    OR NEW.task_id IS DISTINCT FROM OLD.task_id
+                    OR NEW.request_type IS DISTINCT FROM OLD.request_type
+                    OR NEW.subject_type IS DISTINCT FROM OLD.subject_type
+                    OR NEW.subject_id IS DISTINCT FROM OLD.subject_id
+                    OR NEW.reason IS DISTINCT FROM OLD.reason
+                    OR NEW.options::text IS DISTINCT FROM OLD.options::text
+                    OR NEW.supporting_evidence_ids::text
+                        IS DISTINCT FROM OLD.supporting_evidence_ids::text
+                    OR NEW.requesting_state IS DISTINCT FROM OLD.requesting_state
+                    OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+                    OR NEW.request_fingerprint
+                        IS DISTINCT FROM OLD.request_fingerprint
+                    OR NEW.precondition_fingerprint
+                        IS DISTINCT FROM OLD.precondition_fingerprint
+                    OR NEW.resume_state IS DISTINCT FROM OLD.resume_state
+                    OR NEW.blocked_operation::text
+                        IS DISTINCT FROM OLD.blocked_operation::text
+                    OR NEW.retry_history::text
+                        IS DISTINCT FROM OLD.retry_history::text
+                    OR NEW.owner_id IS DISTINCT FROM OLD.owner_id
+                    OR NEW.root_correlation_id
+                        IS DISTINCT FROM OLD.root_correlation_id
+                    OR NEW.causation_id IS DISTINCT FROM OLD.causation_id
+                    OR NEW.parent_correlation_id
+                        IS DISTINCT FROM OLD.parent_correlation_id
+                    OR NEW.created_at IS DISTINCT FROM OLD.created_at
+                    OR OLD.status <> 'PENDING'
+                    OR NEW.status = 'PENDING'
+                    OR NEW.decision IS NULL
+                    OR NEW.decision_id IS NULL
+                    OR NEW.decision_fingerprint IS NULL
+                    OR NEW.decided_by IS NULL
+                    OR NEW.decided_at IS NULL
+                ) THEN
+                    RAISE EXCEPTION 'invalid approval request update';
+                END IF;
             END IF;
             RETURN NEW;
         END;
@@ -347,6 +356,25 @@ def upgrade() -> None:
             ["task_id", "status", "expires_at"],
             unique=False,
         )
+    op.execute(
+        f"""
+        UPDATE approval_requests
+        SET status = 'CANCELLED',
+            decision = 'CANCEL',
+            decision_id = id,
+            decision_fingerprint = '{_ZERO_FINGERPRINT}',
+            decided_by = '{_LEGACY_FENCE_ACTOR}',
+            decided_at = COALESCE(
+                expires_at,
+                updated_at,
+                created_at,
+                CURRENT_TIMESTAMP
+            )
+        WHERE status = 'PENDING'
+          AND request_fingerprint = '{_ZERO_FINGERPRINT}'
+          AND precondition_fingerprint = '{_ZERO_FINGERPRINT}'
+        """
+    )
     if op.get_bind().dialect.name == "sqlite":
         _create_sqlite_triggers()
     else:
@@ -368,8 +396,6 @@ def downgrade() -> None:
             "OR resume_state IS NOT NULL "
             "OR blocked_operation IS NOT NULL "
             "OR CAST(retry_history AS TEXT) <> '[]' "
-            "OR decision_id IS NOT NULL "
-            "OR decision_fingerprint IS NOT NULL "
             "LIMIT 1"
         ),
         {"zero": _ZERO_FINGERPRINT},
@@ -379,6 +405,24 @@ def downgrade() -> None:
         )
 
     _drop_triggers()
+    op.execute(
+        f"""
+        UPDATE approval_requests
+        SET status = 'PENDING',
+            decision = NULL,
+            decision_id = NULL,
+            decision_fingerprint = NULL,
+            decided_by = NULL,
+            decided_at = NULL
+        WHERE request_fingerprint = '{_ZERO_FINGERPRINT}'
+          AND precondition_fingerprint = '{_ZERO_FINGERPRINT}'
+          AND decision_id = id
+          AND decision_fingerprint = '{_ZERO_FINGERPRINT}'
+          AND decided_by = '{_LEGACY_FENCE_ACTOR}'
+          AND decision = 'CANCEL'
+          AND status = 'CANCELLED'
+        """
+    )
     with op.batch_alter_table("approval_requests") as batch_op:
         batch_op.drop_index(
             op.f("ix_approval_requests_task_status_expiry")

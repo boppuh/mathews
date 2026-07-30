@@ -289,7 +289,8 @@ def test_approval_revision_migrates_legacy_rows_and_guards_provenance(
             migrated = connection.execute(
                 text(
                     "SELECT request_fingerprint, precondition_fingerprint, "
-                    "resume_state, blocked_operation, retry_history, decision_id "
+                    "resume_state, blocked_operation, retry_history, status, "
+                    "decision, decision_id, decision_fingerprint, decided_by "
                     "FROM approval_requests WHERE id = :id"
                 ),
                 {"id": request_id.hex},
@@ -300,7 +301,11 @@ def test_approval_revision_migrates_legacy_rows_and_guards_provenance(
             None,
             None,
             "[]",
-            None,
+            "CANCELLED",
+            "CANCEL",
+            request_id.hex,
+            "0" * 64,
+            "migration-0007-legacy-fence",
         )
     finally:
         engine.dispose()
@@ -312,6 +317,15 @@ def test_approval_revision_migrates_legacy_rows_and_guards_provenance(
             column["name"]
             for column in inspect(engine).get_columns("approval_requests")
         }
+        with engine.connect() as connection:
+            restored = connection.execute(
+                text(
+                    "SELECT status, decision, decided_by, decided_at "
+                    "FROM approval_requests WHERE id = :id"
+                ),
+                {"id": request_id.hex},
+            ).one()
+        assert restored == ("PENDING", None, None, None)
     finally:
         engine.dispose()
 
@@ -1712,5 +1726,8 @@ def test_offline_postgres_migration_sql_hides_database_password(
     assert "CREATE TABLE auth_sessions" in captured.out
     assert "CREATE TABLE validation_contracts" in captured.out
     assert "CREATE TABLE webhook_deliveries" in captured.out
+    assert "IF TG_OP = 'UPDATE' THEN" in captured.out
+    assert "IF TG_OP = 'UPDATE' AND" not in captured.out
+    assert "migration-0007-legacy-fence" in captured.out
     assert password not in captured.out
     assert password not in captured.err

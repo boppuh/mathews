@@ -125,7 +125,10 @@ recorded state. Revision returns an exact brief to `BRIEFING`; deny or abandon
 produces `FAILED`; cancel produces `CANCELLED`; expiry is audited and produces
 `FAILED`. Request and decision transitions are idempotent, append task events,
 and cannot be rewritten or deleted through the database. Startup reconciles
-expired pending requests before serving traffic.
+expired pending requests before serving traffic. Migration `0007` explicitly
+fences pending approvals from earlier schema revisions as cancelled; any
+remaining zero-fingerprint legacy rows are excluded from automatic expiry and
+execution.
 
 ## Local authentication
 
