@@ -61,8 +61,8 @@ def _configuration(
             "committer": {"name": "Mathews", "email": "mathews@example.com"},
         },
         xcode_settings={
-            "container_path": "Mathews.xcodeproj",
-            "container_kind": "PROJECT",
+            "container_path": "Mathews.xcworkspace",
+            "container_kind": "WORKSPACE",
             "scheme": "Mathews",
             "simulator": {
                 "runtime_identifier": "com.apple.iOS-18-5",
@@ -76,8 +76,8 @@ def _configuration(
                 "argv": [
                     "xcodebuild",
                     "build",
-                    "-project",
-                    "Mathews.xcodeproj",
+                    "-workspace",
+                    "Mathews.xcworkspace",
                     "-scheme",
                     "Mathews",
                     "-destination",
@@ -92,8 +92,8 @@ def _configuration(
                 "argv": [
                     "xcodebuild",
                     "test",
-                    "-project",
-                    "Mathews.xcodeproj",
+                    "-workspace",
+                    "Mathews.xcworkspace",
                     "-scheme",
                     "Mathews",
                     "-destination",
@@ -108,8 +108,8 @@ def _configuration(
                 "argv": [
                     "xcodebuild",
                     "test",
-                    "-project",
-                    "Mathews.xcodeproj",
+                    "-workspace",
+                    "Mathews.xcworkspace",
                     "-scheme",
                     "Mathews",
                     "-destination",
@@ -124,12 +124,13 @@ def _configuration(
                 "argv": [
                     "xcodebuild",
                     "test",
-                    "-project",
-                    "Mathews.xcodeproj",
+                    "-workspace",
+                    "Mathews.xcworkspace",
                     "-scheme",
                     "Mathews",
                     "-destination",
                     "MATHEWS_CONFIGURED_SIMULATOR",
+                    "-only-testing:MathewsUITests/PrimaryJourneyTests/testPrimaryJourney",
                 ],
                 "timeout_seconds": 900,
                 "e2e_flow": {
@@ -139,7 +140,64 @@ def _configuration(
                     "terminal_state": "ready",
                     "fixture_id": "default",
                     "fixture_version": 1,
+                    "fixture_digest": f"sha256:{'1' * 64}",
+                    "test_account_recipe_id": "primary_account",
+                    "test_account_recipe_version": 1,
+                    "test_account_recipe_digest": f"sha256:{'2' * 64}",
                     "test_account": "keychain://mathews/test-account",
+                    "runner_test_identifier": (
+                        "MathewsUITests/PrimaryJourneyTests/testPrimaryJourney"
+                    ),
+                    "app_bundle_identifier": "com.boppuh.mathews",
+                    "harness_source_root": "MathewsUITests",
+                    "harness_project_path": "MathewsHarness.xcodeproj",
+                    "harness_target_identifier": "AAAAAAAAAAAAAAAAAAAAAAAA",
+                    "runner_source_file": (
+                        "MathewsUITests/PrimaryJourneyTests.swift"
+                    ),
+                    "harness_files": [
+                        {
+                            "path": (
+                                "Mathews.xcworkspace/contents.xcworkspacedata"
+                            ),
+                            "digest": f"sha256:{'3' * 64}",
+                        },
+                        {
+                            "path": (
+                                "Mathews.xcworkspace/xcshareddata/xcschemes/"
+                                "Mathews.xcscheme"
+                            ),
+                            "digest": f"sha256:{'4' * 64}",
+                        },
+                        {
+                            "path": (
+                                "MathewsHarness.xcodeproj/project.pbxproj"
+                            ),
+                            "digest": f"sha256:{'5' * 64}",
+                        },
+                        {
+                            "path": "MathewsUITests/PrimaryJourneyTests.swift",
+                            "digest": f"sha256:{'6' * 64}",
+                        },
+                    ],
+                    "fixture_file": {
+                        "path": "Fixtures/primary.json",
+                        "digest": f"sha256:{'1' * 64}",
+                    },
+                    "test_account_recipe_file": {
+                        "path": "Fixtures/primary-account.json",
+                        "digest": f"sha256:{'2' * 64}",
+                    },
+                    "required_assertion_ids": [
+                        "ready-title",
+                        "ready",
+                        "api-ready",
+                        "app-ready",
+                        "no-crash",
+                    ],
+                    "clean_state_before_each_run": True,
+                    "locale_identifier": "en_US_POSIX",
+                    "time_zone_identifier": "UTC",
                     "clean_state_steps": [
                         "SHUTDOWN",
                         "ERASE",
@@ -154,13 +212,77 @@ def _configuration(
         ],
         e2e_assertions=[
             {
+                "assertion_id": "ready-title",
+                "kind": "ELEMENT_VALUE_PRESENT",
+                "role": "FLOW_BASELINE",
+                "catalog_key": "ready.title",
+                "verifier": {
+                    "accessibility_identifier": "ready.title",
+                    "expected_value_fixture_key": "ready.title",
+                },
+            },
+            {
+                "assertion_id": "ready",
+                "kind": "NAVIGATION_STATE_REACHED",
+                "role": "FLOW_BASELINE",
+                "catalog_key": "ready.state",
+                "verifier": {
+                    "state_id": "ready",
+                    "marker_accessibility_identifier": "ready.screen",
+                },
+            },
+            {
+                "assertion_id": "api-ready",
+                "kind": "EXPECTED_NETWORK_RESPONSE",
+                "role": "FLOW_BASELINE",
+                "catalog_key": "api.ready.response",
+                "verifier": {
+                    "endpoint_class": "api.ready",
+                    "method": "GET",
+                    "expected_status_code": 200,
+                },
+            },
+            {
+                "assertion_id": "app-ready",
+                "kind": "EXPECTED_LOG_EVENT",
+                "role": "FLOW_BASELINE",
+                "catalog_key": "app.ready.log",
+                "verifier": {
+                    "subsystem": "com.boppuh.mathews",
+                    "category": "journey",
+                    "event_key": "app.ready",
+                    "minimum_count": 1,
+                },
+            },
+            {
                 "assertion_id": "no-crash",
                 "kind": "NO_CRASH",
+                "role": "FLOW_BASELINE",
                 "catalog_key": "app.no_crash",
-            }
+                "verifier": {"bundle_identifier": "com.boppuh.mathews"},
+            },
+            {
+                "assertion_id": "ready-title-task",
+                "kind": "ELEMENT_VALUE_PRESENT",
+                "role": "TASK_SELECTABLE",
+                "catalog_key": "ready.title.task",
+                "verifier": {
+                    "accessibility_identifier": "ready.title",
+                    "expected_value_fixture_key": "ready.title",
+                },
+            },
         ],
         artifact_settings={"collection_paths": ["artifacts/test.log"]},
-        prohibited_paths=[".git", ".env"],
+        prohibited_paths=[
+            ".git",
+            ".env",
+            "Mathews.xcworkspace/contents.xcworkspacedata",
+            "Mathews.xcworkspace/xcshareddata/xcschemes/Mathews.xcscheme",
+            "MathewsHarness.xcodeproj/project.pbxproj",
+            "MathewsUITests",
+            "Fixtures/primary.json",
+            "Fixtures/primary-account.json",
+        ],
         secret_references=["keychain://mathews/test-account"],
         owner_id="local-user",
         actor_id="local-user",
