@@ -344,7 +344,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         with engine.connect() as connection:
             current_revision = MigrationContext.configure(connection).get_current_revision()
         assert ScriptDirectory.from_config(migration_config).get_heads() == ["0007"]
-        assert current_revision == "0006"
+        assert current_revision == "0007"
         inspector = inspect(engine)
         validation_run_foreign_keys = inspector.get_foreign_keys("validation_runs")
         validation_run_foreign_tables = {
