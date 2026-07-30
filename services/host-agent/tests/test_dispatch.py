@@ -29,7 +29,11 @@ from mathews_host_agent.dispatch import (
     HostRequestDispatcher,
     default_operation_registry,
 )
-from mathews_host_agent.journal import HostOperationJournal
+from mathews_host_agent.journal import (
+    HostJournalError,
+    HostOperationJournal,
+    JournalResult,
+)
 from mathews_host_agent.preflight import RepositoryPreflightRunner
 
 NOW_MS = 1_800_000_000_000
@@ -400,6 +404,61 @@ def test_failure_after_an_effect_attempt_remains_ambiguous(
     assert retry.code == "OPERATION_AMBIGUOUS"
 
 
+def test_finish_failure_remains_ambiguous_without_an_effect(
+    tmp_path: Path,
+) -> None:
+    invocations = 0
+    authenticator = _authenticator()
+
+    class FinishFailingJournal(HostOperationJournal):
+        def finish(
+            self,
+            request: HostRequestMessage,
+            *,
+            result: JournalResult,
+        ) -> None:
+            raise HostJournalError("JOURNAL_UNAVAILABLE")
+
+    def handler(
+        _context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        nonlocal invocations
+        invocations += 1
+        return {"value": 42}
+
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=FinishFailingJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=HostOperationRegistry(
+            {
+                "test.execute": HostOperationDefinition(
+                    authority=HostAuthorityKind.TASK_LEASE,
+                    validate=_empty,
+                    handle=handler,
+                )
+            }
+        ),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+    request = _request()
+
+    first = authenticator.verify_response(dispatcher.dispatch(authenticator.sign_request(request)))
+    retry = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(replace(request, request_id=uuid4())))
+    )
+
+    assert invocations == 1
+    assert first.status is HostResponseStatus.AMBIGUOUS
+    assert first.code == "OPERATION_AMBIGUOUS"
+    assert retry.status is HostResponseStatus.AMBIGUOUS
+    assert retry.code == "OPERATION_AMBIGUOUS"
+
+
 def test_same_lease_can_renew_while_mutating_handler_is_between_effects(
     tmp_path: Path,
 ) -> None:
@@ -516,6 +575,7 @@ def test_registry_rejects_mutation_without_task_lease_authority() -> None:
 
 def test_handler_crossing_lease_expiry_cannot_commit(tmp_path: Path) -> None:
     clock = [NOW_MS]
+    invocations = 0
     authenticator = HostMessageAuthenticator(
         SecretValue("a" * 32),
         key_id="control-plane-v1",
@@ -530,6 +590,8 @@ def test_handler_crossing_lease_expiry_cannot_commit(tmp_path: Path) -> None:
         _context: HostOperationContext,
         _arguments: dict[str, JsonValue],
     ) -> dict[str, JsonValue]:
+        nonlocal invocations
+        invocations += 1
         clock[0] = NOW_MS + 61_000
         return {"must_not_commit": True}
 
@@ -553,10 +615,17 @@ def test_handler_crossing_lease_expiry_cannot_commit(tmp_path: Path) -> None:
     response = authenticator.verify_response(
         dispatcher.dispatch(authenticator.sign_request(request))
     )
+    clock[0] = NOW_MS
+    retry = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(replace(request, request_id=uuid4())))
+    )
 
-    assert response.status is HostResponseStatus.REJECTED
-    assert response.code == "LEASE_EXPIRED"
+    assert invocations == 1
+    assert response.status is HostResponseStatus.AMBIGUOUS
+    assert response.code == "OPERATION_AMBIGUOUS"
     assert response.result == {}
+    assert retry.status is HostResponseStatus.AMBIGUOUS
+    assert retry.code == "OPERATION_AMBIGUOUS"
 
 
 def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:

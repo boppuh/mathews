@@ -329,16 +329,8 @@ class HostRequestDispatcher:
         try:
             with task_guard or nullcontext():
                 self._journal.finish(request, result=journal_result)
-        except HostJournalError as error:
-            if context.effect_attempted:
-                return self._ambiguous_response(request)
-            return self._signed_response(
-                request,
-                status=HostResponseStatus.REJECTED,
-                code=_safe_journal_code(error),
-                result={},
-                replayed=False,
-            )
+        except HostJournalError:
+            return self._ambiguous_response(request)
         return self._signed_response(
             request,
             status=journal_result.status,
