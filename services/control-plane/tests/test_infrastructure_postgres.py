@@ -24,6 +24,7 @@ from mathews_configuration import (
     RepositoryConfiguration,
     RepositoryPreflightReport,
 )
+from mathews_control_plane.approvals import ApprovalService, BlockedOperation
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     AuthenticationService,
@@ -44,6 +45,8 @@ from mathews_control_plane.database import (
     session_scope,
 )
 from mathews_control_plane.domain_models import (
+    ApprovalDecision,
+    ApprovalRequestType,
     EvidenceRecord,
     PolicyVersion,
     Task,
@@ -343,8 +346,8 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         authentication_service = AuthenticationService(factory)
         with engine.connect() as connection:
             current_revision = MigrationContext.configure(connection).get_current_revision()
-        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0006"]
-        assert current_revision == "0006"
+        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0007"]
+        assert current_revision == "0007"
         inspector = inspect(engine)
         validation_run_foreign_keys = inspector.get_foreign_keys("validation_runs")
         validation_run_foreign_tables = {
@@ -530,6 +533,56 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
             TaskState.BRIEFING,
             TaskState.CANCELLED,
         }
+
+        with session_scope(factory) as session:
+            approval_task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="7" * 40,
+                requester="local-user",
+                raw_request="Exercise PostgreSQL approval triggers",
+                summary="Exercise approval triggers",
+                owner_id="local-user",
+                actor_id="postgres-test",
+            )
+            session.flush()
+            approval_evidence_id = session.scalar(
+                select(EvidenceRecord.id).where(
+                    EvidenceRecord.task_id == approval_task.id
+                )
+            )
+            assert approval_evidence_id is not None
+            approval_task_id = approval_task.id
+        approval_service = ApprovalService(
+            factory,
+            store,
+            principal_id="postgres-test",
+        )
+        approval = approval_service.request(
+            approval_task_id,
+            request_id=uuid4(),
+            expected_state=TaskState.INTAKE,
+            request_type=ApprovalRequestType.UNSAFE_ACTION,
+            reason_code="UNSAFE_ACTION_REQUIRED",
+            subject_type="BLOCKED_OPERATION",
+            subject_id=None,
+            blocked_operation=BlockedOperation(
+                operation_name="host.mutate",
+                idempotency_key="postgres-approval-operation",
+                input_fingerprint="a" * 64,
+            ),
+            evidence_ids=(approval_evidence_id,),
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        approval_decision = approval_service.decide(
+            approval.request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.DENY,
+            actor_id="local-user",
+        )
+        assert approval.task_state is TaskState.ESCALATED
+        assert approval_decision.task_state is TaskState.FAILED
 
         collision_inputs: list[tuple[UUID, UUID]] = []
         with session_scope(factory) as session:

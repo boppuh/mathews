@@ -11,6 +11,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 from mathews_control_plane import __version__
+from mathews_control_plane.approvals import ApprovalService
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     CSRF_HEADER_NAME,
@@ -46,6 +47,7 @@ def create_app(
     session_factory: SessionFactory | None = None,
     authentication_service: AuthenticationService | None = None,
     evidence_service: EvidenceService | None = None,
+    approval_service: ApprovalService | None = None,
 ) -> FastAPI:
     """Create a default-deny API with an injectable persistence boundary."""
 
@@ -66,14 +68,31 @@ def create_app(
                 seconds=current_settings.auth_reauthentication_ttl_seconds
             ),
         )
+    artifact_store = ArtifactStore.from_settings(current_settings)
     if evidence_service is None:
         evidence_service = EvidenceService(
             session_factory,
-            ArtifactStore.from_settings(current_settings),
+            artifact_store,
+        )
+    if approval_service is None:
+        approval_service = ApprovalService(
+            session_factory,
+            artifact_store,
         )
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
+        approval_batch_size = 100
+        while (
+            len(
+                await run_in_threadpool(
+                    approval_service.expire_due,
+                    limit=approval_batch_size,
+                )
+            )
+            == approval_batch_size
+        ):
+            pass
         # A committed deletion request is an unreadable durable fence. Resume
         # bounded physical cleanup before accepting traffic after any restart.
         batch_size = 100
@@ -99,6 +118,7 @@ def create_app(
         application.state.database_engine = database_engine
     application.state.authentication_service = authentication_service
     application.state.evidence_service = evidence_service
+    application.state.approval_service = approval_service
     application.include_router(create_authentication_router(authentication_service))
     application.include_router(create_evidence_router(evidence_service))
 

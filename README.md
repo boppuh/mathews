@@ -112,6 +112,24 @@ npm run test:postgres
 The integration test creates a uniquely named disposable schema, applies the
 migration chain only inside that schema, and drops the schema during cleanup.
 
+## Approvals and resumable escalation
+
+The control plane persists brief, unsafe-action, retry-limit, review-conflict,
+and review-rule decisions through the approval service. A pending escalation
+stores the exact prior/resume state, a non-secret blocked-operation identity,
+bounded retry history, supporting evidence references, an expiry, and immutable
+request/precondition fingerprints.
+
+Approving or retrying rechecks those durable preconditions and resumes only the
+recorded state. Revision returns an exact brief to `BRIEFING`; deny or abandon
+produces `FAILED`; cancel produces `CANCELLED`; expiry is audited and produces
+`FAILED`. Request and decision transitions are idempotent, append task events,
+and cannot be rewritten or deleted through the database. Startup reconciles
+expired pending requests before serving traffic. Migration `0007` explicitly
+fences pending approvals from earlier schema revisions as cancelled; any
+remaining zero-fingerprint legacy rows are excluded from automatic expiry and
+execution.
+
 ## Local authentication
 
 After applying migrations, issue the one-time bootstrap token:
