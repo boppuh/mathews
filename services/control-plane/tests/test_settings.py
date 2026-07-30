@@ -13,6 +13,7 @@ def test_incomplete_configuration_blocks_automation() -> None:
     assert settings.automation_ready is False
     assert settings.missing_automation_settings == (
         "target_repository_root",
+        "host_auth_key_ref",
         "hermes_endpoint",
         "hermes_api_key_ref",
         "github_app_id",
@@ -32,6 +33,10 @@ def test_complete_configuration_returns_typed_snapshot(tmp_path: Path) -> None:
     settings = Settings(
         target_repository_root=tmp_path,
         artifact_root=Path("/tmp/mathews-artifacts"),
+        host_socket_path=Path("/tmp/mathews-host.sock"),
+        host_auth_key_ref=SecretReference.parse(
+            "keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1"
+        ),
         hermes_endpoint=AnyHttpUrl("https://hermes.example.test"),
         hermes_api_key_ref=SecretReference.parse("keychain://com.boppuh.mathews.hermes/api-key"),
         github_app_id=123,
@@ -50,6 +55,8 @@ def test_complete_configuration_returns_typed_snapshot(tmp_path: Path) -> None:
     assert settings.automation_ready is True
     assert configuration.target_repository_root == tmp_path.resolve()
     assert configuration.artifact_root == Path("/tmp/mathews-artifacts").resolve()
+    assert configuration.host_socket_path == Path("/tmp/mathews-host.sock").resolve()
+    assert configuration.host_auth_key_id == "host-control-plane-v1"
     assert str(configuration.hermes_endpoint) == "https://hermes.example.test/"
     assert configuration.github_app_id == 123
     assert configuration.github_repository_id == 789
@@ -72,6 +79,7 @@ def test_blank_optional_environment_values_are_unconfigured(
 
     for name in (
         "MATHEWS_TARGET_REPOSITORY_ROOT",
+        "MATHEWS_HOST_AUTH_KEY_REF",
         "MATHEWS_HERMES_ENDPOINT",
         "MATHEWS_HERMES_API_KEY_REF",
         "MATHEWS_GITHUB_APP_ID",
@@ -183,6 +191,7 @@ def test_example_environment_contains_references_not_raw_integration_secrets() -
     example = example_path.read_text()
     raw_names = (
         "MATHEWS_HERMES_API_KEY",
+        "MATHEWS_HOST_AUTH_KEY",
         "MATHEWS_GITHUB_PRIVATE_KEY",
         "MATHEWS_GITHUB_WEBHOOK_SECRET",
     )
@@ -192,6 +201,7 @@ def test_example_environment_contains_references_not_raw_integration_secrets() -
 
     settings = Settings(_env_file=example_path)  # type: ignore[call-arg]
     assert settings.hermes_endpoint is not None
+    assert settings.host_auth_key_ref is not None
     assert settings.hermes_api_key_ref is not None
     assert settings.github_private_key_ref is not None
     assert settings.github_webhook_secret_ref is not None

@@ -1,9 +1,26 @@
 import { spawn, spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseEnv } from "node:util";
 
 const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const isWindows = process.platform === "win32";
+const environmentFile = path.join(workspaceRoot, ".env");
+const fileEnvironment = existsSync(environmentFile)
+  ? parseEnv(readFileSync(environmentFile, "utf8"))
+  : {};
+const hostEnvironment = Object.fromEntries(
+  [
+    "MATHEWS_HOST_AUTH_KEY_ID",
+    "MATHEWS_HOST_AUTH_KEY_REF",
+    "MATHEWS_HOST_ID",
+    "MATHEWS_HOST_JOURNAL_PATH",
+    "MATHEWS_HOST_SOCKET_PATH",
+  ]
+    .filter((name) => process.env[name] === undefined && fileEnvironment[name] !== undefined)
+    .map((name) => [name, fileEnvironment[name]]),
+);
 
 if (process.env.MATHEWS_SKIP_POSTGRES !== "1") {
   const database = spawnSync(
@@ -99,6 +116,7 @@ const services = [
     name: "host-agent",
     command: "uv",
     args: ["run", "--package", "mathews-host-agent", "mathews-host-agent"],
+    environment: hostEnvironment,
   },
 ];
 
@@ -123,6 +141,7 @@ for (const service of services) {
     cwd: workspaceRoot,
     env: {
       ...process.env,
+      ...service.environment,
       PYTHONUNBUFFERED: "1",
     },
     stdio: "inherit",

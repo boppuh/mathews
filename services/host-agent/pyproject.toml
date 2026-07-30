@@ -9,6 +9,7 @@ dependencies = [
 
 [project.scripts]
 mathews-host-agent = "mathews_host_agent.agent:main"
+mathews-host-agent-plist = "mathews_host_agent.launchd:main"
 mathews-keychain-check = "mathews_host_agent.secrets:main"
 
 [build-system]

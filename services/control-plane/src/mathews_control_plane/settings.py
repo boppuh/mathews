@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
-from mathews_configuration import SecretReference
+from mathews_configuration import (
+    HostProtocolError,
+    SecretReference,
+    validate_host_identifier,
+)
 from pydantic import AnyHttpUrl, PositiveInt, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -25,6 +29,9 @@ class AutomationConfiguration:
 
     target_repository_root: Path
     artifact_root: Path
+    host_socket_path: Path
+    host_auth_key_ref: SecretReference
+    host_auth_key_id: str
     hermes_endpoint: AnyHttpUrl
     hermes_api_key_ref: SecretReference
     github_app_id: int
@@ -60,11 +67,20 @@ class Settings(BaseSettings):
     postgres_password: SecretStr = SecretStr("mathews")
     postgres_port: int = 5432
     artifact_root: Path = Path(".local/artifacts")
+    host_socket_path: Path = (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "Mathews"
+        / "host-agent.sock"
+    )
+    host_auth_key_id: str = "host-control-plane-v1"
     auth_session_idle_ttl_seconds: PositiveInt = 30 * 60
     auth_session_absolute_ttl_seconds: PositiveInt = 8 * 60 * 60
     auth_reauthentication_ttl_seconds: PositiveInt = 5 * 60
 
     target_repository_root: Path | None = None
+    host_auth_key_ref: SecretReference | None = None
     hermes_endpoint: AnyHttpUrl | None = None
     hermes_api_key_ref: SecretReference | None = None
     github_app_id: PositiveInt | None = None
@@ -89,6 +105,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "hermes_api_key_ref",
+        "host_auth_key_ref",
         "github_private_key_ref",
         "github_webhook_secret_ref",
         mode="before",
@@ -112,10 +129,18 @@ class Settings(BaseSettings):
             raise ValueError("target repository root must be an absolute path")
         return expanded.resolve(strict=False)
 
-    @field_validator("artifact_root")
+    @field_validator("artifact_root", "host_socket_path")
     @classmethod
-    def normalize_artifact_root(cls, value: Path) -> Path:
+    def normalize_local_path(cls, value: Path) -> Path:
         return value.expanduser().resolve(strict=False)
+
+    @field_validator("host_auth_key_id")
+    @classmethod
+    def host_auth_key_id_is_canonical(cls, value: str) -> str:
+        try:
+            return validate_host_identifier(value)
+        except HostProtocolError:
+            raise ValueError("host authentication key id is invalid") from None
 
     @field_validator("web_origin", "hermes_endpoint")
     @classmethod
@@ -131,6 +156,7 @@ class Settings(BaseSettings):
     def missing_automation_settings(self) -> tuple[str, ...]:
         required = (
             ("target_repository_root", self.target_repository_root),
+            ("host_auth_key_ref", self.host_auth_key_ref),
             ("hermes_endpoint", self.hermes_endpoint),
             ("hermes_api_key_ref", self.hermes_api_key_ref),
             ("github_app_id", self.github_app_id),
@@ -155,6 +181,9 @@ class Settings(BaseSettings):
         return AutomationConfiguration(
             target_repository_root=cast(Path, self.target_repository_root),
             artifact_root=self.artifact_root,
+            host_socket_path=self.host_socket_path,
+            host_auth_key_ref=cast(SecretReference, self.host_auth_key_ref),
+            host_auth_key_id=self.host_auth_key_id,
             hermes_endpoint=cast(AnyHttpUrl, self.hermes_endpoint),
             hermes_api_key_ref=cast(SecretReference, self.hermes_api_key_ref),
             github_app_id=cast(int, self.github_app_id),
@@ -178,6 +207,9 @@ class Settings(BaseSettings):
             "postgres_password": "[REDACTED]",
             "postgres_port": self.postgres_port,
             "artifact_root": str(self.artifact_root),
+            "host_socket_path": str(self.host_socket_path),
+            "host_auth_key_ref": _reference_status(self.host_auth_key_ref),
+            "host_auth_key_id": self.host_auth_key_id,
             "target_repository_root": (
                 str(self.target_repository_root)
                 if self.target_repository_root is not None
