@@ -32,6 +32,7 @@ from mathews_control_plane.domain_models import (
     TaskEventEvidenceReference,
     TaskState,
 )
+from mathews_control_plane.evidence import redact_evidence_content
 
 TASK_INTAKE_EVENT_TYPE = "TASK_CREATED"
 TASK_INTAKE_EVENT_SCHEMA_VERSION = 1
@@ -237,10 +238,17 @@ def _principal(authentication: AuthenticatedSession) -> str:
 
 
 def _request_summary(raw_request: str) -> str:
-    normalized = " ".join(raw_request.split())
+    redacted = redact_evidence_content(
+        raw_request,
+        media_type="text/plain; charset=utf-8",
+    )
+    normalized = " ".join(str(redacted.value).split())
     if len(normalized) <= 160:
         return normalized
-    return f"{normalized[:157].rstrip()}..."
+    truncated = normalized[:157].rstrip()
+    if truncated.rfind("[") > truncated.rfind("]"):
+        truncated = truncated[: truncated.rfind("[")].rstrip()
+    return f"{truncated}..."
 
 
 def _as_utc(value: datetime) -> datetime:

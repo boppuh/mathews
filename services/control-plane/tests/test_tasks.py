@@ -347,6 +347,22 @@ def test_create_redacts_summary_before_task_event_and_list_projection(
     assert raw_token not in str(loaded.content)
 
 
+def test_create_redacts_full_request_before_summary_truncation(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    raw_token = f"ghp_{'A' * 24}"  # noqa: S105 - non-secret test fixture
+    raw_request = f"{'x' * 150} {raw_token} must never survive"
+
+    created = _create(task_harness, csrf_token, request=raw_request)
+
+    summary = str(created["summary"])
+    assert len(summary) <= 160
+    assert raw_token not in summary
+    assert "ghp_" not in summary
+    assert summary.endswith("...")
+
+
 @pytest.mark.parametrize(
     "payload",
     [
