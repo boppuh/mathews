@@ -484,7 +484,7 @@ def _command_fingerprint(
 ) -> str:
     command = {
         "actor_id": actor_id,
-        "evidence_ids": [str(evidence_id) for evidence_id in evidence_ids],
+        "evidence_ids": sorted(str(evidence_id) for evidence_id in evidence_ids),
         "expected_state": expected_state.value,
         "kind": kind.value,
         "reason_code": reason_code,

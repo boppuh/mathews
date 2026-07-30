@@ -660,13 +660,22 @@ def test_transition_evidence_reference_limits_and_order_are_enforced(
                 evidence_ids=evidence_ids,
             )
 
+    transition_id = uuid4()
     result = service.transition(
         task_id,
-        transition_id=uuid4(),
+        transition_id=transition_id,
         expected_state=TaskState.INTAKE,
         kind=TaskTransitionKind.START_BRIEFING,
         reason_code="ORDERED_EVIDENCE_REFERENCES",
         evidence_ids=(second_evidence_id, first_evidence_id),
+    )
+    reordered_replay = service.transition(
+        task_id,
+        transition_id=transition_id,
+        expected_state=TaskState.INTAKE,
+        kind=TaskTransitionKind.START_BRIEFING,
+        reason_code="ORDERED_EVIDENCE_REFERENCES",
+        evidence_ids=(first_evidence_id, second_evidence_id),
     )
     with state_machine_harness.factory() as session:
         references = list(
@@ -688,6 +697,7 @@ def test_transition_evidence_reference_limits_and_order_are_enforced(
     ]
     assert [reference.position for reference in references] == [1, 2]
     assert event_count == 1
+    assert reordered_replay == replace(result, replayed=True)
 
 
 def test_same_transition_id_with_different_command_conflicts(
