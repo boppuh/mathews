@@ -1,9 +1,10 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+from mathews_configuration import SecretValue
 from pydantic import SecretStr
 from sqlalchemy import (
     CheckConstraint,
@@ -21,6 +22,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 
+from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database_base import Base as Base
 from mathews_control_plane.domain_models import Task
 
@@ -152,6 +154,7 @@ def session_scope(factory: SessionFactory) -> Iterator[Session]:
 
 def create_task_record(
     session: Session,
+    artifact_store: ArtifactStore,
     *,
     repository: str,
     base_revision: str,
@@ -160,10 +163,25 @@ def create_task_record(
     summary: str,
     owner_id: str,
     actor_id: str,
+    secrets: Sequence[SecretValue] = (),
 ) -> TaskRecord:
-    """Stage and flush a task record in the caller's transaction."""
+    """Capture a redacted request, then stage its linked task record."""
 
-    normalized_summary = summary.strip()
+    # Local import avoids a module cycle: evidence uses SessionFactory.
+    from mathews_control_plane.evidence import (
+        EvidenceAccessClass,
+        EvidenceRetentionClass,
+        EvidenceSourceKind,
+        capture_evidence,
+        redact_evidence_content,
+    )
+
+    redacted_summary = redact_evidence_content(
+        summary,
+        media_type="text/plain; charset=utf-8",
+        secrets=secrets,
+    )
+    normalized_summary = str(redacted_summary.value).strip()
     if not normalized_summary:
         raise ValueError("task summary must not be empty")
     if len(normalized_summary) > 500:
@@ -198,12 +216,33 @@ def create_task_record(
         repository=normalized_repository,
         base_revision=normalized_base_revision,
         requester=normalized_requester,
-        raw_request=raw_request,
+        # The authoritative request content exists only in its evidence
+        # envelope. This placeholder is replaced with the evidence identifier
+        # below and never contains a second content copy.
+        raw_request="evidence://capture-pending",
         summary=normalized_summary,
         owner_id=normalized_owner_id,
         actor_id=normalized_actor_id,
     )
     session.add(task)
+    session.flush()
+    captured_request = capture_evidence(
+        session,
+        artifact_store,
+        payload=raw_request,
+        media_type="text/plain; charset=utf-8",
+        source_kind=EvidenceSourceKind.REQUEST,
+        evidence_type="task-request",
+        origin="control-plane:task-intake",
+        access_classification=EvidenceAccessClass.TASK_OWNER,
+        retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+        owner_id=normalized_owner_id,
+        actor_id=normalized_actor_id,
+        root_correlation_id=task_id,
+        task_id=task_id,
+        secrets=secrets,
+    )
+    task.raw_request = f"evidence://{captured_request.record.id}"
     session.flush()
     return task
 

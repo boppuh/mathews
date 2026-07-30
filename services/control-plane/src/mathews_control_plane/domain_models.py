@@ -288,13 +288,27 @@ class EvidenceRecord(RecordContext, Base):
         CheckConstraint(
             "correction_of_id IS NULL OR correction_of_id <> id", name="correction_not_self"
         ),
+        CheckConstraint(
+            "access_classification IN "
+            "('TASK_OWNER', 'OWNER', 'RECENT_PASSWORD', 'INTERNAL')",
+            name="access_classification",
+        ),
+        CheckConstraint(
+            "retention_policy IN "
+            "('TASK_LIFETIME', 'REPOSITORY_LIFETIME', 'AUDIT')",
+            name="retention_policy",
+        ),
+        UniqueConstraint("correction_of_id", name="uq_evidence_records_correction"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    task_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("tasks.id", ondelete="CASCADE"))
+    task_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("tasks.id", ondelete="RESTRICT"),
+    )
     validation_run_id: Mapped[UUID | None] = mapped_column(
         Uuid,
-        ForeignKey("validation_runs.id", ondelete="SET NULL", use_alter=True),
+        ForeignKey("validation_runs.id", ondelete="RESTRICT", use_alter=True),
     )
     evidence_type: Mapped[str] = mapped_column(String(100), nullable=False)
     origin: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -309,6 +323,139 @@ class EvidenceRecord(RecordContext, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deletion_actor_id: Mapped[str | None] = mapped_column(String(255))
     deletion_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class EvidenceAuditEvent(RecordContext, Base):
+    """Append-only, non-content audit event for an evidence record."""
+
+    __tablename__ = "evidence_audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN "
+            "('CAPTURED', 'METADATA_READ', 'CONTENT_DOWNLOADED', "
+            "'CORRECTION_CREATED', 'DELETION_REQUESTED', 'CONTENT_DESTROYED', "
+            "'DERIVATIVE_REGISTERED')",
+            name="event_type",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[UUID | None] = mapped_column(Uuid)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    details: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+
+
+class EvidenceDeletionRequest(RecordContext, Base):
+    """Durable fence that makes evidence unreadable before content removal."""
+
+    __tablename__ = "evidence_deletion_requests"
+    __table_args__ = (
+        UniqueConstraint("evidence_id", name="uq_evidence_deletion_requests_evidence"),
+        UniqueConstraint(
+            "id",
+            "evidence_id",
+            "reason_code",
+            name="uq_evidence_deletion_requests_identity",
+        ),
+        CheckConstraint(
+            "reason_code IN "
+            "('USER_REQUEST', 'RETENTION_EXPIRED', 'SOURCE_REVOKED', "
+            "'SECURITY_RESPONSE')",
+            name="reason_code",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class EvidenceTombstone(RecordContext, Base):
+    """Minimal completion marker retained after evidence content is destroyed."""
+
+    __tablename__ = "evidence_tombstones"
+    __table_args__ = (
+        UniqueConstraint("evidence_id", name="uq_evidence_tombstones_evidence"),
+        UniqueConstraint(
+            "deletion_request_id",
+            name="uq_evidence_tombstones_deletion_request",
+        ),
+        CheckConstraint(
+            "reason_code IN "
+            "('USER_REQUEST', 'RETENTION_EXPIRED', 'SOURCE_REVOKED', "
+            "'SECURITY_RESPONSE')",
+            name="reason_code",
+        ),
+        CheckConstraint(
+            "removed_derivative_count >= 0",
+            name="removed_derivative_count_non_negative",
+        ),
+        ForeignKeyConstraint(
+            ["deletion_request_id", "evidence_id", "reason_code"],
+            [
+                "evidence_deletion_requests.id",
+                "evidence_deletion_requests.evidence_id",
+                "evidence_deletion_requests.reason_code",
+            ],
+            name="fk_evidence_tombstones_deletion_request_identity",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    deletion_request_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        nullable=False,
+    )
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    removed_derivative_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+
+
+class EvidenceDerivative(RecordContext, Base):
+    """Registered rebuildable index/cache content derived from source evidence."""
+
+    __tablename__ = "evidence_derivatives"
+    __table_args__ = (
+        CheckConstraint(
+            "(deleted_at IS NULL AND content_address IS NOT NULL) OR "
+            "(deleted_at IS NOT NULL AND content_address IS NULL)",
+            name="deletion_state",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    derivative_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(80), nullable=False)
+    content_address: Mapped[str | None] = mapped_column(String(255))
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ValidationContract(RecordContext, Base):

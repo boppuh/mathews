@@ -121,6 +121,53 @@ def test_missing_artifact_raises_safe_error(tmp_path: Path) -> None:
         store.get_bytes(address)
 
 
+def test_delete_is_verified_durable_and_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifact = store.put_bytes(b"delete this verified artifact")
+    shard = _artifact_path(store.root, artifact.address).parent
+    original_fsync = os.fsync
+    fsynced_inodes: set[int] = set()
+
+    def record_fsync(descriptor: int) -> None:
+        descriptor_stat = os.fstat(descriptor)
+        if stat.S_ISDIR(descriptor_stat.st_mode):
+            fsynced_inodes.add(descriptor_stat.st_ino)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+
+    assert store.delete_bytes(artifact.address)
+    assert not _artifact_path(store.root, artifact.address).exists()
+    assert shard.stat().st_ino in fsynced_inodes
+    assert not store.delete_bytes(artifact.address)
+
+
+def test_delete_removes_corrupt_content_but_refuses_redirected_artifacts(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    corrupt = store.put_bytes(b"expected")
+    corrupt_path = _artifact_path(store.root, corrupt.address)
+    corrupt_path.write_bytes(b"unexpected")
+
+    assert store.delete_bytes(corrupt.address)
+    assert not corrupt_path.exists()
+
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    redirected_address = "sha256:" + hashlib.sha256(outside.read_bytes()).hexdigest()
+    redirected_path = _artifact_path(store.root, redirected_address)
+    redirected_path.parent.mkdir(parents=True, exist_ok=True)
+    redirected_path.symlink_to(outside)
+
+    with pytest.raises(ArtifactPathError):
+        store.delete_bytes(redirected_address)
+    assert outside.read_bytes() == b"outside"
+
+
 def test_symlinked_storage_directory_cannot_escape_root(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     outside = tmp_path / "outside"

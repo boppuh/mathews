@@ -1,7 +1,10 @@
 from pathlib import Path
+from typing import TypedDict
 from uuid import UUID
 
 import pytest
+from mathews_configuration import SecretValue
+from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database import (
     Base,
     create_database_engine,
@@ -10,10 +13,22 @@ from mathews_control_plane.database import (
     get_task_record,
     session_scope,
 )
+from mathews_control_plane.domain_models import EvidenceRecord
 from pydantic import SecretStr
+from sqlalchemy import select
 
 
-def _task_arguments(summary: str) -> dict[str, str]:
+class TaskArguments(TypedDict):
+    repository: str
+    base_revision: str
+    requester: str
+    raw_request: str
+    summary: str
+    owner_id: str
+    actor_id: str
+
+
+def _task_arguments(summary: str) -> TaskArguments:
     return {
         "repository": "boppuh/mathews",
         "base_revision": "a" * 40,
@@ -58,6 +73,7 @@ def test_task_record_round_trip(tmp_path: Path) -> None:
         with session_scope(factory) as session:
             created = create_task_record(
                 session,
+                ArtifactStore(tmp_path / "artifacts"),
                 **_task_arguments("  Prove durable storage  "),
             )
             task_id = created.id
@@ -77,6 +93,49 @@ def test_task_record_round_trip(tmp_path: Path) -> None:
         engine.dispose()
 
 
+def test_task_request_is_redacted_before_projection_and_evidence_storage(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'tasks.sqlite3'}")
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    store = ArtifactStore(tmp_path / "artifacts")
+    secret = "task-request-secret-value"
+    arguments = _task_arguments(
+        f"Email alice@example.com with Authorization: Bearer {secret}"
+    )
+
+    try:
+        with session_scope(factory) as session:
+            created = create_task_record(
+                session,
+                store,
+                **arguments,
+                secrets=(SecretValue(secret),),
+            )
+            task_id = created.id
+
+        with factory() as session:
+            task = get_task_record(session, task_id)
+            evidence = session.scalar(
+                select(EvidenceRecord).where(
+                    EvidenceRecord.task_id == task_id,
+                    EvidenceRecord.evidence_type == "task-request",
+                )
+            )
+
+        assert task is not None
+        assert evidence is not None
+        assert task.raw_request == f"evidence://{evidence.id}"
+        assert secret not in task.raw_request
+        assert "alice@example.com" not in task.raw_request
+        assert evidence.content_address is not None
+        assert secret.encode() not in store.get_bytes(evidence.content_address)
+        assert b"alice@example.com" not in store.get_bytes(evidence.content_address)
+    finally:
+        engine.dispose()
+
+
 def test_task_record_rejects_empty_summary(tmp_path: Path) -> None:
     engine = create_database_engine(f"sqlite:///{tmp_path / 'tasks.sqlite3'}")
     Base.metadata.create_all(engine)
@@ -85,7 +144,11 @@ def test_task_record_rejects_empty_summary(tmp_path: Path) -> None:
     try:
         with pytest.raises(ValueError, match="must not be empty"):
             with session_scope(factory) as session:
-                create_task_record(session, **_task_arguments("  "))
+                create_task_record(
+                    session,
+                    ArtifactStore(tmp_path / "artifacts"),
+                    **_task_arguments("  "),
+                )
     finally:
         engine.dispose()
 
@@ -98,7 +161,11 @@ def test_task_record_rejects_summary_over_storage_limit(tmp_path: Path) -> None:
     try:
         with pytest.raises(ValueError, match="must not exceed 500"):
             with session_scope(factory) as session:
-                create_task_record(session, **_task_arguments("a" * 501))
+                create_task_record(
+                    session,
+                    ArtifactStore(tmp_path / "artifacts"),
+                    **_task_arguments("a" * 501),
+                )
     finally:
         engine.dispose()
 
@@ -113,7 +180,11 @@ def test_task_record_requires_an_exact_base_revision(tmp_path: Path) -> None:
     try:
         with pytest.raises(ValueError, match="exact 40- or 64-character"):
             with session_scope(factory) as session:
-                create_task_record(session, **arguments)
+                create_task_record(
+                    session,
+                    ArtifactStore(tmp_path / "artifacts"),
+                    **arguments,
+                )
     finally:
         engine.dispose()
 
@@ -129,6 +200,7 @@ def test_session_scope_rolls_back_failed_unit_of_work(tmp_path: Path) -> None:
             with session_scope(factory) as session:
                 task_id = create_task_record(
                     session,
+                    ArtifactStore(tmp_path / "artifacts"),
                     **_task_arguments("Rollback me"),
                 ).id
                 raise RuntimeError("abort")

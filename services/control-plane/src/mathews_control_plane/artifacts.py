@@ -184,6 +184,68 @@ class ArtifactStore:
         finally:
             os.close(directory_descriptor)
 
+    def delete_bytes(self, address: str) -> bool:
+        """Idempotently destroy one safely resolved artifact through descriptors.
+
+        The caller owns reference coordination. This primitive refuses redirected,
+        non-regular, or swapped targets and fsyncs the shard after unlinking. A
+        digest mismatch does not prevent deletion of corrupted sensitive bytes.
+        """
+
+        hex_digest = _validate_address(address)
+        try:
+            directory_descriptor = self._open_digest_directory(hex_digest, create=False)
+        except FileNotFoundError:
+            return False
+
+        artifact_name = hex_digest[2:]
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            try:
+                descriptor = os.open(
+                    artifact_name,
+                    flags,
+                    dir_fd=directory_descriptor,
+                )
+            except FileNotFoundError:
+                return False
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ArtifactPathError(
+                        f"artifact path is redirected: {address}"
+                    ) from None
+                raise
+
+            with os.fdopen(descriptor, "rb") as artifact_file:
+                opened_stat = os.fstat(artifact_file.fileno())
+                if not stat.S_ISREG(opened_stat.st_mode):
+                    raise ArtifactCorruptionError(
+                        f"artifact is not a regular file: {address}"
+                    )
+
+            try:
+                current_stat = os.stat(
+                    artifact_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            if not stat.S_ISREG(current_stat.st_mode) or (
+                current_stat.st_dev,
+                current_stat.st_ino,
+            ) != (opened_stat.st_dev, opened_stat.st_ino):
+                raise ArtifactPathError(
+                    "artifact changed during deletion"
+                )
+
+            self._verify_digest_directory(directory_descriptor, hex_digest)
+            os.unlink(artifact_name, dir_fd=directory_descriptor)
+            self._fsync_directory(directory_descriptor)
+            return True
+        finally:
+            os.close(directory_descriptor)
+
     def _open_digest_directory(self, hex_digest: str, *, create: bool) -> int:
         root_descriptor = self._open_root(create=create)
         try:
