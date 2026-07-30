@@ -17,6 +17,7 @@ def test_incomplete_configuration_blocks_automation() -> None:
         "hermes_api_key_ref",
         "github_app_id",
         "github_installation_id",
+        "github_repository_id",
         "github_private_key_ref",
         "github_webhook_secret_ref",
     )
@@ -35,6 +36,7 @@ def test_complete_configuration_returns_typed_snapshot(tmp_path: Path) -> None:
         hermes_api_key_ref=SecretReference.parse("keychain://com.boppuh.mathews.hermes/api-key"),
         github_app_id=123,
         github_installation_id=456,
+        github_repository_id=789,
         github_private_key_ref=SecretReference.parse(
             "keychain://com.boppuh.mathews.github-app/private-key"
         ),
@@ -50,6 +52,7 @@ def test_complete_configuration_returns_typed_snapshot(tmp_path: Path) -> None:
     assert configuration.artifact_root == Path("/tmp/mathews-artifacts").resolve()
     assert str(configuration.hermes_endpoint) == "https://hermes.example.test/"
     assert configuration.github_app_id == 123
+    assert configuration.github_repository_id == 789
     assert configuration.github_private_key_ref == SecretReference.parse(
         "keychain://com.boppuh.mathews.github-app/private-key"
     )
@@ -73,6 +76,7 @@ def test_blank_optional_environment_values_are_unconfigured(
         "MATHEWS_HERMES_API_KEY_REF",
         "MATHEWS_GITHUB_APP_ID",
         "MATHEWS_GITHUB_INSTALLATION_ID",
+        "MATHEWS_GITHUB_REPOSITORY_ID",
         "MATHEWS_GITHUB_PRIVATE_KEY_REF",
         "MATHEWS_GITHUB_WEBHOOK_SECRET_REF",
     ):

@@ -41,7 +41,8 @@ opaque Keychain references and credential values remain on the macOS host.
 
 The control plane validates environment values as typed settings. A complete
 automation configuration includes one absolute repository root, the Hermes
-endpoint, GitHub App and installation identifiers, and these opaque references:
+endpoint, GitHub App, installation, and exact repository identifiers, and these
+opaque references:
 
 | Setting | Keychain reference |
 | --- | --- |
@@ -69,6 +70,9 @@ Verify that a Keychain item exists without printing its value:
 uv run --package mathews-host-agent mathews-keychain-check \
   keychain://com.boppuh.mathews.github-app/private-key
 ```
+
+Register the repository-scoped App and its exact permissions using
+[`services/control-plane/GITHUB_APP.md`](services/control-plane/GITHUB_APP.md).
 
 ## Durable local infrastructure
 

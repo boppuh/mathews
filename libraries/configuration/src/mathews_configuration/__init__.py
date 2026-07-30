@@ -1,5 +1,14 @@
 """Shared Mathews configuration contracts."""
 
+from mathews_configuration.github import (
+    GITHUB_APP_PERMISSIONS,
+    GITHUB_WEBHOOK_EVENTS,
+    GitHubAppConfiguration,
+    GitHubAppConfigurationError,
+    GitHubCredentialPurpose,
+    GitHubRepositoryContext,
+    github_token_permissions,
+)
 from mathews_configuration.repository import (
     MANDATORY_PROHIBITED_OPERATIONS,
     MANDATORY_PROHIBITED_PATHS,
@@ -35,6 +44,8 @@ from mathews_configuration.secrets import (
 )
 
 __all__ = [
+    "GITHUB_APP_PERMISSIONS",
+    "GITHUB_WEBHOOK_EVENTS",
     "MANDATORY_PROHIBITED_OPERATIONS",
     "MANDATORY_PROHIBITED_PATHS",
     "REQUIRED_PREFLIGHT_CHECKS",
@@ -44,6 +55,10 @@ __all__ = [
     "AssertionKind",
     "E2EFlow",
     "GitIdentity",
+    "GitHubAppConfiguration",
+    "GitHubAppConfigurationError",
+    "GitHubCredentialPurpose",
+    "GitHubRepositoryContext",
     "GitSettings",
     "OperationKind",
     "PreflightCheck",
@@ -63,5 +78,6 @@ __all__ = [
     "TestOperation",
     "XcodeContainerKind",
     "XcodeSettings",
+    "github_token_permissions",
     "redact_text",
 ]

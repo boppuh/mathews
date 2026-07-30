@@ -29,6 +29,7 @@ class AutomationConfiguration:
     hermes_api_key_ref: SecretReference
     github_app_id: int
     github_installation_id: int
+    github_repository_id: int
     github_private_key_ref: SecretReference
     github_webhook_secret_ref: SecretReference
 
@@ -68,6 +69,7 @@ class Settings(BaseSettings):
     hermes_api_key_ref: SecretReference | None = None
     github_app_id: PositiveInt | None = None
     github_installation_id: PositiveInt | None = None
+    github_repository_id: PositiveInt | None = None
     github_private_key_ref: SecretReference | None = None
     github_webhook_secret_ref: SecretReference | None = None
 
@@ -76,6 +78,7 @@ class Settings(BaseSettings):
         "hermes_endpoint",
         "github_app_id",
         "github_installation_id",
+        "github_repository_id",
         mode="before",
     )
     @classmethod
@@ -132,6 +135,7 @@ class Settings(BaseSettings):
             ("hermes_api_key_ref", self.hermes_api_key_ref),
             ("github_app_id", self.github_app_id),
             ("github_installation_id", self.github_installation_id),
+            ("github_repository_id", self.github_repository_id),
             ("github_private_key_ref", self.github_private_key_ref),
             ("github_webhook_secret_ref", self.github_webhook_secret_ref),
         )
@@ -155,6 +159,7 @@ class Settings(BaseSettings):
             hermes_api_key_ref=cast(SecretReference, self.hermes_api_key_ref),
             github_app_id=cast(int, self.github_app_id),
             github_installation_id=cast(int, self.github_installation_id),
+            github_repository_id=cast(int, self.github_repository_id),
             github_private_key_ref=cast(SecretReference, self.github_private_key_ref),
             github_webhook_secret_ref=cast(SecretReference, self.github_webhook_secret_ref),
         )
@@ -182,6 +187,7 @@ class Settings(BaseSettings):
             "hermes_api_key_ref": _reference_status(self.hermes_api_key_ref),
             "github_app_id": self.github_app_id,
             "github_installation_id": self.github_installation_id,
+            "github_repository_id": self.github_repository_id,
             "github_private_key_ref": _reference_status(self.github_private_key_ref),
             "github_webhook_secret_ref": _reference_status(self.github_webhook_secret_ref),
             "automation_ready": self.automation_ready,
