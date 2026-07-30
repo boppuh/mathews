@@ -1,7 +1,12 @@
-import type { CreateTaskRequest, TaskListResponse, TaskSummary } from "@mathews/contracts";
+import type {
+  CreateTaskRequest,
+  TaskCockpitResponse,
+  TaskListResponse,
+  TaskSummary,
+} from "@mathews/contracts";
 
 import { cookieValue, normalizeControlPlaneUrl } from "./auth";
-import { parseTaskList, parseTaskSummary } from "./tasks";
+import { parseTaskCockpit, parseTaskList, parseTaskSummary } from "./tasks";
 
 const CSRF_COOKIE_NAME = "__Host-mathews-csrf";
 const controlPlaneUrl = normalizeControlPlaneUrl(process.env.NEXT_PUBLIC_CONTROL_PLANE_URL);
@@ -29,11 +34,13 @@ async function request(path: string, init: RequestInit, fallbackError: string): 
     const message =
       response.status === 401
         ? "Your session expired. Refresh the page and sign in again."
-        : response.status === 413
-          ? "The task request is too large."
-          : response.status === 422
-            ? "Check the repository, exact base SHA, and task request."
-            : fallbackError;
+        : response.status === 404
+          ? "This task is unavailable."
+          : response.status === 413
+            ? "The task request is too large."
+            : response.status === 422
+              ? "Check the repository, exact base SHA, and task request."
+              : fallbackError;
     throw new TaskRequestError(message, response.status);
   }
   return response;
@@ -72,9 +79,40 @@ export const taskClient = {
     );
     return parseTaskSummary(await response.json());
   },
+
+  async detail(taskId: string, signal?: AbortSignal): Promise<TaskCockpitResponse> {
+    const response = await request(
+      `/api/tasks/${encodeURIComponent(taskId)}`,
+      { method: "GET", signal },
+      "Unable to load the task cockpit.",
+    );
+    return parseTaskCockpit(await response.json());
+  },
 };
 
 export type TaskListClient = Pick<typeof taskClient, "list">;
+export type TaskDetailClient = Pick<typeof taskClient, "detail">;
+
+export class LatestTaskDetailLoader {
+  private generation = 0;
+
+  async load(
+    taskId: string,
+    signal?: AbortSignal,
+    client: TaskDetailClient = taskClient,
+  ): Promise<TaskCockpitResponse | undefined> {
+    const requestGeneration = ++this.generation;
+    try {
+      const result = await client.detail(taskId, signal);
+      return requestGeneration === this.generation ? result : undefined;
+    } catch (error) {
+      if (requestGeneration !== this.generation) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+}
 
 export class LatestTaskListLoader {
   private generation = 0;

@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { LatestTaskListLoader, TaskRequestError, taskClient } from "./task-client";
+import {
+  LatestTaskDetailLoader,
+  LatestTaskListLoader,
+  TaskRequestError,
+  taskClient,
+} from "./task-client";
 
 const task = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -67,8 +72,37 @@ describe("taskClient", () => {
     expect(JSON.parse(String(init.body))).toEqual(body);
   });
 
+  it("loads a credentialed durable cockpit", async () => {
+    const cockpit = {
+      task,
+      state_context: {
+        kind: "ACTIVE",
+        label: "Intake",
+        detail: "The request is captured and waiting for briefing.",
+        resume_state: null,
+      },
+      events: [],
+      evidence: [],
+      approvals: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(cockpit), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(taskClient.detail(task.id)).resolves.toEqual(cockpit);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`http://localhost:8000/api/tasks/${task.id}`);
+    expect(init).toMatchObject({ credentials: "include", method: "GET" });
+  });
+
   it.each([
     [401, "Your session expired"],
+    [404, "task is unavailable"],
     [413, "too large"],
     [422, "Check the repository"],
   ])("maps status %i without exposing response details", async (status, message) => {
@@ -134,5 +168,68 @@ describe("LatestTaskListLoader", () => {
         list: vi.fn().mockRejectedValue(error),
       }),
     ).rejects.toBe(error);
+  });
+});
+
+describe("LatestTaskDetailLoader", () => {
+  const cockpit = {
+    task,
+    state_context: {
+      kind: "ACTIVE" as const,
+      label: "Intake",
+      detail: "The request is captured and waiting for briefing.",
+      resume_state: null,
+    },
+    events: [],
+    evidence: [],
+    approvals: [],
+  };
+
+  it("drops an older cockpit response after a newer route wins", async () => {
+    let resolveOlder: ((value: typeof cockpit) => void) | undefined;
+    const olderRequest = new Promise<typeof cockpit>((resolve) => {
+      resolveOlder = resolve;
+    });
+    const loader = new LatestTaskDetailLoader();
+    const olderResult = loader.load(task.id, undefined, {
+      detail: vi.fn().mockReturnValue(olderRequest),
+    });
+    const newerCockpit = {
+      ...cockpit,
+      task: {
+        ...task,
+        id: "22222222-2222-4222-8222-222222222222",
+        cockpit_path: "/tasks/22222222-2222-4222-8222-222222222222",
+      },
+    };
+
+    await expect(
+      loader.load(newerCockpit.task.id, undefined, {
+        detail: vi.fn().mockResolvedValue(newerCockpit),
+      }),
+    ).resolves.toEqual(newerCockpit);
+    resolveOlder?.(cockpit);
+
+    await expect(olderResult).resolves.toBeUndefined();
+  });
+
+  it("drops an older cockpit failure after a newer route wins", async () => {
+    let rejectOlder: ((error: Error) => void) | undefined;
+    const olderRequest = new Promise<never>((_resolve, reject) => {
+      rejectOlder = reject;
+    });
+    const loader = new LatestTaskDetailLoader();
+    const olderResult = loader.load(task.id, undefined, {
+      detail: vi.fn().mockReturnValue(olderRequest),
+    });
+
+    await expect(
+      loader.load(task.id, undefined, {
+        detail: vi.fn().mockResolvedValue(cockpit),
+      }),
+    ).resolves.toEqual(cockpit);
+    rejectOlder?.(new TaskRequestError("stale failure", 503));
+
+    await expect(olderResult).resolves.toBeUndefined();
   });
 });

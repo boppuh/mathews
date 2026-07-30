@@ -22,6 +22,7 @@ from mathews_control_plane.database import (
     SessionFactory,
     create_database_engine,
     create_session_factory,
+    create_task_record,
 )
 from mathews_control_plane.domain_models import (
     ApprovalDecision,
@@ -298,6 +299,184 @@ def test_list_orders_recent_activity_and_projects_durable_blockers(
             "count": 2,
         },
     ]
+
+
+def test_cockpit_projects_durable_history_evidence_and_approvals_without_payloads(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    created = _create(task_harness, csrf_token, request="Build the task cockpit")
+    task_id = UUID(str(created["id"]))
+    raw_payload_secret = "raw-event-payload-must-stay-private"  # noqa: S105
+
+    with task_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        session.add(
+            TaskEvent(
+                task_id=task_id,
+                sequence=2,
+                event_type="AGENT_PROGRESS",
+                payload={"raw_output": raw_payload_secret},
+                occurred_at=task_harness.clock.now + timedelta(minutes=1),
+                owner_id=task.owner_id,
+                actor_id="agent-runtime",
+                root_correlation_id=task.root_correlation_id,
+            )
+        )
+        session.add(
+            ApprovalRequest(
+                task_id=task_id,
+                request_type=ApprovalRequestType.BRIEF.value,
+                subject_type="BRIEF",
+                reason="private approval reason",
+                options=[ApprovalDecision.APPROVE.value],
+                supporting_evidence_ids=[],
+                requesting_state=TaskState.INTAKE,
+                status=ApprovalStatus.PENDING,
+                owner_id=task.owner_id,
+                actor_id="control-plane",
+                root_correlation_id=task.root_correlation_id,
+            )
+        )
+
+    response = task_harness.client.get(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert raw_payload_secret not in response.text
+    assert "private approval reason" not in response.text
+    cockpit = response.json()
+    assert cockpit["task"]["id"] == str(task_id)
+    assert cockpit["state_context"] == {
+        "kind": "ACTIVE",
+        "label": "Intake",
+        "detail": "The request is captured and waiting for briefing.",
+        "resume_state": None,
+    }
+    assert [
+        (event["sequence"], event["kind"], event["summary"])
+        for event in cockpit["events"]
+    ] == [
+        (1, "CREATED", "Task request captured."),
+        (2, "ACTIVITY", "Task activity was recorded."),
+    ]
+    assert cockpit["events"][0]["evidence_count"] == 1
+    assert cockpit["events"][1]["evidence_count"] == 0
+    assert cockpit["events"][0]["occurred_at"].endswith("Z")
+    assert len(cockpit["evidence"]) == 1
+    assert cockpit["evidence"][0]["evidence_type"] == "task-request"
+    assert cockpit["evidence"][0]["status"] == "AVAILABLE"
+    assert cockpit["approvals"][0]["type_label"] == "Brief approval"
+    assert cockpit["approvals"][0]["status"] == "PENDING"
+
+
+@pytest.mark.parametrize(
+    ("state", "resume_state", "kind", "label_fragment", "detail_fragment"),
+    [
+        (
+            TaskState.ESCALATED,
+            TaskState.VALIDATING,
+            "RESUMABLE_ESCALATION",
+            "Resumable",
+            "resume from Validating",
+        ),
+        (
+            TaskState.FAILED,
+            None,
+            "TERMINAL",
+            "failure",
+            "cannot resume",
+        ),
+        (
+            TaskState.CANCELLED,
+            None,
+            "TERMINAL",
+            "cancellation",
+            "cannot restart",
+        ),
+        (
+            TaskState.PR_ACTIVE,
+            None,
+            "VERIFIED_DRAFT_PR",
+            "Verified draft PR",
+            "not yet ready",
+        ),
+        (
+            TaskState.READY_FOR_HUMAN_MERGE,
+            None,
+            "HUMAN_MERGE_READY",
+            "Ready for human merge",
+            "human merge decision",
+        ),
+        (
+            TaskState.HANDED_OFF,
+            None,
+            "AUTOMATION_HANDED_OFF",
+            "Automation handed off",
+            "does not mean",
+        ),
+    ],
+)
+def test_cockpit_distinguishes_workflow_boundaries(
+    task_harness: TaskHarness,
+    state: TaskState,
+    resume_state: TaskState | None,
+    kind: str,
+    label_fragment: str,
+    detail_fragment: str,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    created = _create(task_harness, csrf_token)
+    task_id = UUID(str(created["id"]))
+    with task_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.state = state
+        task.escalation_resume_state = resume_state
+
+    response = task_harness.client.get(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200, response.text
+    context = response.json()["state_context"]
+    assert context["kind"] == kind
+    assert label_fragment in context["label"]
+    assert detail_fragment in context["detail"]
+    assert context["resume_state"] == (
+        None if resume_state is None else resume_state.value
+    )
+
+
+def test_cockpit_requires_authentication_and_hides_absent_tasks(
+    task_harness: TaskHarness,
+) -> None:
+    unknown_id = UUID("11111111-1111-4111-8111-111111111111")
+
+    assert task_harness.client.get(f"/api/tasks/{unknown_id}").status_code == 401
+    _authenticate(task_harness)
+    with task_harness.factory.begin() as session:
+        other_owner_task = create_task_record(
+            session,
+            task_harness.store,
+            repository="boppuh/mathews",
+            base_revision=_BASE_SHA,
+            requester="another-local-user",
+            raw_request="This task belongs to another owner.",
+            summary="Another owner's task",
+            owner_id="another-local-user",
+            actor_id="another-local-user",
+        )
+        other_owner_task_id = other_owner_task.id
+
+    response = task_harness.client.get(f"/api/tasks/{unknown_id}")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "task unavailable"}
+    cross_owner_response = task_harness.client.get(
+        f"/api/tasks/{other_owner_task_id}"
+    )
+    assert cross_owner_response.status_code == 404
+    assert cross_owner_response.json() == {"detail": "task unavailable"}
 
 
 def test_create_redacts_summary_before_task_event_and_list_projection(
