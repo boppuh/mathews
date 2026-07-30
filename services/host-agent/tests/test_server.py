@@ -18,6 +18,8 @@ from mathews_configuration import (
     HostRequestMessage,
     JsonValue,
     SecretValue,
+    SignedHostRequest,
+    SignedHostResponse,
     SystemHostAuthority,
     decode_signed_host_response,
     encode_signed_host_request,
@@ -363,6 +365,7 @@ def test_shutdown_is_bounded_when_an_operation_handler_is_stuck(
     entered = threading.Event()
     release = threading.Event()
     completed = threading.Event()
+    dispatch_completed = threading.Event()
 
     def stuck_handler(
         _context: HostOperationContext,
@@ -375,7 +378,14 @@ def test_shutdown_is_bounded_when_an_operation_handler_is_stuck(
         finally:
             completed.set()
 
-    dispatcher = HostRequestDispatcher(
+    class ObservableDispatcher(HostRequestDispatcher):
+        def dispatch(self, envelope: SignedHostRequest) -> SignedHostResponse:
+            try:
+                return super().dispatch(envelope)
+            finally:
+                dispatch_completed.set()
+
+    dispatcher = ObservableDispatcher(
         authenticator=authenticator,
         journal=HostOperationJournal(
             socket_runtime / "journal.sqlite3",
@@ -433,4 +443,5 @@ def test_shutdown_is_bounded_when_an_operation_handler_is_stuck(
     assert not server_thread.is_alive()
     release.set()
     assert completed.wait(timeout=2)
+    assert dispatch_completed.wait(timeout=2)
     client_connection.close()
