@@ -69,6 +69,7 @@ def test_task_record_round_trip(tmp_path: Path) -> None:
 
         assert retrieved is not None
         assert retrieved.id == task_id
+        assert retrieved.root_correlation_id == task_id
         assert retrieved.summary == "Prove durable storage"
         assert retrieved.created_at is not None
         assert retrieved.updated_at is not None

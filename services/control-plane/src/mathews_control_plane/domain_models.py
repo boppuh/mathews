@@ -179,9 +179,6 @@ class Task(RecordContext, Base):
         _enum(TaskState, name="task_escalation_resume_state", length=32)
     )
     terminal_outcome: Mapped[str | None] = mapped_column(Text)
-    root_correlation_id: Mapped[UUID] = mapped_column(Uuid, nullable=False, default=uuid4)
-
-
 class Brief(RecordContext, Base):
     """Immutable, versioned statement of task scope and acceptance."""
 

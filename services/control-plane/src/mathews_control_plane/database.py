@@ -191,7 +191,10 @@ def create_task_record(
     if not normalized_owner_id or not normalized_actor_id:
         raise ValueError("task owner and actor must not be empty")
 
+    task_id = uuid4()
     task = TaskRecord(
+        id=task_id,
+        root_correlation_id=task_id,
         repository=normalized_repository,
         base_revision=normalized_base_revision,
         requester=normalized_requester,
