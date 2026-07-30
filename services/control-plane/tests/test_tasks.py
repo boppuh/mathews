@@ -305,7 +305,7 @@ def test_create_redacts_summary_before_task_event_and_list_projection(
 ) -> None:
     csrf_token = _authenticate(task_harness)
     raw_email = "alice@example.com"
-    raw_token = "raw-task-intake-token"
+    raw_token = "raw-task-intake-token"  # noqa: S105 - non-secret test fixture
     raw_request = (
         f"Email {raw_email} after the fix. "
         f"Authorization: Bearer {raw_token}"
