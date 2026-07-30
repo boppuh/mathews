@@ -1,8 +1,9 @@
 import hashlib
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import TypedDict
@@ -29,6 +30,11 @@ from mathews_control_plane.authentication import (
     BootstrapAlreadyCompletedError,
     IssuedSession,
     generate_bootstrap_token,
+)
+from mathews_control_plane.background_jobs import (
+    BackgroundJobLeaseLostError,
+    BackgroundJobService,
+    JobLeaseGrant,
 )
 from mathews_control_plane.database import (
     create_database_engine,
@@ -98,9 +104,7 @@ def _repository_configuration_arguments(
         "test_account_recipe_version": 1,
         "test_account_recipe_digest": f"sha256:{'2' * 64}",
         "test_account": test_account,
-        "runner_test_identifier": (
-            "MathewsUITests/PrimaryJourneyTests/testPrimaryJourney"
-        ),
+        "runner_test_identifier": ("MathewsUITests/PrimaryJourneyTests/testPrimaryJourney"),
         "app_bundle_identifier": "com.boppuh.mathews",
         "harness_source_root": "MathewsUITests",
         "harness_project_path": "MathewsHarness.xcodeproj",
@@ -112,15 +116,11 @@ def _repository_configuration_arguments(
                 "digest": f"sha256:{'3' * 64}",
             },
             {
-                "path": (
-                    "Mathews.xcworkspace/xcshareddata/xcschemes/Mathews.xcscheme"
-                ),
+                "path": ("Mathews.xcworkspace/xcshareddata/xcschemes/Mathews.xcscheme"),
                 "digest": f"sha256:{'4' * 64}",
             },
             {
-                "path": (
-                    "MathewsHarness.xcodeproj/project.pbxproj"
-                ),
+                "path": ("MathewsHarness.xcodeproj/project.pbxproj"),
                 "digest": f"sha256:{'5' * 64}",
             },
             {
@@ -172,24 +172,19 @@ def _repository_configuration_arguments(
                 "MATHEWS_CONFIGURED_SIMULATOR",
             ],
             "timeout_seconds": 600,
-            "e2e_flow": (
-                e2e_flow if kind is OperationKind.SIMULATOR_E2E else None
-            ),
+            "e2e_flow": (e2e_flow if kind is OperationKind.SIMULATOR_E2E else None),
         }
         if kind is OperationKind.SIMULATOR_E2E:
             assert isinstance(operation["argv"], list)
             operation["argv"].append(
-                "-only-testing:MathewsUITests/"
-                "PrimaryJourneyTests/testPrimaryJourney"
+                "-only-testing:MathewsUITests/PrimaryJourneyTests/testPrimaryJourney"
             )
         operations.append(operation)
     return {
         "repository_key": "boppuh/mathews",
         "repository_settings": {
             "root": str(root),
-            "prohibited_operations": [
-                operation.value for operation in ProhibitedOperation
-            ],
+            "prohibited_operations": [operation.value for operation in ProhibitedOperation],
         },
         "git_settings": {
             "default_base_ref": "refs/remotes/origin/main",
@@ -203,12 +198,8 @@ def _repository_configuration_arguments(
             "container_path": "Mathews.xcworkspace",
             "scheme": "Mathews",
             "simulator": {
-                "runtime_identifier": (
-                    "com.apple.CoreSimulator.SimRuntime.iOS-26-0"
-                ),
-                "device_type_identifier": (
-                    "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"
-                ),
+                "runtime_identifier": ("com.apple.CoreSimulator.SimRuntime.iOS-26-0"),
+                "device_type_identifier": ("com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"),
             },
         },
         "operations": operations,
@@ -352,13 +343,12 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         authentication_service = AuthenticationService(factory)
         with engine.connect() as connection:
             current_revision = MigrationContext.configure(connection).get_current_revision()
-        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0005"]
-        assert current_revision == "0005"
+        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0006"]
+        assert current_revision == "0006"
         inspector = inspect(engine)
         validation_run_foreign_keys = inspector.get_foreign_keys("validation_runs")
         validation_run_foreign_tables = {
-            foreign_key["referred_table"]
-            for foreign_key in validation_run_foreign_keys
+            foreign_key["referred_table"] for foreign_key in validation_run_foreign_keys
         }
         assert {
             "tasks",
@@ -369,8 +359,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
             foreign_key["constrained_columns"]
             == ["validation_contract_id", "repository_configuration_id"]
             and foreign_key["referred_table"] == "validation_contracts"
-            and foreign_key["referred_columns"]
-            == ["id", "repository_configuration_id"]
+            and foreign_key["referred_columns"] == ["id", "repository_configuration_id"]
             for foreign_key in validation_run_foreign_keys
         )
         assert {
@@ -402,18 +391,14 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
             root_correlation_id = created.root_correlation_id
             repository_configuration = create_repository_configuration(
                 session,
-                **_repository_configuration_arguments(
-                    tmp_path / "target-repository"
-                ),
+                **_repository_configuration_arguments(tmp_path / "target-repository"),
                 owner_id="local-user",
                 actor_id="postgres-test",
                 root_correlation_id=root_correlation_id,
             )
             repository_configuration_id = repository_configuration.id
             repository_configuration_version = repository_configuration.version
-            repository_digest = repository_configuration_digest(
-                repository_configuration
-            )
+            repository_digest = repository_configuration_digest(repository_configuration)
             base_sha = "b" * 40
             preflight_attempt = begin_preflight_attempt(
                 session,
@@ -480,10 +465,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         with pytest.raises(DBAPIError, match="append-only"):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE evidence_records SET origin = 'rewritten' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE evidence_records SET origin = 'rewritten' WHERE id = :id"),
                     {"id": request_evidence_id},
                 )
         with pytest.raises(IntegrityError):
@@ -532,9 +514,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
                 )
             )
         accepted_transitions = [
-            result
-            for result in transition_results
-            if isinstance(result, TaskTransitionResult)
+            result for result in transition_results if isinstance(result, TaskTransitionResult)
         ]
         stale_transitions = [
             result
@@ -567,14 +547,10 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
                 )
                 session.flush()
                 collision_evidence_id = session.scalar(
-                    select(EvidenceRecord.id).where(
-                        EvidenceRecord.task_id == collision_task.id
-                    )
+                    select(EvidenceRecord.id).where(EvidenceRecord.task_id == collision_task.id)
                 )
                 assert collision_evidence_id is not None
-                collision_inputs.append(
-                    (collision_task.id, collision_evidence_id)
-                )
+                collision_inputs.append((collision_task.id, collision_evidence_id))
         shared_transition_id = uuid4()
 
         def collide_transition_id(
@@ -594,23 +570,55 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
                 return error
 
         with ThreadPoolExecutor(max_workers=2) as executor:
-            collision_results = list(
-                executor.map(collide_transition_id, collision_inputs)
-            )
+            collision_results = list(executor.map(collide_transition_id, collision_inputs))
+        assert sum(isinstance(result, TaskTransitionResult) for result in collision_results) == 1
         assert (
-            sum(
-                isinstance(result, TaskTransitionResult)
-                for result in collision_results
-            )
+            sum(isinstance(result, TaskTransitionConflictError) for result in collision_results)
             == 1
         )
-        assert (
-            sum(
-                isinstance(result, TaskTransitionConflictError)
-                for result in collision_results
-            )
-            == 1
+
+        job_service = BackgroundJobService(
+            factory,
+            store,
+            principal_id="postgres-test",
         )
+        scheduled_job = job_service.schedule(
+            task_id=task_id,
+            job_type="postgres-race",
+            idempotency_key=f"postgres-race:{task_id}",
+            input_payload={"operation": "verify-claim"},
+        )
+
+        def claim_job(worker_id: str) -> JobLeaseGrant | None:
+            return job_service.claim_next(
+                worker_id=worker_id,
+                lease_duration=timedelta(seconds=1),
+                job_types=("postgres-race",),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claim_results = list(
+                executor.map(claim_job, ("postgres-worker-1", "postgres-worker-2"))
+            )
+        job_grants = [result for result in claim_results if result is not None]
+        assert len(job_grants) == 1
+        first_job_grant = job_grants[0]
+        assert first_job_grant.job_id == scheduled_job.job_id
+
+        time.sleep(1.1)
+        recovered_job_grant = claim_job("postgres-worker-recovered")
+        assert recovered_job_grant is not None
+        assert recovered_job_grant.recovered is True
+        assert recovered_job_grant.attempt == 2
+        assert recovered_job_grant.fencing_token > first_job_grant.fencing_token
+        with pytest.raises(BackgroundJobLeaseLostError):
+            job_service.checkpoint(
+                first_job_grant,
+                expected_version=0,
+                idempotency_key="postgres-stale-checkpoint",
+                payload={"stale": True},
+            )
+
         artifact = store.put_bytes(payload)
         bootstrap_token = generate_bootstrap_token(factory)
 
@@ -693,9 +701,7 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
             with session_scope(recreated_factory) as session:
                 return create_repository_configuration(
                     session,
-                    **_repository_configuration_arguments(
-                        tmp_path / "target-repository"
-                    ),
+                    **_repository_configuration_arguments(tmp_path / "target-repository"),
                     owner_id="local-user",
                     actor_id="postgres-test",
                     root_correlation_id=uuid4(),

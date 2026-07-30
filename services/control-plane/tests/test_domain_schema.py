@@ -40,7 +40,11 @@ from sqlalchemy.exc import IntegrityError
 
 EXPECTED_DOMAIN_TABLES = {
     "approval_requests",
+    "background_job_checkpoints",
+    "background_job_effects",
+    "background_job_fencing_counter",
     "background_job_leases",
+    "background_job_task_transitions",
     "background_jobs",
     "brief_approval_decisions",
     "briefs",

@@ -1,4 +1,4 @@
 def test_worker_probe() -> None:
-    from mathews_control_plane.worker import run_once
+    from mathews_control_plane.worker import probe
 
-    assert run_once() == "worker:0.1.0:local"
+    assert probe() == "worker:0.1.0:local"

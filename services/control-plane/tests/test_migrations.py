@@ -1,5 +1,6 @@
 import json
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,6 +10,11 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.background_jobs import (
+    BackgroundJobService,
+    EffectExecutionResult,
+    RetryPolicy,
+)
 from mathews_control_plane.database import (
     Base,
     create_database_engine,
@@ -33,7 +39,11 @@ EXPECTED_HEAD_TABLES = {
     "approval_requests",
     "auth_sessions",
     "authentication_state",
+    "background_job_checkpoints",
+    "background_job_effects",
+    "background_job_fencing_counter",
     "background_job_leases",
+    "background_job_task_transitions",
     "background_jobs",
     "brief_approval_decisions",
     "briefs",
@@ -222,6 +232,369 @@ def test_migrations_match_declared_model_metadata(tmp_path: Path) -> None:
         engine.dispose()
 
 
+def test_job_loop_migrates_nonempty_legacy_jobs_without_stranding_them(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "0005")
+    engine = create_database_engine(database_url)
+    store = ArtifactStore(tmp_path / "artifacts")
+    factory = create_session_factory(engine)
+    runnable_id = uuid4()
+    legacy_lease_id = uuid4()
+    taskless_id = uuid4()
+    exhausted_id = uuid4()
+    correlation_id = uuid4()
+    try:
+        with factory.begin() as session:
+            task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="1" * 40,
+                requester="local-user",
+                raw_request="Migrate legacy jobs",
+                summary="Migrate legacy jobs",
+                owner_id="local-user",
+                actor_id="local-user",
+            )
+            task_id = task.id
+        with engine.begin() as connection:
+            for parameters in (
+                {
+                    "id": runnable_id.hex,
+                    "task_id": task_id.hex,
+                    "key": "legacy:runnable",
+                    "attempts": 6,
+                },
+                {
+                    "id": taskless_id.hex,
+                    "task_id": None,
+                    "key": "legacy:taskless",
+                    "attempts": 1,
+                },
+                {
+                    "id": exhausted_id.hex,
+                    "task_id": task_id.hex,
+                    "key": "legacy:over-budget",
+                    "attempts": 101,
+                },
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO background_jobs ("
+                        "id, task_id, job_type, status, idempotency_key, "
+                        "attempt_count, owner_id, actor_id, root_correlation_id"
+                        ") VALUES ("
+                        ":id, :task_id, 'legacy-action', 'RUNNING', :key, "
+                        ":attempts, 'local-user', 'legacy-worker', :correlation_id)"
+                    ),
+                    {**parameters, "correlation_id": correlation_id.hex},
+                )
+            connection.execute(
+                text(
+                    "INSERT INTO background_job_leases ("
+                    "id, job_id, lease_owner, attempt, fencing_token, "
+                    "idempotency_key, heartbeat_at, expires_at, owner_id, "
+                    "actor_id, root_correlation_id"
+                    ") VALUES ("
+                    ":id, :job_id, 'legacy-worker', 6, 77, "
+                    "'legacy:runnable:lease:6', CURRENT_TIMESTAMP, "
+                    "datetime(CURRENT_TIMESTAMP, '+1 hour'), 'local-user', "
+                    "'legacy-worker', :correlation_id)"
+                ),
+                {
+                    "id": legacy_lease_id.hex,
+                    "job_id": runnable_id.hex,
+                    "correlation_id": correlation_id.hex,
+                },
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            rows = {
+                row.id: row
+                for row in connection.execute(
+                    text(
+                        "SELECT id, status, attempt_count, max_attempts, "
+                        "available_at, last_error_code "
+                        "FROM background_jobs"
+                    )
+                ).mappings()
+            }
+            legacy_lease = connection.execute(
+                text(
+                    "SELECT fencing_token, lease_protocol_version "
+                    "FROM background_job_leases WHERE id = :id"
+                ),
+                {"id": legacy_lease_id.hex},
+            ).one()
+            next_token = connection.execute(
+                text("SELECT next_token FROM background_job_fencing_counter WHERE id = 1")
+            ).scalar_one()
+        runnable = rows[runnable_id.hex]
+        taskless = rows[taskless_id.hex]
+        exhausted = rows[exhausted_id.hex]
+        assert runnable.status == "QUEUED"
+        assert runnable.attempt_count == 6
+        assert runnable.max_attempts == 7
+        assert runnable.available_at is not None
+        assert taskless.status == "FAILED"
+        assert taskless.last_error_code == "LEGACY_TASK_BINDING_MISSING"
+        assert exhausted.status == "FAILED"
+        assert exhausted.attempt_count == 100
+        assert exhausted.max_attempts == 100
+        assert exhausted.last_error_code == "LEGACY_ATTEMPT_BUDGET_EXCEEDED"
+        assert legacy_lease == (77, 0)
+        assert next_token == 78
+    finally:
+        engine.dispose()
+
+    command.downgrade(config, "0005")
+    engine = create_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            preserved = connection.execute(
+                text("SELECT job_id, fencing_token FROM background_job_leases WHERE id = :id"),
+                {"id": legacy_lease_id.hex},
+            ).one()
+        assert preserved == (runnable_id.hex, 77)
+    finally:
+        engine.dispose()
+
+
+def test_job_loop_migration_installs_declared_checks_and_defaults(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    try:
+        inspector = inspect(engine)
+        lease_checks = {
+            check["name"] for check in inspector.get_check_constraints("background_job_leases")
+        }
+        lease_columns = {
+            column["name"]: column for column in inspector.get_columns("background_job_leases")
+        }
+        counter_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("background_job_fencing_counter")
+        }
+        with engine.connect() as connection:
+            job_triggers = set(
+                connection.execute(
+                    text(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'trigger' AND tbl_name = 'background_jobs'"
+                    )
+                ).scalars()
+            )
+    finally:
+        engine.dispose()
+
+    assert {
+        "background_jobs_validate_insert",
+        "background_jobs_validate_update",
+        "background_jobs_no_delete",
+    } <= job_triggers
+    assert {
+        "ck_background_job_leases_checkpoint_version_non_negative",
+        "ck_background_job_leases_expires_after_heartbeat",
+        "ck_background_job_leases_release_shape",
+    } <= lease_checks
+    assert lease_columns["lease_protocol_version"]["default"] is not None
+    assert counter_columns["next_token"]["default"] is not None
+
+
+def test_job_loop_downgrade_refuses_unclaimed_new_command(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    factory = create_session_factory(engine)
+    store = ArtifactStore(tmp_path / "artifacts")
+    try:
+        with factory.begin() as session:
+            task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="1" * 40,
+                requester="local-user",
+                raw_request="Guard a new queued command",
+                summary="Guard queued command",
+                owner_id="local-user",
+                actor_id="local-user",
+            )
+            task_id = task.id
+        BackgroundJobService(factory, store).schedule(
+            task_id=task_id,
+            job_type="migration-check",
+            idempotency_key="migration-check:queued",
+            input_payload={"operation": "verify"},
+        )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(
+        RuntimeError,
+        match="fenced background job provenance",
+    ):
+        command.downgrade(config, "0005")
+
+
+def test_job_loop_migration_enforces_fenced_provenance_and_guarded_downgrade(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    factory = create_session_factory(engine)
+    store = ArtifactStore(tmp_path / "artifacts")
+    now = datetime.now(UTC)
+    try:
+        with factory.begin() as session:
+            task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="1" * 40,
+                requester="local-user",
+                raw_request="Exercise the migrated job loop",
+                summary="Exercise job loop",
+                owner_id="local-user",
+                actor_id="local-user",
+            )
+            task_id = task.id
+        service = BackgroundJobService(factory, store, clock=lambda: now)
+        scheduled = service.schedule(
+            task_id=task_id,
+            job_type="migration-check",
+            idempotency_key="migration-check:1",
+            input_payload={"operation": "verify"},
+        )
+        grant = service.claim_next(
+            worker_id="migration-worker",
+            lease_duration=timedelta(seconds=60),
+        )
+        assert grant is not None and grant.job_id == scheduled.job_id
+        checkpoint = service.checkpoint(
+            grant,
+            expected_version=0,
+            idempotency_key="migration-checkpoint:1",
+            payload={"step": "prepared"},
+        )
+        effect = service.prepare_effect(
+            grant,
+            effect_key="publish",
+            effect_type="git.push",
+            request_payload={"branch": "task"},
+        )
+        service.record_effect_result(
+            grant,
+            effect_id=effect.effect_id,
+            result=EffectExecutionResult(
+                succeeded=True,
+                payload={"remote_sha": "a" * 40},
+            ),
+            expected_checkpoint_version=checkpoint.sequence,
+            checkpoint_idempotency_key="migration-checkpoint:2",
+            checkpoint_payload={"step": "published"},
+        )
+
+        with pytest.raises(IntegrityError, match="cannot heartbeat"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE background_job_leases "
+                        "SET expires_at = datetime(expires_at, '+60 seconds') "
+                        "WHERE id = :lease_id"
+                    ),
+                    {"lease_id": grant.lease_id.hex},
+                )
+        with pytest.raises(IntegrityError, match="not fenced"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE background_jobs "
+                        "SET checkpoint_version = checkpoint_version + 1, "
+                        "last_fencing_token = :stale "
+                        "WHERE id = :job_id"
+                    ),
+                    {
+                        "job_id": scheduled.job_id.hex,
+                        "stale": grant.fencing_token + 1,
+                    },
+                )
+        with pytest.raises(IntegrityError, match="append-only"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text("DELETE FROM background_job_checkpoints WHERE id = :checkpoint_id"),
+                    {"checkpoint_id": checkpoint.checkpoint_id.hex},
+                )
+        service.complete(
+            grant,
+            expected_checkpoint_version=2,
+        )
+        realtime_service = BackgroundJobService(factory, store)
+        exhausted_job = realtime_service.schedule(
+            task_id=task_id,
+            job_type="migration-expiry",
+            idempotency_key="migration-expiry:1",
+            input_payload={"operation": "expire"},
+            retry_policy=RetryPolicy(max_attempts=1),
+        )
+        exhausted_grant = realtime_service.claim_next(
+            worker_id="migration-expiry-worker",
+            lease_duration=timedelta(seconds=1),
+            job_types=("migration-expiry",),
+        )
+        assert exhausted_grant is not None
+        time.sleep(1.1)
+        assert (
+            realtime_service.claim_next(
+                worker_id="migration-expiry-reconciler",
+                lease_duration=timedelta(seconds=1),
+                job_types=("migration-expiry",),
+            )
+            is None
+        )
+        with engine.connect() as connection:
+            exhausted_status = connection.execute(
+                text("SELECT status, last_error_code FROM background_jobs WHERE id = :job_id"),
+                {"job_id": exhausted_job.job_id.hex},
+            ).one()
+        assert exhausted_status == (
+            "FAILED",
+            "LEASE_EXPIRED_ATTEMPTS_EXHAUSTED",
+        )
+        with pytest.raises(IntegrityError, match="cannot be deleted"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text("DELETE FROM background_jobs WHERE id = :job_id"),
+                    {"job_id": scheduled.job_id.hex},
+                )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(
+        RuntimeError,
+        match="fenced background job provenance",
+    ):
+        command.downgrade(config, "0005")
+    assert _table_names(database_url) == EXPECTED_HEAD_TABLES
+
+
 def test_evidence_revision_explicitly_fences_revision_0003_preflight_rows(
     tmp_path: Path,
 ) -> None:
@@ -280,10 +653,7 @@ def test_evidence_revision_explicitly_fences_revision_0003_preflight_rows(
     try:
         with engine.connect() as connection:
             pointer = connection.execute(
-                text(
-                    "SELECT preflight_evidence_id FROM repository_configurations "
-                    "WHERE id = :id"
-                ),
+                text("SELECT preflight_evidence_id FROM repository_configurations WHERE id = :id"),
                 {"id": configuration_id},
             ).scalar_one()
             migrated = connection.execute(
@@ -366,10 +736,7 @@ def test_evidence_revision_downgrade_fences_canonical_preflight_rows(
     try:
         with engine.connect() as connection:
             pointer = connection.execute(
-                text(
-                    "SELECT preflight_evidence_id FROM repository_configurations "
-                    "WHERE id = :id"
-                ),
+                text("SELECT preflight_evidence_id FROM repository_configurations WHERE id = :id"),
                 {"id": configuration_id},
             ).scalar_one()
             labels = connection.execute(
@@ -417,10 +784,7 @@ def test_migrated_evidence_audit_records_are_database_append_only(
         with pytest.raises(IntegrityError, match="append-only"):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE evidence_records SET origin = 'rewritten' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE evidence_records SET origin = 'rewritten' WHERE id = :id"),
                     {"id": evidence_id},
                 )
         with pytest.raises(IntegrityError, match="append-only"):
@@ -656,26 +1020,19 @@ def test_migrated_task_lifecycle_requires_matching_append_only_audit(
         with pytest.raises(IntegrityError, match="append-only"):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE task_events SET payload = '{}' WHERE id = :id"
-                    ),
+                    text("UPDATE task_events SET payload = '{}' WHERE id = :id"),
                     {"id": event_id},
                 )
         with pytest.raises(IntegrityError, match="append-only"):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "DELETE FROM task_event_evidence_references WHERE id = :id"
-                    ),
+                    text("DELETE FROM task_event_evidence_references WHERE id = :id"),
                     {"id": reference_id},
                 )
         with pytest.raises(IntegrityError, match="append-only"):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE policy_versions SET approved_by = 'rewritten' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE policy_versions SET approved_by = 'rewritten' WHERE id = :id"),
                     {"id": policy_id},
                 )
         with pytest.raises(IntegrityError, match="append-only"):
@@ -919,8 +1276,7 @@ def test_task_transition_revision_scrubs_legacy_task_events(
         with engine.connect() as connection:
             event = connection.execute(
                 text(
-                    "SELECT event_type, payload, owner_id, actor_id "
-                    "FROM task_events WHERE id = :id"
+                    "SELECT event_type, payload, owner_id, actor_id FROM task_events WHERE id = :id"
                 ),
                 {"id": event_id},
             ).one()
@@ -969,9 +1325,7 @@ def test_task_transition_revision_refuses_to_discard_accepted_provenance(
             )
             session.flush()
             evidence_id = session.scalar(
-                select(EvidenceRecord.id).where(
-                    EvidenceRecord.task_id == task.id
-                )
+                select(EvidenceRecord.id).where(EvidenceRecord.task_id == task.id)
             )
             assert evidence_id is not None
             task_id = task.id
