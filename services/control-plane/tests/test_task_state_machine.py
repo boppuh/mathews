@@ -55,7 +55,8 @@ from mathews_control_plane.task_state_machine import (
     TaskTransitionSnapshot,
     evaluate_task_transition,
 )
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 _NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
@@ -669,6 +670,7 @@ def test_transition_evidence_reference_limits_and_order_are_enforced(
         reason_code="ORDERED_EVIDENCE_REFERENCES",
         evidence_ids=(second_evidence_id, first_evidence_id),
     )
+    assert result.replayed is False
     reordered_replay = service.transition(
         task_id,
         transition_id=transition_id,
@@ -698,6 +700,42 @@ def test_transition_evidence_reference_limits_and_order_are_enforced(
     assert [reference.position for reference in references] == [1, 2]
     assert event_count == 1
     assert reordered_replay == replace(result, replayed=True)
+
+
+def test_unexpected_integrity_errors_are_not_mislabeled_as_conflicts(
+    state_machine_harness: StateMachineHarness,
+) -> None:
+    task_id, evidence_id = _create_task_policy_and_evidence(state_machine_harness)
+    with state_machine_harness.engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TRIGGER reject_test_task_event "
+                "BEFORE INSERT ON task_events "
+                "BEGIN "
+                "SELECT RAISE(ABORT, 'simulated storage integrity failure'); "
+                "END"
+            )
+        )
+
+    with pytest.raises(IntegrityError, match="simulated storage integrity failure"):
+        _service(state_machine_harness).transition(
+            task_id,
+            transition_id=uuid4(),
+            expected_state=TaskState.INTAKE,
+            kind=TaskTransitionKind.START_BRIEFING,
+            reason_code="START_BRIEFING",
+            evidence_ids=(evidence_id,),
+        )
+
+    with state_machine_harness.factory() as session:
+        task = session.get(Task, task_id)
+        event_count = session.scalar(
+            select(func.count())
+            .select_from(TaskEvent)
+            .where(TaskEvent.task_id == task_id)
+        )
+    assert task is not None and task.state is TaskState.INTAKE
+    assert event_count == 0
 
 
 def test_same_transition_id_with_different_command_conflicts(

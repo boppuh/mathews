@@ -870,9 +870,7 @@ class TaskTransitionService:
                     )
                 )
                 if existing is None:
-                    raise TaskTransitionConflictError(
-                        "transition conflicted with concurrent durable state"
-                    ) from None
+                    raise
                 fingerprint = _command_fingerprint(
                     task_id=task_id,
                     transition_id=transition_id,
