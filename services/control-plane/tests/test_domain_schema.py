@@ -57,6 +57,7 @@ EXPECTED_DOMAIN_TABLES = {
     "review_rules",
     "rule_candidates",
     "task_events",
+    "task_event_evidence_references",
     "tasks",
     "validation_contracts",
     "validation_runs",
