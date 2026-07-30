@@ -1,5 +1,6 @@
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,6 +10,12 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.authentication import (
+    AuthenticationService,
+    BootstrapAlreadyCompletedError,
+    IssuedSession,
+    generate_bootstrap_token,
+)
 from mathews_control_plane.database import (
     create_database_engine,
     create_session_factory,
@@ -62,10 +69,11 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         engine = create_database_engine(database_url)
         factory = create_session_factory(engine)
         store = ArtifactStore(tmp_path / "artifacts")
+        authentication_service = AuthenticationService(factory)
         with engine.connect() as connection:
             current_revision = MigrationContext.configure(connection).get_current_revision()
-        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0001"]
-        assert current_revision == "0001"
+        assert ScriptDirectory.from_config(migration_config).get_heads() == ["0002"]
+        assert current_revision == "0002"
 
         with session_scope(factory) as session:
             created = create_task_record(
@@ -74,6 +82,32 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
             )
             task_id = created.id
         artifact = store.put_bytes(payload)
+        bootstrap_token = generate_bootstrap_token(factory)
+
+        def bootstrap_concurrently() -> IssuedSession | BootstrapAlreadyCompletedError:
+            try:
+                return authentication_service.bootstrap(
+                    bootstrap_token=bootstrap_token,
+                    password="correct horse battery staple",
+                )
+            except BootstrapAlreadyCompletedError as error:
+                return error
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            bootstrap_results = list(
+                executor.map(lambda _attempt: bootstrap_concurrently(), range(2))
+            )
+        issued_sessions = [
+            result for result in bootstrap_results if isinstance(result, IssuedSession)
+        ]
+        rejected_bootstraps = [
+            result
+            for result in bootstrap_results
+            if isinstance(result, BootstrapAlreadyCompletedError)
+        ]
+        assert len(issued_sessions) == 1
+        assert len(rejected_bootstraps) == 1
+        issued_session = issued_sessions[0]
         engine.dispose()
         engine = None
 
@@ -81,13 +115,27 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
         engine = recreated_engine
         recreated_factory = create_session_factory(recreated_engine)
         recreated_store = ArtifactStore(store.root)
+        recreated_authentication_service = AuthenticationService(recreated_factory)
         with recreated_factory() as session:
             retrieved = get_task_record(session, task_id)
+        authenticated = recreated_authentication_service.authenticate(
+            issued_session.session_token
+        )
 
         assert retrieved is not None
         assert retrieved.summary == "PostgreSQL and artifact durability smoke"
         assert artifact.address == f"sha256:{expected_digest}"
         assert recreated_store.get_bytes(artifact.address) == payload
+        assert authenticated is not None
+        assert recreated_authentication_service.bootstrap_status().bootstrap_required is False
+
+        recreated_authentication_service.logout(authenticated)
+        assert (
+            AuthenticationService(recreated_factory).authenticate(
+                issued_session.session_token
+            )
+            is None
+        )
     finally:
         if engine is not None:
             engine.dispose()

@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     postgres_password: SecretStr = SecretStr("mathews")
     postgres_port: int = 5432
     artifact_root: Path = Path(".local/artifacts")
+    auth_session_idle_ttl_seconds: PositiveInt = 30 * 60
+    auth_session_absolute_ttl_seconds: PositiveInt = 8 * 60 * 60
+    auth_reauthentication_ttl_seconds: PositiveInt = 5 * 60
 
     target_repository_root: Path | None = None
     hermes_endpoint: AnyHttpUrl | None = None

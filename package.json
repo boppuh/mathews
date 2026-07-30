@@ -20,6 +20,7 @@
     "sharp": "0.35.3"
   },
   "scripts": {
+    "auth:bootstrap-token": "uv run --package mathews-control-plane mathews-auth-bootstrap-token",
     "build": "npm run build --workspaces --if-present",
     "check": "npm run lint && npm run typecheck && npm test",
     "db:migrate": "uv run --package mathews-control-plane alembic -c services/control-plane/alembic.ini upgrade head",

@@ -4,7 +4,20 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from pydantic import SecretStr
-from sqlalchemy import DateTime, Engine, MetaData, String, Uuid, create_engine, func, select
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Engine,
+    ForeignKey,
+    LargeBinary,
+    MetaData,
+    SmallInteger,
+    String,
+    Uuid,
+    create_engine,
+    func,
+    select,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 _NAMING_CONVENTION = {
@@ -45,6 +58,94 @@ class TaskRecord(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class AuthenticationState(Base):
+    """Singleton state for the one-time, out-of-band bootstrap ceremony."""
+
+    __tablename__ = "authentication_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
+    bootstrap_token_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32))
+    failed_login_attempts: Mapped[int] = mapped_column(
+        SmallInteger,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    login_blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class LocalUser(Base):
+    """The single local operator account."""
+
+    __tablename__ = "local_users"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
+    password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class AuthSession(Base):
+    """Durable server-side session; raw credentials are never persisted."""
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[int] = mapped_column(
+        SmallInteger,
+        ForeignKey("local_users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    token_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False, unique=True)
+    csrf_token_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    absolute_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    reauthenticated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 type SessionFactory = sessionmaker[Session]
