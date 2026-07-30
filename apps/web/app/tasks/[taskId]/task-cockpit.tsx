@@ -249,7 +249,9 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
                       <strong>{approval.type_label}</strong>
                       <small>Requested during {stageLabel(approval.requesting_state)}</small>
                     </div>
-                    <span>{approval.status}</span>
+                    <span className={`approval-status approval-${approval.status.toLowerCase()}`}>
+                      {approval.status}
+                    </span>
                   </li>
                 ))}
               </ul>

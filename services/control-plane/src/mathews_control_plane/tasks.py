@@ -582,7 +582,7 @@ def _task_state_context(task: Task) -> TaskStateContextResponse:
             TaskState.IMPLEMENTING: "Approved implementation work is in progress.",
             TaskState.VALIDATING: "The current candidate is being validated.",
             TaskState.REPAIRING: "A bounded repair is in progress before revalidation.",
-        }[state],
+        }.get(state, "Automation is working on this task."),
     )
 
 

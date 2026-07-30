@@ -22,6 +22,7 @@ from mathews_control_plane.database import (
     SessionFactory,
     create_database_engine,
     create_session_factory,
+    create_task_record,
 )
 from mathews_control_plane.domain_models import (
     ApprovalDecision,
@@ -453,11 +454,29 @@ def test_cockpit_requires_authentication_and_hides_absent_tasks(
 
     assert task_harness.client.get(f"/api/tasks/{unknown_id}").status_code == 401
     _authenticate(task_harness)
+    with task_harness.factory.begin() as session:
+        other_owner_task = create_task_record(
+            session,
+            task_harness.store,
+            repository="boppuh/mathews",
+            base_revision=_BASE_SHA,
+            requester="another-local-user",
+            raw_request="This task belongs to another owner.",
+            summary="Another owner's task",
+            owner_id="another-local-user",
+            actor_id="another-local-user",
+        )
+        other_owner_task_id = other_owner_task.id
 
     response = task_harness.client.get(f"/api/tasks/{unknown_id}")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "task unavailable"}
+    cross_owner_response = task_harness.client.get(
+        f"/api/tasks/{other_owner_task_id}"
+    )
+    assert cross_owner_response.status_code == 404
+    assert cross_owner_response.json() == {"detail": "task unavailable"}
 
 
 def test_create_redacts_summary_before_task_event_and_list_projection(

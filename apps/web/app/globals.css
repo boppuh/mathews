@@ -824,6 +824,21 @@ section {
   background: linear-gradient(120deg, rgb(255 157 157 / 10%), transparent 58%), rgb(21 27 36 / 92%);
 }
 
+.context-verified_draft_pr {
+  border-color: rgb(91 179 255 / 48%);
+  background: linear-gradient(120deg, rgb(91 179 255 / 14%), transparent 58%), rgb(21 27 36 / 92%);
+}
+
+.context-human_merge_ready {
+  border-color: rgb(255 201 120 / 52%);
+  background: linear-gradient(120deg, rgb(255 201 120 / 14%), transparent 58%), rgb(21 27 36 / 92%);
+}
+
+.context-automation_handed_off {
+  border-color: rgb(177 162 255 / 46%);
+  background: linear-gradient(120deg, rgb(177 162 255 / 13%), transparent 58%), rgb(21 27 36 / 92%);
+}
+
 .cockpit-section {
   margin-top: clamp(3.5rem, 8vw, 6rem);
   scroll-margin-top: 1rem;
@@ -1053,10 +1068,27 @@ section {
 }
 
 .cockpit-blockers span,
-.approval-list > li > span {
+.approval-status {
   color: var(--danger);
   font-size: 0.68rem;
   font-weight: 750;
+}
+
+.approval-pending {
+  color: #ffc978;
+}
+
+.approval-approved {
+  color: var(--accent);
+}
+
+.approval-cancelled {
+  color: var(--muted);
+}
+
+.approval-rejected,
+.approval-expired {
+  color: var(--danger);
 }
 
 .approval-list {
