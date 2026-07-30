@@ -70,6 +70,32 @@ uv run --package mathews-host-agent mathews-keychain-check \
   keychain://com.boppuh.mathews.github-app/private-key
 ```
 
+## Durable local infrastructure
+
+Local startup applies the control-plane migrations before starting the API and
+worker. Apply the same repeatable migration explicitly with:
+
+```bash
+npm run db:migrate
+```
+
+Artifacts are stored beneath `MATHEWS_ARTIFACT_ROOT` using immutable
+`sha256:<digest>` addresses. Writes are atomic, duplicate content is
+deduplicated, and stored bytes are rehashed on every read.
+
+The default test suite exercises database transactions and migrations without
+requiring a local PostgreSQL server. CI additionally runs the combined
+task-record and artifact smoke test against PostgreSQL 17. To run that test
+locally, set `POSTGRES_TEST_DATABASE_URL` to a PostgreSQL database on which the
+test user may create and drop schemas, then run:
+
+```bash
+npm run test:postgres
+```
+
+The integration test creates a uniquely named disposable schema, applies the
+migration chain only inside that schema, and drops the schema during cleanup.
+
 ## Run locally
 
 ```bash

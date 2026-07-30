@@ -22,6 +22,7 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "check": "npm run lint && npm run typecheck && npm test",
+    "db:migrate": "uv run --package mathews-control-plane alembic -c services/control-plane/alembic.ini upgrade head",
     "dev": "node scripts/dev.mjs",
     "dev:api": "uv run --package mathews-control-plane uvicorn mathews_control_plane.app:app --reload --host 127.0.0.1 --port 8000",
     "dev:host": "uv run --package mathews-host-agent mathews-host-agent",
@@ -32,6 +33,7 @@
     "lint:python": "uv run ruff check libraries/configuration services",
     "test": "npm run test:js && npm run test:python",
     "test:js": "npm run test --workspaces --if-present",
+    "test:postgres": "uv run pytest -q services/control-plane/tests/test_infrastructure_postgres.py",
     "test:python": "uv run pytest",
     "typecheck": "npm run typecheck:js && npm run typecheck:python",
     "typecheck:js": "npm run typecheck --workspaces --if-present",
