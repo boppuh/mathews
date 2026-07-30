@@ -79,10 +79,6 @@ export type TaskListClient = Pick<typeof taskClient, "list">;
 export class LatestTaskListLoader {
   private generation = 0;
 
-  invalidate(): void {
-    this.generation += 1;
-  }
-
   async load(
     signal?: AbortSignal,
     client: TaskListClient = taskClient,

@@ -63,10 +63,14 @@ export function TaskWorkspace() {
       if (error instanceof Error && error.name === "AbortError") {
         return;
       }
-      setListState({
-        status: "failed",
-        message: messageFrom(error, "Unable to load tasks."),
-      });
+      setListState((current) =>
+        current.status === "ready"
+          ? current
+          : {
+              status: "failed",
+              message: messageFrom(error, "Unable to load tasks."),
+            },
+      );
     }
   }, []);
 
@@ -91,7 +95,6 @@ export function TaskWorkspace() {
     setCreateError(null);
     try {
       const created = await taskClient.create(body);
-      taskListLoader.current?.invalidate();
       setListState((current) => ({
         status: "ready",
         tasks:

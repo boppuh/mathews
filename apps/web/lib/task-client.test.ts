@@ -105,20 +105,24 @@ describe("taskClient", () => {
 });
 
 describe("LatestTaskListLoader", () => {
-  it("drops an older failure after a successful create invalidates it", async () => {
+  it("drops an older failure after a newer list request wins", async () => {
     let rejectOlder: ((error: Error) => void) | undefined;
     const olderRequest = new Promise<never>((_resolve, reject) => {
       rejectOlder = reject;
     });
     const loader = new LatestTaskListLoader();
-    const result = loader.load(undefined, {
+    const olderResult = loader.load(undefined, {
       list: vi.fn().mockReturnValue(olderRequest),
     });
 
-    loader.invalidate();
+    await expect(
+      loader.load(undefined, {
+        list: vi.fn().mockResolvedValue({ tasks: [] }),
+      }),
+    ).resolves.toEqual({ tasks: [] });
     rejectOlder?.(new TaskRequestError("stale failure", 503));
 
-    await expect(result).resolves.toBeUndefined();
+    await expect(olderResult).resolves.toBeUndefined();
   });
 
   it("surfaces the newest list failure", async () => {
