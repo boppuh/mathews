@@ -42,6 +42,7 @@ class Settings(BaseSettings):
         # The workspace shares this file with the Node development launcher.
         # Unknown entries are ignored; required automation fields still fail closed.
         extra="ignore",
+        hide_input_in_errors=True,
         validate_default=True,
     )
 
@@ -109,6 +110,16 @@ class Settings(BaseSettings):
     def normalize_artifact_root(cls, value: Path) -> Path:
         return value.expanduser().resolve(strict=False)
 
+    @field_validator("web_origin", "hermes_endpoint")
+    @classmethod
+    def diagnostic_urls_have_no_credentials(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        if value is not None and (value.username is not None or value.password is not None):
+            raise ValueError(
+                "URL credentials are not allowed; configure authentication "
+                "through a secret reference"
+            )
+        return value
+
     @property
     def missing_automation_settings(self) -> tuple[str, ...]:
         required = (
@@ -151,7 +162,7 @@ class Settings(BaseSettings):
             "environment": self.environment,
             "api_host": self.api_host,
             "api_port": self.api_port,
-            "web_origin": str(self.web_origin),
+            "web_origin": _safe_url(self.web_origin),
             "database_url": "[REDACTED]",
             "postgres_db": self.postgres_db,
             "postgres_user": self.postgres_user,
@@ -163,9 +174,7 @@ class Settings(BaseSettings):
                 if self.target_repository_root is not None
                 else None
             ),
-            "hermes_endpoint": (
-                str(self.hermes_endpoint) if self.hermes_endpoint is not None else None
-            ),
+            "hermes_endpoint": _safe_url(self.hermes_endpoint),
             "hermes_api_key_ref": _reference_status(self.hermes_api_key_ref),
             "github_app_id": self.github_app_id,
             "github_installation_id": self.github_installation_id,
@@ -178,6 +187,14 @@ class Settings(BaseSettings):
 
 def _reference_status(reference: SecretReference | None) -> str | None:
     return reference.safe_label if reference is not None else None
+
+
+def _safe_url(value: AnyHttpUrl | None) -> str | None:
+    if value is None:
+        return None
+    if value.username is not None or value.password is not None:
+        return "[REDACTED URL]"
+    return str(value)
 
 
 @lru_cache

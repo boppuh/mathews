@@ -89,15 +89,53 @@ def test_shared_dotenv_ignores_launcher_and_legacy_fields(tmp_path: Path) -> Non
     from mathews_control_plane.settings import Settings
 
     env_file = tmp_path / ".env"
-    env_file.write_text(
-        "MATHEWS_SKIP_POSTGRES=1\n"
-        "MATHEWS_HERMES_API_KEY=unused-legacy-secret\n"
-    )
+    env_file.write_text("MATHEWS_SKIP_POSTGRES=1\nMATHEWS_HERMES_API_KEY=unused-legacy-secret\n")
 
     settings = Settings(_env_file=env_file)  # type: ignore[call-arg]
 
     assert settings.automation_ready is False
     assert "unused-legacy-secret" not in str(settings.safe_summary())
+
+
+def test_validation_errors_hide_invalid_inputs() -> None:
+    from mathews_control_plane.settings import Settings
+
+    invalid_secret = "do-not-log-this-secret"
+
+    with pytest.raises(ValidationError) as error:
+        Settings(github_app_id=invalid_secret)  # type: ignore[arg-type]
+
+    assert invalid_secret not in str(error.value)
+
+
+@pytest.mark.parametrize("field_name", ("web_origin", "hermes_endpoint"))
+def test_diagnostic_urls_reject_embedded_credentials(field_name: str) -> None:
+    from mathews_control_plane.settings import Settings
+
+    credential = "do-not-log-this-secret"
+
+    with pytest.raises(ValidationError, match="URL credentials are not allowed") as error:
+        Settings.model_validate(
+            {field_name: f"https://user:{credential}@example.test"}
+        )
+
+    assert credential not in str(error.value)
+
+
+def test_safe_summary_redacts_url_credentials_if_validation_is_bypassed() -> None:
+    from mathews_control_plane.settings import Settings
+
+    credential = "do-not-log-this-secret"
+    credential_url = AnyHttpUrl(f"https://user:{credential}@example.test")
+    settings = Settings.model_construct(
+        web_origin=credential_url,
+        hermes_endpoint=credential_url,
+    )
+
+    summary = str(settings.safe_summary())
+
+    assert credential not in summary
+    assert summary.count("[REDACTED URL]") == 2
 
 
 def test_configuration_report_redacts_database_credentials() -> None:
