@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import time
+from collections.abc import Mapping
 
 from sqlalchemy import Engine
 
@@ -17,7 +18,11 @@ from mathews_control_plane.database import (
     create_database_engine,
     create_session_factory,
 )
+from mathews_control_plane.domain_models import ReconciliationTargetKind
 from mathews_control_plane.reliability import (
+    OwnedProcessTerminator,
+    OwnedWorkspaceCleaner,
+    ReconciliationAdapter,
     StartupRecoveryResult,
     StartupRecoveryService,
 )
@@ -70,13 +75,25 @@ def _poll_delay(outcome: WorkerRunOutcome) -> float | None:
 def recover_worker_startup(
     runtime_settings: Settings,
     engine: Engine,
+    *,
+    adapters: Mapping[
+        ReconciliationTargetKind,
+        ReconciliationAdapter,
+    ]
+    | None = None,
+    terminator: OwnedProcessTerminator | None = None,
+    cleaner: OwnedWorkspaceCleaner | None = None,
 ) -> StartupRecoveryResult:
     """Reconcile durable external state before the worker may claim work."""
 
     return StartupRecoveryService(
         create_session_factory(engine),
         ArtifactStore(runtime_settings.artifact_root),
-    ).recover()
+    ).recover(
+        adapters=adapters,
+        terminator=terminator,
+        cleaner=cleaner,
+    )
 
 
 def main() -> None:

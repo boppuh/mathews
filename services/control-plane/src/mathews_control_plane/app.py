@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Literal
@@ -25,12 +25,18 @@ from mathews_control_plane.database import (
     create_database_engine,
     create_session_factory,
 )
+from mathews_control_plane.domain_models import ReconciliationTargetKind
 from mathews_control_plane.evidence import (
     EvidenceBodyLimitMiddleware,
     EvidenceService,
     create_evidence_router,
 )
-from mathews_control_plane.reliability import StartupRecoveryService
+from mathews_control_plane.reliability import (
+    OwnedProcessTerminator,
+    OwnedWorkspaceCleaner,
+    ReconciliationAdapter,
+    StartupRecoveryService,
+)
 from mathews_control_plane.settings import Settings, settings
 
 
@@ -50,6 +56,13 @@ def create_app(
     evidence_service: EvidenceService | None = None,
     approval_service: ApprovalService | None = None,
     startup_recovery_service: StartupRecoveryService | None = None,
+    startup_recovery_adapters: Mapping[
+        ReconciliationTargetKind,
+        ReconciliationAdapter,
+    ]
+    | None = None,
+    startup_process_terminator: OwnedProcessTerminator | None = None,
+    startup_workspace_cleaner: OwnedWorkspaceCleaner | None = None,
 ) -> FastAPI:
     """Create a default-deny API with an injectable persistence boundary."""
 
@@ -102,7 +115,12 @@ def create_app(
             pass
         # Read and reconcile every durable external boundary before any worker
         # may issue a new effect after restart.
-        await run_in_threadpool(startup_recovery_service.recover)
+        await run_in_threadpool(
+            startup_recovery_service.recover,
+            adapters=startup_recovery_adapters,
+            terminator=startup_process_terminator,
+            cleaner=startup_workspace_cleaner,
+        )
         # A committed deletion request is an unreadable durable fence. Resume
         # bounded physical cleanup before accepting traffic after any restart.
         batch_size = 100

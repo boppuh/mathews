@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -63,6 +64,7 @@ from mathews_control_plane.task_state_machine import (
 
 _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,99}\Z")
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,99}\Z")
+_LOGGER = logging.getLogger("mathews.reliability")
 
 
 class ReliabilityError(RuntimeError):
@@ -683,29 +685,29 @@ class CancellationService:
                     process.termination_requested_at = now
                     process.actor_id = self._principal_id
                     process.updated_at = now
-                targets = tuple(
-                    session.scalars(
-                        select(ReconciliationTarget)
-                        .where(
-                            ReconciliationTarget.task_id == task.id,
-                            ReconciliationTarget.kind
-                            != ReconciliationTargetKind.HOST_PROCESS,
-                            ReconciliationTarget.status
-                            != ReconciliationStatus.CANCELLED,
-                        )
-                        .with_for_update()
+            targets = tuple(
+                session.scalars(
+                    select(ReconciliationTarget)
+                    .where(
+                        ReconciliationTarget.task_id == task.id,
+                        ReconciliationTarget.kind
+                        != ReconciliationTargetKind.HOST_PROCESS,
+                        ReconciliationTarget.status
+                        != ReconciliationStatus.CANCELLED,
                     )
+                    .with_for_update()
                 )
-                for target in targets:
-                    target.observed_payload = {
-                        "reason_code": "TASK_TERMINAL",
-                    }
-                    target.status = ReconciliationStatus.CANCELLED
-                    target.reconciliation_version += 1
-                    target.last_reconciled_at = now
-                    target.last_error_code = None
-                    target.actor_id = self._principal_id
-                    target.updated_at = now
+            )
+            for target in targets:
+                target.observed_payload = {
+                    "reason_code": "TASK_TERMINAL",
+                }
+                target.status = ReconciliationStatus.CANCELLED
+                target.reconciliation_version += 1
+                target.last_reconciled_at = now
+                target.last_error_code = None
+                target.actor_id = self._principal_id
+                target.updated_at = now
             session.flush()
 
         self.resume_cleanup(
@@ -986,34 +988,6 @@ class CancellationService:
         ]
         return tuple(completed)
 
-    def has_unfenced_terminal_tasks(self) -> bool:
-        """Return whether a terminal task transition still lacks its fence."""
-
-        with self._factory() as session:
-            return bool(
-                session.scalar(
-                    select(
-                        exists().where(
-                            TaskEvent.task_id == Task.id,
-                            Task.state.in_(
-                                (TaskState.CANCELLED, TaskState.FAILED)
-                            ),
-                            TaskEvent.transition_kind.in_(
-                                (
-                                    TaskTransitionKind.CANCEL.value,
-                                    TaskTransitionKind.FAIL.value,
-                                )
-                            ),
-                            TaskEvent.transition_id.is_not(None),
-                            ~exists().where(
-                                TaskCancellation.task_id
-                                == TaskEvent.task_id
-                            ),
-                        )
-                    )
-                )
-            )
-
     def reconcile_unfenced_terminal_tasks(
         self,
         *,
@@ -1081,13 +1055,7 @@ class CancellationService:
 class StartupRecoveryService:
     """Reconcile every durable boundary before workers may issue new effects."""
 
-    _KIND_ORDER = (
-        ReconciliationTargetKind.HERMES_RUN,
-        ReconciliationTargetKind.HOST_PROCESS,
-        ReconciliationTargetKind.BRANCH_HEAD,
-        ReconciliationTargetKind.PR_HEAD,
-        ReconciliationTargetKind.WEBHOOK_CURSOR,
-    )
+    _KIND_ORDER = tuple(ReconciliationTargetKind)
 
     def __init__(
         self,
@@ -1145,15 +1113,13 @@ class StartupRecoveryService:
             lambda: self._jobs.reconcile_outage_decisions(limit=limit),
             batch_size=limit,
         )
-        recovered_cancellations: list[UUID] = []
-        while self._cancellations.has_unfenced_terminal_tasks():
-            recovered_cancellations.extend(
-                self._cancellations.reconcile_unfenced_terminal_tasks(
-                    limit=limit,
-                    terminator=terminator,
-                    cleaner=cleaner,
-                )
+        recovered_cancellations = (
+            self._reconcile_unfenced_terminal_pages(
+                limit=limit,
+                terminator=terminator,
+                cleaner=cleaner,
             )
+        )
         resumed_cancellations = self._resume_pending_cleanup_pages(
             limit=limit,
             terminator=terminator,
@@ -1175,6 +1141,101 @@ class StartupRecoveryService:
             completed_cancellation_ids=completed_cancellations,
             reconciled_target_ids=reconciled_targets,
         )
+
+    def _reconcile_unfenced_terminal_pages(
+        self,
+        *,
+        limit: int,
+        terminator: OwnedProcessTerminator | None,
+        cleaner: OwnedWorkspaceCleaner | None,
+    ) -> tuple[UUID, ...]:
+        completed: list[UUID] = []
+        after_id: UUID | None = None
+        while True:
+            with self._factory() as session:
+                query = (
+                    select(TaskEvent)
+                    .join(Task, Task.id == TaskEvent.task_id)
+                    .where(
+                        Task.state.in_(
+                            (TaskState.CANCELLED, TaskState.FAILED)
+                        ),
+                        TaskEvent.transition_kind.in_(
+                            (
+                                TaskTransitionKind.CANCEL.value,
+                                TaskTransitionKind.FAIL.value,
+                            )
+                        ),
+                        TaskEvent.transition_id.is_not(None),
+                        ~exists().where(
+                            TaskCancellation.task_id == TaskEvent.task_id
+                        ),
+                    )
+                    .order_by(TaskEvent.id)
+                    .limit(limit)
+                )
+                if after_id is not None:
+                    query = query.where(TaskEvent.id > after_id)
+                events = tuple(session.scalars(query))
+                snapshots = tuple(
+                    (
+                        event.id,
+                        event.task_id,
+                        event.transition_id,
+                        event.transition_from_state,
+                        event.transition_reason_code,
+                    )
+                    for event in events
+                )
+            if not snapshots:
+                return tuple(completed)
+            after_id = snapshots[-1][0]
+            for (
+                event_id,
+                task_id,
+                cancellation_id,
+                from_state,
+                reason_code,
+            ) in snapshots:
+                if (
+                    cancellation_id is None
+                    or from_state is None
+                    or reason_code is None
+                ):
+                    _LOGGER.error(
+                        "terminal task recovery provenance is malformed",
+                        extra={
+                            "event_id": str(event_id),
+                            "task_id": str(task_id),
+                        },
+                    )
+                    continue
+                try:
+                    result = self._cancellations.cancel_task(
+                        task_id,
+                        cancellation_id=cancellation_id,
+                        expected_state=TaskState(from_state),
+                        reason_code=reason_code,
+                        terminator=terminator,
+                        cleaner=cleaner,
+                    )
+                except (
+                    ReliabilityError,
+                    BackgroundJobConflictError,
+                    ValueError,
+                ):
+                    _LOGGER.exception(
+                        "terminal task recovery remains pending",
+                        extra={
+                            "event_id": str(event_id),
+                            "task_id": str(task_id),
+                        },
+                    )
+                    continue
+                if result.cleanup_complete:
+                    completed.append(cancellation_id)
+            if len(snapshots) < limit:
+                return tuple(completed)
 
     def _reconcile_pending_outage_pages(
         self,
@@ -1240,15 +1301,25 @@ class StartupRecoveryService:
             if not cancellation_ids:
                 return tuple(completed)
             after_id = cancellation_ids[-1]
-            completed.extend(
-                cancellation_id
-                for cancellation_id in cancellation_ids
-                if self._cancellations.resume_cleanup(
-                    cancellation_id,
-                    terminator=terminator,
-                    cleaner=cleaner,
-                )
-            )
+            for cancellation_id in cancellation_ids:
+                try:
+                    cleanup_complete = (
+                        self._cancellations.resume_cleanup(
+                            cancellation_id,
+                            terminator=terminator,
+                            cleaner=cleaner,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception(
+                        "cancellation cleanup remains pending",
+                        extra={
+                            "cancellation_id": str(cancellation_id),
+                        },
+                    )
+                    continue
+                if cleanup_complete:
+                    completed.append(cancellation_id)
             if len(cancellation_ids) < limit:
                 return tuple(completed)
 
@@ -1309,11 +1380,36 @@ class StartupRecoveryService:
                             error_code="ADAPTER_UNAVAILABLE",
                         )
                     else:
-                        observation = adapter.reconcile(
-                            kind=kind,
-                            target_key=target_key,
-                            expected_payload=expected_payload,
-                        )
+                        try:
+                            observation = adapter.reconcile(
+                                kind=kind,
+                                target_key=target_key,
+                                expected_payload=expected_payload,
+                            )
+                            if not isinstance(
+                                observation,
+                                ReconciliationObservation,
+                            ):
+                                raise InvalidReliabilityCommandError(
+                                    "startup reconciliation adapter returned "
+                                    "an invalid observation"
+                                )
+                        except Exception:  # noqa: BLE001
+                            _LOGGER.exception(
+                                "external target reconciliation failed",
+                                extra={
+                                    "kind": kind.value,
+                                    "target_id": str(target_id),
+                                    "target_key": target_key,
+                                },
+                            )
+                            observation = ReconciliationObservation(
+                                status=(
+                                    ReconciliationStatus.RETRY_REQUIRED
+                                ),
+                                observed_payload={},
+                                error_code="ADAPTER_FAILED",
+                            )
                     with self._factory() as session, session.begin():
                         _begin_serialized(session)
                         target = session.scalar(

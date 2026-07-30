@@ -429,6 +429,56 @@ def test_outage_exhaustion_escalates_and_retry_creates_new_job_generation(
     assert jobs.reconcile_outage_decisions() == ()
 
 
+def test_stale_outage_recovery_gets_a_fresh_deterministic_expiry(
+    reliability_harness: ReliabilityHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _task(reliability_harness, state=TaskState.IMPLEMENTING)
+    jobs = reliability_harness.jobs()
+    scheduled = jobs.schedule(
+        task_id=task_id,
+        job_type="stale-outage",
+        idempotency_key="stale-outage:1",
+        input_payload={"service": "github"},
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    grant = jobs.claim_next(
+        worker_id="worker-1",
+        lease_duration=timedelta(seconds=30),
+    )
+    assert grant is not None
+    original_reconcile = jobs.reconcile_outage_escalation
+    monkeypatch.setattr(
+        jobs,
+        "reconcile_outage_escalation",
+        lambda _job_id: None,
+    )
+    jobs.fail_dependency_attempt(
+        grant,
+        service=DependencyService.GITHUB,
+        error_code="GITHUB_UNAVAILABLE",
+    )
+    monkeypatch.setattr(
+        jobs,
+        "reconcile_outage_escalation",
+        original_reconcile,
+    )
+    reliability_harness.clock.advance(days=31)
+
+    request_id = jobs.reconcile_outage_escalation(scheduled.job_id)
+    replay_id = jobs.reconcile_outage_escalation(scheduled.job_id)
+
+    assert request_id is not None
+    assert replay_id == request_id
+    with reliability_harness.factory() as session:
+        request = session.get(ApprovalRequest, request_id)
+    assert request is not None
+    assert request.expires_at is not None
+    assert request.expires_at.replace(tzinfo=UTC) == (
+        reliability_harness.clock.now + timedelta(days=30)
+    )
+
+
 def test_cancellation_closes_pending_approval_before_resource_fence(
     reliability_harness: ReliabilityHarness,
 ) -> None:
@@ -721,3 +771,48 @@ def test_startup_recovery_drains_every_bounded_page(
     assert set(recovery.recovered_job_ids) == set(scheduled_ids)
     assert len(recovery.reconciled_target_ids) == 2
     assert len(adapter.calls) == 2
+
+
+def test_adapterless_startup_fails_closed_without_reclaiming_job(
+    reliability_harness: ReliabilityHarness,
+) -> None:
+    task_id = _task(reliability_harness)
+    jobs = reliability_harness.jobs()
+    scheduled = jobs.schedule(
+        task_id=task_id,
+        job_type="adapterless-restart",
+        idempotency_key="adapterless-restart:1",
+        input_payload={"step": "external"},
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    grant = jobs.claim_next(
+        worker_id="worker-1",
+        lease_duration=timedelta(seconds=5),
+    )
+    assert grant is not None
+    jobs.register_reconciliation_target(
+        grant,
+        kind=ReconciliationTargetKind.HERMES_RUN,
+        target_key="hermes:adapterless",
+        expected_payload={"run_id": "run-1"},
+    )
+    reliability_harness.clock.advance(seconds=5)
+
+    recovery = StartupRecoveryService(
+        reliability_harness.factory,
+        reliability_harness.store,
+        clock=reliability_harness.clock,
+    ).recover()
+
+    assert recovery.recovered_job_ids == (scheduled.job_id,)
+    with reliability_harness.factory() as session:
+        target = session.scalar(select(ReconciliationTarget))
+    assert target is not None
+    assert target.status is ReconciliationStatus.RETRY_REQUIRED
+    assert (
+        jobs.claim_next(
+            worker_id="worker-2",
+            lease_duration=timedelta(seconds=5),
+        )
+        is None
+    )

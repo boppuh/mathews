@@ -8,14 +8,15 @@ import signal
 import sqlite3
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, cast
 from uuid import UUID
 
-from mathews_host_agent.journal import HostJournalError, _prepare_journal_file
+from mathews_host_agent.journal import HostJournalError, prepare_journal_file
 
 
 class OwnedProcessError(RuntimeError):
@@ -143,6 +144,11 @@ class LocalProcessController:
             raise OwnedProcessError("PROCESS_TERMINATION_FAILED") from None
         deadline = time.monotonic() + grace_seconds
         while time.monotonic() < deadline:
+            observed = self.observe(expected.pid)
+            if observed is None:
+                return True
+            if observed != expected:
+                return False
             try:
                 os.killpg(process_group_id, 0)
             except ProcessLookupError:
@@ -152,13 +158,26 @@ class LocalProcessController:
                     "PROCESS_TERMINATION_FAILED"
                 ) from None
             time.sleep(0.02)
+        observed = self.observe(expected.pid)
+        if observed is None:
+            return True
+        if observed != expected:
+            return False
         try:
             os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
             return True
         except OSError:
             raise OwnedProcessError("PROCESS_TERMINATION_FAILED") from None
-        return True
+        kill_deadline = time.monotonic() + min(grace_seconds, 1.0)
+        while time.monotonic() < kill_deadline:
+            observed = self.observe(expected.pid)
+            if observed is None:
+                return True
+            if observed != expected:
+                return False
+            time.sleep(0.02)
+        raise OwnedProcessError("PROCESS_TERMINATION_FAILED")
 
 
 class OwnedProcessGroupManager:
@@ -175,7 +194,7 @@ class OwnedProcessGroupManager:
         self._controller = controller or LocalProcessController()
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         try:
-            _prepare_journal_file(path)
+            prepare_journal_file(path)
         except HostJournalError as error:
             raise OwnedProcessError(error.code) from None
         self._initialize()
@@ -339,6 +358,27 @@ class OwnedProcessGroupManager:
                     ),
                 )
                 if cursor.rowcount != 1:
+                    settled = connection.execute(
+                        """
+                        SELECT state, termination_key
+                          FROM owned_process_groups
+                         WHERE ownership_nonce = ?
+                        """,
+                        (str(identity.ownership_nonce),),
+                    ).fetchone()
+                    if (
+                        settled is not None
+                        and settled["termination_key"] == idempotency_key
+                        and settled["state"]
+                        != OwnedProcessState.RUNNING.value
+                    ):
+                        connection.commit()
+                        return TerminationResult(
+                            state=OwnedProcessState(
+                                cast(str, settled["state"])
+                            ),
+                            replayed=True,
+                        )
                     raise OwnedProcessError("PROCESS_OWNERSHIP_CONFLICT")
                 connection.commit()
         except OwnedProcessError:
@@ -381,7 +421,8 @@ class OwnedProcessGroupManager:
         except sqlite3.Error:
             raise OwnedProcessError("PROCESS_JOURNAL_UNAVAILABLE") from None
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(
             self._path,
             timeout=5.0,
@@ -389,7 +430,11 @@ class OwnedProcessGroupManager:
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
 
 def _same_identity(

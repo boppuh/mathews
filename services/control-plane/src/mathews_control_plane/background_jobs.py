@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, aliased
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
+    ApprovalRequest,
     BackgroundJob,
     BackgroundJobCheckpoint,
     BackgroundJobEffect,
@@ -1783,6 +1784,15 @@ class BackgroundJobService:
                 NAMESPACE_URL,
                 f"mathews:outage-approval:{latest.id}",
             )
+            existing_request = session.get(ApprovalRequest, request_id)
+            expires_at = (
+                _as_utc(existing_request.expires_at)
+                if (
+                    existing_request is not None
+                    and existing_request.expires_at is not None
+                )
+                else _as_utc(self._clock()) + timedelta(days=30)
+            )
             evidence_ids = tuple(
                 attempt.checkpoint_evidence_id for attempt in attempts
             )
@@ -1824,8 +1834,7 @@ class BackgroundJobService:
                 blocked_operation=blocked_operation,
                 retry_history=retry_history,
                 evidence_ids=evidence_ids,
-                expires_at=_as_utc(latest.occurred_at)
-                + timedelta(days=30),
+                expires_at=expires_at,
             )
         except ApprovalError as error:
             _LOGGER.warning(
