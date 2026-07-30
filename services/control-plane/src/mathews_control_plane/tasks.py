@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import asyncio
+import time
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from starlette.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mathews_control_plane.artifacts import ArtifactStore
@@ -19,7 +22,11 @@ from mathews_control_plane.authentication import (
     AuthenticatedSession,
     require_authenticated_session,
 )
-from mathews_control_plane.database import SessionFactory, create_task_record
+from mathews_control_plane.database import (
+    AuthSession,
+    SessionFactory,
+    create_task_record,
+)
 from mathews_control_plane.domain_models import (
     ApprovalRequest,
     ApprovalStatus,
@@ -39,6 +46,10 @@ TASK_INTAKE_EVENT_TYPE = "TASK_CREATED"
 TASK_INTAKE_EVENT_SCHEMA_VERSION = 1
 MAX_TASK_REQUEST_CHARACTERS = 20_000
 MAX_TASK_REQUEST_BYTES = 64 * 1024
+TASK_EVENT_STREAM_BATCH_SIZE = 100
+TASK_EVENT_POLL_INTERVAL_SECONDS = 1.0
+TASK_EVENT_HEARTBEAT_SECONDS = 15.0
+MAX_TASK_EVENT_SEQUENCE = (1 << 63) - 1
 _LOCAL_USER_ID = 1
 _LOCAL_OWNER_ID = "local-user"
 
@@ -175,6 +186,10 @@ class TaskCockpitResponse(BaseModel):
 
 class TaskNotFoundError(RuntimeError):
     """The task is absent or outside the authenticated owner's scope."""
+
+
+class InvalidTaskEventCursorError(ValueError):
+    """The SSE resume cursor is not a canonical task-event sequence."""
 
 
 class TaskService:
@@ -358,6 +373,65 @@ class TaskService:
                 approvals=[_approval_response(request) for request in approvals],
             )
 
+    def events_after(
+        self,
+        task_id: UUID,
+        authentication: AuthenticatedSession,
+        *,
+        after_sequence: int,
+        limit: int = TASK_EVENT_STREAM_BATCH_SIZE,
+    ) -> Sequence[TaskEventResponse]:
+        owner_id = _principal(authentication)
+        if not 0 <= after_sequence <= MAX_TASK_EVENT_SEQUENCE:
+            raise InvalidTaskEventCursorError("task event cursor is invalid")
+        if not 1 <= limit <= TASK_EVENT_STREAM_BATCH_SIZE:
+            raise ValueError("task event batch size is invalid")
+
+        with self._factory() as session:
+            now = _as_utc(self._clock())
+            active_session = session.scalar(
+                select(AuthSession.id).where(
+                    AuthSession.id == authentication.session_id,
+                    AuthSession.user_id == authentication.user_id,
+                    AuthSession.revoked_at.is_(None),
+                    AuthSession.expires_at > now,
+                    AuthSession.absolute_expires_at > now,
+                )
+            )
+            if active_session is None:
+                raise TaskAccessError("task session is unavailable")
+            task_exists = session.scalar(
+                select(Task.id).where(
+                    Task.id == task_id,
+                    Task.owner_id == owner_id,
+                )
+            )
+            if task_exists is None:
+                raise TaskNotFoundError("task is unavailable")
+            events = tuple(
+                session.scalars(
+                    select(TaskEvent)
+                    .where(
+                        TaskEvent.task_id == task_id,
+                        TaskEvent.owner_id == owner_id,
+                        TaskEvent.sequence > after_sequence,
+                    )
+                    .order_by(TaskEvent.sequence, TaskEvent.id)
+                    .limit(limit)
+                )
+            )
+            reference_counts = _event_evidence_counts(
+                session,
+                tuple(event.id for event in events),
+            )
+            return [
+                _event_response(
+                    event,
+                    evidence_count=reference_counts.get(event.id, 0),
+                )
+                for event in events
+            ]
+
 
 def _principal(authentication: AuthenticatedSession) -> str:
     if authentication.user_id != _LOCAL_USER_ID:
@@ -383,6 +457,79 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _last_event_sequence(value: str | None) -> int:
+    if value is None:
+        return 0
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdecimal()
+        or len(value) > 19
+        or (len(value) > 1 and value.startswith("0"))
+    ):
+        raise InvalidTaskEventCursorError("task event cursor is invalid")
+    sequence = int(value)
+    if sequence > MAX_TASK_EVENT_SEQUENCE:
+        raise InvalidTaskEventCursorError("task event cursor is invalid")
+    return sequence
+
+
+def _format_sse_event(event: TaskEventResponse) -> str:
+    return (
+        f"id: {event.sequence}\n"
+        "event: task-event\n"
+        f"data: {event.model_dump_json()}\n\n"
+    )
+
+
+async def _task_event_stream(
+    request: Request,
+    service: TaskService,
+    task_id: UUID,
+    authentication: AuthenticatedSession,
+    *,
+    after_sequence: int,
+    initial_events: Sequence[TaskEventResponse],
+) -> AsyncIterator[str]:
+    cursor = after_sequence
+    pending: Sequence[TaskEventResponse] = tuple(initial_events)
+    last_heartbeat = time.monotonic()
+    yield "retry: 1000\n\n"
+
+    while not await request.is_disconnected():
+        if pending:
+            for event in pending:
+                if event.sequence <= cursor:
+                    continue
+                yield _format_sse_event(event)
+                cursor = event.sequence
+            try:
+                pending = await run_in_threadpool(
+                    service.events_after,
+                    task_id,
+                    authentication,
+                    after_sequence=cursor,
+                )
+            except (TaskAccessError, TaskNotFoundError):
+                return
+            continue
+
+        now = time.monotonic()
+        if now - last_heartbeat >= TASK_EVENT_HEARTBEAT_SECONDS:
+            yield ": keep-alive\n\n"
+            last_heartbeat = now
+        await asyncio.sleep(TASK_EVENT_POLL_INTERVAL_SECONDS)
+        try:
+            pending = await run_in_threadpool(
+                service.events_after,
+                task_id,
+                authentication,
+                after_sequence=cursor,
+            )
+        except (TaskAccessError, TaskNotFoundError):
+            return
 
 
 def _count_rows(
@@ -823,6 +970,50 @@ def create_task_router(service: TaskService) -> APIRouter:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="task unavailable",
             ) from None
+
+    @router.get("/{task_id}/events")
+    async def task_events(
+        task_id: UUID,
+        request: Request,
+        authentication: AuthenticatedTaskSession,
+    ) -> StreamingResponse:
+        try:
+            after_sequence = _last_event_sequence(
+                request.headers.get("last-event-id")
+            )
+            initial_events = await run_in_threadpool(
+                service.events_after,
+                task_id,
+                authentication,
+                after_sequence=after_sequence,
+            )
+        except InvalidTaskEventCursorError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="invalid task event cursor",
+            ) from None
+        except (TaskAccessError, TaskNotFoundError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="task unavailable",
+            ) from None
+
+        return StreamingResponse(
+            _task_event_stream(
+                request,
+                service,
+                task_id,
+                authentication,
+                after_sequence=after_sequence,
+                initial_events=initial_events,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @router.post(
         "",

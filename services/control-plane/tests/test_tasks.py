@@ -14,6 +14,8 @@ from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     CSRF_COOKIE_NAME,
     CSRF_HEADER_NAME,
+    SESSION_COOKIE_NAME,
+    AuthenticatedSession,
     AuthenticationService,
     generate_bootstrap_token,
 )
@@ -41,9 +43,14 @@ from mathews_control_plane.domain_models import (
 from mathews_control_plane.evidence import load_evidence
 from mathews_control_plane.settings import Settings
 from mathews_control_plane.tasks import (
+    MAX_TASK_EVENT_SEQUENCE,
     MAX_TASK_REQUEST_BYTES,
     TASK_INTAKE_EVENT_TYPE,
+    InvalidTaskEventCursorError,
+    TaskAccessError,
     TaskService,
+    _format_sse_event,
+    _last_event_sequence,
 )
 from pydantic import SecretStr
 from sqlalchemy import Engine, func, select
@@ -71,6 +78,8 @@ class TaskHarness:
     factory: SessionFactory
     store: ArtifactStore
     clock: MutableClock
+    task_service: TaskService
+    authentication_service: AuthenticationService
     bootstrap_token: str
 
 
@@ -100,6 +109,8 @@ def task_harness(tmp_path: Path) -> Iterator[TaskHarness]:
         factory=factory,
         store=store,
         clock=clock,
+        task_service=task_service,
+        authentication_service=authentication_service,
         bootstrap_token=generate_bootstrap_token(factory),
     )
     try:
@@ -147,6 +158,14 @@ def _create(
     )
     assert response.status_code == 201, response.text
     return cast(dict[str, object], response.json())
+
+
+def _authenticated_context(harness: TaskHarness) -> AuthenticatedSession:
+    session_token = harness.client.cookies.get(SESSION_COOKIE_NAME)
+    assert session_token is not None
+    authentication = harness.authentication_service.authenticate(session_token)
+    assert authentication is not None
+    return authentication
 
 
 def test_task_api_requires_authentication_and_csrf(task_harness: TaskHarness) -> None:
@@ -477,6 +496,119 @@ def test_cockpit_requires_authentication_and_hides_absent_tasks(
     )
     assert cross_owner_response.status_code == 404
     assert cross_owner_response.json() == {"detail": "task unavailable"}
+
+
+def test_task_event_batches_replay_after_cursor_without_raw_payloads(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    created = _create(task_harness, csrf_token)
+    task_id = UUID(str(created["id"]))
+    raw_payload = "private streamed runtime output"
+    with task_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        session.add(
+            TaskEvent(
+                task_id=task_id,
+                sequence=2,
+                event_type="VALIDATION_PROGRESS",
+                payload={"raw_output": raw_payload},
+                occurred_at=task_harness.clock.now + timedelta(seconds=1),
+                owner_id=task.owner_id,
+                actor_id="control-plane",
+                root_correlation_id=task.root_correlation_id,
+            )
+        )
+
+    authentication = _authenticated_context(task_harness)
+    all_events = task_harness.task_service.events_after(
+        task_id,
+        authentication,
+        after_sequence=0,
+    )
+    resumed_events = task_harness.task_service.events_after(
+        task_id,
+        authentication,
+        after_sequence=1,
+    )
+
+    assert [event.sequence for event in all_events] == [1, 2]
+    assert [event.sequence for event in resumed_events] == [2]
+    encoded = _format_sse_event(resumed_events[0])
+    assert encoded.startswith("id: 2\nevent: task-event\ndata: ")
+    assert encoded.endswith("\n\n")
+    assert "Task activity was recorded." in encoded
+    assert raw_payload not in encoded
+
+    task_harness.authentication_service.logout(authentication)
+    with pytest.raises(TaskAccessError):
+        task_harness.task_service.events_after(
+            task_id,
+            authentication,
+            after_sequence=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, 0),
+        ("0", 0),
+        ("1", 1),
+        (str(MAX_TASK_EVENT_SEQUENCE), MAX_TASK_EVENT_SEQUENCE),
+    ],
+)
+def test_task_event_cursor_accepts_canonical_sequences(
+    value: str | None,
+    expected: int,
+) -> None:
+    assert _last_event_sequence(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "-1",
+        "+1",
+        "01",
+        "01x",
+        " 1",
+        "1 ",
+        "١",
+        str(MAX_TASK_EVENT_SEQUENCE + 1),
+    ],
+)
+def test_task_event_cursor_rejects_ambiguous_or_out_of_range_values(
+    value: str,
+) -> None:
+    with pytest.raises(InvalidTaskEventCursorError):
+        _last_event_sequence(value)
+
+
+def test_task_event_stream_requires_auth_and_hides_cursor_details(
+    task_harness: TaskHarness,
+) -> None:
+    unknown_id = UUID("11111111-1111-4111-8111-111111111111")
+    assert task_harness.client.get(
+        f"/api/tasks/{unknown_id}/events"
+    ).status_code == 401
+    _authenticate(task_harness)
+
+    invalid_cursor = task_harness.client.get(
+        f"/api/tasks/{unknown_id}/events",
+        headers={"Last-Event-ID": "not-a-sequence"},
+    )
+    assert invalid_cursor.status_code == 400
+    assert invalid_cursor.json() == {"detail": "invalid task event cursor"}
+
+    absent_task = task_harness.client.get(
+        f"/api/tasks/{unknown_id}/events",
+        headers={"Last-Event-ID": "0"},
+    )
+    assert absent_task.status_code == 404
+    assert absent_task.json() == {"detail": "task unavailable"}
 
 
 def test_create_redacts_summary_before_task_event_and_list_projection(

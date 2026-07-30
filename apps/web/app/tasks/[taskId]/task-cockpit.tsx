@@ -5,13 +5,19 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { stageLabel } from "../../../lib/stages";
-import { LatestTaskDetailLoader, TaskRequestError } from "../../../lib/task-client";
-import { shortRevision } from "../../../lib/tasks";
+import {
+  LatestTaskDetailLoader,
+  TaskRequestError,
+  taskEventStreamUrl,
+} from "../../../lib/task-client";
+import { parseTaskEvent, shortRevision } from "../../../lib/tasks";
 
 type CockpitState =
   | { status: "loading" }
   | { status: "failed"; message: string }
   | { status: "ready"; cockpit: TaskCockpitResponse };
+
+type LiveStatus = "connecting" | "live" | "reconnecting" | "unavailable";
 
 const eventKindLabels: Record<TaskEventKind, string> = {
   CREATED: "Created",
@@ -47,25 +53,34 @@ function failureMessage(error: unknown): string {
 
 export function TaskCockpit({ taskId }: { taskId: string }) {
   const [state, setState] = useState<CockpitState>({ status: "loading" });
+  const [liveStatus, setLiveStatus] = useState<LiveStatus>("connecting");
   const detailLoader = useRef<LatestTaskDetailLoader | null>(null);
   if (detailLoader.current === null) {
     detailLoader.current = new LatestTaskDetailLoader();
   }
 
   const loadCockpit = useCallback(
-    async (signal?: AbortSignal) => {
-      setState({ status: "loading" });
+    async (signal?: AbortSignal, background = false) => {
+      if (!background) {
+        setState({ status: "loading" });
+      }
       try {
         const cockpit = await detailLoader.current?.load(taskId, signal);
         if (!cockpit) {
-          return;
+          return false;
         }
         setState({ status: "ready", cockpit });
+        return true;
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
-          return;
+          return false;
+        }
+        if (background) {
+          setLiveStatus("reconnecting");
+          return false;
         }
         setState({ status: "failed", message: failureMessage(error) });
+        return false;
       }
     },
     [taskId],
@@ -74,8 +89,66 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
   useEffect(() => {
     const controller = new AbortController();
     void loadCockpit(controller.signal);
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      detailLoader.current?.invalidate();
+    };
   }, [loadCockpit]);
+
+  useEffect(() => {
+    if (state.status !== "ready" || state.cockpit.task.id !== taskId) {
+      return;
+    }
+
+    const refreshController = new AbortController();
+    let refreshTimer: number | undefined;
+    let highestObservedSequence = state.cockpit.events.at(-1)?.sequence ?? 0;
+    const eventSource = new EventSource(taskEventStreamUrl(taskId), {
+      withCredentials: true,
+    });
+    setLiveStatus("connecting");
+
+    eventSource.onopen = () => setLiveStatus("live");
+    eventSource.onerror = () => setLiveStatus("reconnecting");
+    const refreshFromStream = async () => {
+      const refreshed = await loadCockpit(refreshController.signal, true);
+      if (!refreshed && !refreshController.signal.aborted) {
+        refreshTimer = window.setTimeout(() => {
+          void refreshFromStream();
+        }, 1_000);
+      }
+    };
+    const handleTaskEvent = (message: MessageEvent<string>) => {
+      try {
+        const event = parseTaskEvent(JSON.parse(message.data));
+        if (event.sequence <= highestObservedSequence) {
+          return;
+        }
+        highestObservedSequence = event.sequence;
+      } catch {
+        eventSource.close();
+        setLiveStatus("unavailable");
+        return;
+      }
+
+      if (refreshTimer !== undefined) {
+        window.clearTimeout(refreshTimer);
+      }
+      refreshTimer = window.setTimeout(() => {
+        void refreshFromStream();
+      }, 50);
+    };
+    eventSource.addEventListener("task-event", handleTaskEvent as EventListener);
+
+    return () => {
+      eventSource.removeEventListener("task-event", handleTaskEvent as EventListener);
+      eventSource.close();
+      refreshController.abort();
+      if (refreshTimer !== undefined) {
+        window.clearTimeout(refreshTimer);
+      }
+    };
+  }, [loadCockpit, state, taskId]);
 
   if (state.status === "loading") {
     return (
@@ -137,9 +210,21 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
             <code>{task.id.slice(0, 8)}</code>
           </p>
         </div>
-        <span className={`state-badge state-${task.state.toLowerCase()}`}>
-          {stageLabel(task.state)}
-        </span>
+        <div className="cockpit-header-status">
+          <span className={`state-badge state-${task.state.toLowerCase()}`}>
+            {stageLabel(task.state)}
+          </span>
+          <span className={`cockpit-live-status live-${liveStatus}`} role="status">
+            <i aria-hidden="true" />
+            {liveStatus === "live"
+              ? "Live"
+              : liveStatus === "connecting"
+                ? "Connecting"
+                : liveStatus === "reconnecting"
+                  ? "Reconnecting"
+                  : "Updates unavailable"}
+          </span>
+        </div>
       </header>
 
       <section

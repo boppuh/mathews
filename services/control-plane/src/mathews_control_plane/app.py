@@ -199,7 +199,7 @@ def create_app(
     application.add_middleware(
         CORSMiddleware,
         allow_credentials=True,
-        allow_headers=["Content-Type", CSRF_HEADER_NAME],
+        allow_headers=["Content-Type", CSRF_HEADER_NAME, "Last-Event-ID"],
         allow_methods=["DELETE", "GET", "POST", "OPTIONS"],
         allow_origins=[str(current_settings.web_origin).rstrip("/")],
     )

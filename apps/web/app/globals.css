@@ -780,9 +780,41 @@ section {
   overflow-wrap: anywhere;
 }
 
-.cockpit-header > .state-badge {
+.cockpit-header-status {
+  display: grid;
   flex: 0 0 auto;
+  justify-items: end;
+  gap: 0.65rem;
   margin-top: 0.25rem;
+}
+
+.cockpit-live-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.cockpit-live-status i {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.cockpit-live-status.live-live {
+  color: var(--accent);
+}
+
+.cockpit-live-status.live-connecting,
+.cockpit-live-status.live-reconnecting {
+  color: #ffc978;
+}
+
+.cockpit-live-status.live-unavailable {
+  color: var(--danger);
 }
 
 .cockpit-revision {
@@ -1214,6 +1246,10 @@ section {
 
   .cockpit-nav {
     width: 100%;
+  }
+
+  .cockpit-header-status {
+    justify-items: start;
   }
 
   .cockpit-timeline {
