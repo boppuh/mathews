@@ -84,6 +84,25 @@ class ApprovalStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class ApprovalRequestType(StrEnum):
+    BRIEF = "BRIEF"
+    UNSAFE_ACTION = "UNSAFE_ACTION"
+    RETRY_LIMIT = "RETRY_LIMIT"
+    REVIEW_CONFLICT = "REVIEW_CONFLICT"
+    REVIEW_RULE = "REVIEW_RULE"
+
+
+class ApprovalDecision(StrEnum):
+    APPROVE = "APPROVE"
+    REQUEST_REVISION = "REQUEST_REVISION"
+    RETRY = "RETRY"
+    DENY = "DENY"
+    REJECT = "REJECT"
+    ABANDON = "ABANDON"
+    CANCEL = "CANCEL"
+    EXPIRE = "EXPIRE"
+
+
 class RuleCandidateStatus(StrEnum):
     PROPOSED = "PROPOSED"
     EVALUATED = "EVALUATED"
@@ -748,7 +767,28 @@ class ApprovalRequest(RecordContext, Base):
 
     __tablename__ = "approval_requests"
     __table_args__ = (
+        CheckConstraint(
+            "length(request_fingerprint) = 64 AND "
+            f"{_hex_only_sql('request_fingerprint')}",
+            name="request_fingerprint",
+        ),
+        CheckConstraint(
+            "length(precondition_fingerprint) = 64 AND "
+            f"{_hex_only_sql('precondition_fingerprint')}",
+            name="precondition_fingerprint",
+        ),
+        CheckConstraint(
+            "decision_fingerprint IS NULL OR ("
+            "length(decision_fingerprint) = 64 AND "
+            f"{_hex_only_sql('decision_fingerprint')}"
+            ")",
+            name="decision_fingerprint",
+        ),
         UniqueConstraint("id", "status", name="uq_approval_requests_id_status"),
+        UniqueConstraint(
+            "decision_id",
+            name="uq_approval_requests_decision_id",
+        ),
         UniqueConstraint(
             "id",
             "status",
@@ -756,6 +796,12 @@ class ApprovalRequest(RecordContext, Base):
             "subject_type",
             "subject_id",
             name="uq_approval_requests_id_status_subject",
+        ),
+        Index(
+            "ix_approval_requests_task_status_expiry",
+            "task_id",
+            "status",
+            "expires_at",
         ),
     )
 
@@ -780,7 +826,31 @@ class ApprovalRequest(RecordContext, Base):
         default=ApprovalStatus.PENDING,
         server_default=ApprovalStatus.PENDING.value,
     )
+    request_fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="0" * 64,
+        server_default="0" * 64,
+    )
+    precondition_fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="0" * 64,
+        server_default="0" * 64,
+    )
+    resume_state: Mapped[TaskState | None] = mapped_column(
+        _enum(TaskState, name="approval_request_resume_state", length=32)
+    )
+    blocked_operation: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    retry_history: Mapped[list[object]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
     decision: Mapped[str | None] = mapped_column(Text)
+    decision_id: Mapped[UUID | None] = mapped_column(Uuid)
+    decision_fingerprint: Mapped[str | None] = mapped_column(String(64))
     decided_by: Mapped[str | None] = mapped_column(String(255))
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

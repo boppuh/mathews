@@ -9,6 +9,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
+from mathews_control_plane.approvals import ApprovalService, BlockedOperation
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.background_jobs import (
     BackgroundJobService,
@@ -22,6 +23,8 @@ from mathews_control_plane.database import (
     create_task_record,
 )
 from mathews_control_plane.domain_models import (
+    ApprovalDecision,
+    ApprovalRequestType,
     EvidenceRecord,
     PolicyVersion,
     TaskEvent,
@@ -228,6 +231,333 @@ def test_migrations_match_declared_model_metadata(tmp_path: Path) -> None:
                 opts={"compare_type": True},
             )
             assert compare_metadata(context, Base.metadata) == []
+    finally:
+        engine.dispose()
+
+
+def test_approval_revision_migrates_legacy_rows_and_guards_provenance(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    request_id = uuid4()
+    command.upgrade(config, "0006")
+    engine = create_database_engine(database_url)
+    store = ArtifactStore(tmp_path / "artifacts")
+    factory = create_session_factory(engine)
+    try:
+        with factory.begin() as session:
+            task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="1" * 40,
+                requester="local-user",
+                raw_request="Migrate one legacy approval",
+                summary="Migrate approval",
+                owner_id="local-user",
+                actor_id="local-user",
+            )
+            task_id = task.id
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO approval_requests ("
+                    "id, task_id, request_type, subject_type, reason, options, "
+                    "supporting_evidence_ids, requesting_state, status, "
+                    "owner_id, actor_id, root_correlation_id"
+                    ") VALUES ("
+                    ":id, :task_id, 'BRIEF', 'BRIEF', 'LEGACY_APPROVAL', "
+                    ":options, :evidence, 'INTAKE', 'PENDING', "
+                    "'local-user', 'local-user', :task_id"
+                    ")"
+                ),
+                {
+                    "id": request_id.hex,
+                    "task_id": task_id.hex,
+                    "options": json.dumps(["APPROVE", "CANCEL"]),
+                    "evidence": json.dumps([]),
+                },
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            migrated = connection.execute(
+                text(
+                    "SELECT request_fingerprint, precondition_fingerprint, "
+                    "resume_state, blocked_operation, retry_history, decision_id "
+                    "FROM approval_requests WHERE id = :id"
+                ),
+                {"id": request_id.hex},
+            ).one()
+        assert migrated == (
+            "0" * 64,
+            "0" * 64,
+            None,
+            None,
+            "[]",
+            None,
+        )
+    finally:
+        engine.dispose()
+
+    command.downgrade(config, "0006")
+    engine = create_engine(database_url)
+    try:
+        assert "request_fingerprint" not in {
+            column["name"]
+            for column in inspect(engine).get_columns("approval_requests")
+        }
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    provenance_request_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO approval_requests ("
+                    "id, task_id, request_type, subject_type, reason, options, "
+                    "supporting_evidence_ids, requesting_state, expires_at, "
+                    "status, request_fingerprint, precondition_fingerprint, "
+                    "retry_history, owner_id, actor_id, root_correlation_id"
+                    ") VALUES ("
+                    ":id, :task_id, 'BRIEF', 'BRIEF', 'NEW_APPROVAL', "
+                    ":options, :evidence, 'INTAKE', '2026-08-01 00:00:00', "
+                    "'PENDING', :request_fingerprint, :precondition_fingerprint, "
+                    ":retry_history, 'local-user', 'local-user', :task_id"
+                    ")"
+                ),
+                {
+                    "id": provenance_request_id.hex,
+                    "task_id": task_id.hex,
+                    "options": json.dumps(["APPROVE", "CANCEL"]),
+                    "evidence": json.dumps([]),
+                    "request_fingerprint": "a" * 64,
+                    "precondition_fingerprint": "b" * 64,
+                    "retry_history": json.dumps([]),
+                },
+            )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(
+        RuntimeError,
+        match="durable approval provenance",
+    ):
+        command.downgrade(config, "0006")
+
+
+def test_approval_revision_enforces_append_only_terminal_projection(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    store = ArtifactStore(tmp_path / "artifacts")
+    factory = create_session_factory(engine)
+    request_id = uuid4()
+    decision_id = uuid4()
+    try:
+        with factory.begin() as session:
+            task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="1" * 40,
+                requester="local-user",
+                raw_request="Protect approval provenance",
+                summary="Protect approval",
+                owner_id="local-user",
+                actor_id="local-user",
+            )
+            task_id = task.id
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO approval_requests ("
+                    "id, task_id, request_type, subject_type, reason, options, "
+                    "supporting_evidence_ids, requesting_state, expires_at, "
+                    "status, request_fingerprint, precondition_fingerprint, "
+                    "resume_state, blocked_operation, retry_history, "
+                    "owner_id, actor_id, root_correlation_id"
+                    ") VALUES ("
+                    ":id, :task_id, 'UNSAFE_ACTION', 'BLOCKED_OPERATION', "
+                    "'UNSAFE_ACTION_REQUIRED', :options, :evidence, "
+                    "'IMPLEMENTING', '2026-08-01 00:00:00', 'PENDING', "
+                    ":request_fingerprint, :precondition_fingerprint, "
+                    "'IMPLEMENTING', :blocked_operation, :retry_history, "
+                    "'local-user', 'control-plane', :task_id"
+                    ")"
+                ),
+                {
+                    "id": request_id.hex,
+                    "task_id": task_id.hex,
+                    "options": json.dumps(["APPROVE", "DENY", "CANCEL"]),
+                    "evidence": json.dumps([]),
+                    "request_fingerprint": "a" * 64,
+                    "precondition_fingerprint": "b" * 64,
+                    "blocked_operation": json.dumps(
+                        {
+                            "checkpoint_evidence_id": None,
+                            "idempotency_key": "operation-1",
+                            "input_fingerprint": "c" * 64,
+                            "operation_name": "host.mutate",
+                        }
+                    ),
+                    "retry_history": json.dumps([]),
+                },
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE approval_requests SET reason = 'REWRITTEN' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": request_id.hex},
+                )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE approval_requests SET status = 'APPROVED' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": request_id.hex},
+                )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE approval_requests SET "
+                    "status = 'APPROVED', decision = 'APPROVE', "
+                    "decision_id = :decision_id, "
+                    "decision_fingerprint = :fingerprint, "
+                    "decided_by = 'local-user', "
+                    "decided_at = '2026-07-30 12:00:00' "
+                    "WHERE id = :id"
+                ),
+                {
+                    "decision_id": decision_id.hex,
+                    "fingerprint": "d" * 64,
+                    "id": request_id.hex,
+                },
+            )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE approval_requests SET decision = 'DENY' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": request_id.hex},
+                )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "DELETE FROM approval_requests WHERE id = :id"
+                    ),
+                    {"id": request_id.hex},
+                )
+    finally:
+        engine.dispose()
+
+
+def test_approval_service_operates_through_migrated_triggers(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    store = ArtifactStore(tmp_path / "artifacts")
+    factory = create_session_factory(engine)
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+    try:
+        with factory.begin() as session:
+            task = create_task_record(
+                session,
+                store,
+                repository="boppuh/mathews",
+                base_revision="1" * 40,
+                requester="local-user",
+                raw_request="Exercise migrated approval triggers",
+                summary="Exercise approval",
+                owner_id="local-user",
+                actor_id="local-user",
+            )
+            session.add(
+                PolicyVersion(
+                    lineage_key="mvp",
+                    version=1,
+                    workflow_thresholds={},
+                    approved_by="local-user",
+                    approved_at=now,
+                    owner_id=task.owner_id,
+                    actor_id="local-user",
+                    root_correlation_id=task.root_correlation_id,
+                )
+            )
+            session.flush()
+            evidence_id = session.scalar(
+                select(EvidenceRecord.id).where(
+                    EvidenceRecord.task_id == task.id
+                )
+            )
+            assert evidence_id is not None
+            task_id = task.id
+        TaskTransitionService(
+            factory,
+            store,
+            clock=lambda: now,
+        ).transition(
+            task_id,
+            transition_id=uuid4(),
+            expected_state=TaskState.INTAKE,
+            kind=TaskTransitionKind.START_BRIEFING,
+            reason_code="START_BRIEFING",
+            evidence_ids=(evidence_id,),
+        )
+        service = ApprovalService(
+            factory,
+            store,
+            clock=lambda: now,
+        )
+        request = service.request(
+            task_id,
+            request_id=uuid4(),
+            expected_state=TaskState.BRIEFING,
+            request_type=ApprovalRequestType.UNSAFE_ACTION,
+            reason_code="UNSAFE_ACTION_REQUIRED",
+            subject_type="BLOCKED_OPERATION",
+            subject_id=None,
+            blocked_operation=BlockedOperation(
+                operation_name="host.mutate",
+                idempotency_key="operation-1",
+                input_fingerprint="a" * 64,
+            ),
+            evidence_ids=(evidence_id,),
+            expires_at=now + timedelta(hours=1),
+        )
+        decision = service.decide(
+            request.request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.DENY,
+            actor_id="local-user",
+        )
+
+        assert request.task_state is TaskState.ESCALATED
+        assert decision.task_state is TaskState.FAILED
     finally:
         engine.dispose()
 
