@@ -35,6 +35,9 @@ def build_worker(
 ) -> tuple[DurableJobWorker, Engine]:
     """Build one database-backed worker and return its disposable engine."""
 
+    handler_registry = {} if handlers is None else dict(handlers)
+    if not handler_registry:
+        logger.warning("worker has no registered handlers; durable polling will remain idle")
     engine = create_database_engine(runtime_settings.database_url)
     service = BackgroundJobService(
         create_session_factory(engine),
@@ -42,10 +45,22 @@ def build_worker(
     )
     worker = DurableJobWorker(
         service,
-        handlers or {},
+        handler_registry,
         worker_id=f"mathews-worker:{os.getpid()}",
     )
     return worker, engine
+
+
+def _poll_delay(outcome: WorkerRunOutcome) -> float | None:
+    if outcome is WorkerRunOutcome.IDLE:
+        return 1
+    if outcome in {
+        WorkerRunOutcome.FAILED,
+        WorkerRunOutcome.LEASE_LOST,
+        WorkerRunOutcome.RETRY_SCHEDULED,
+    }:
+        return 0.5
+    return None
 
 
 def main() -> None:
@@ -75,8 +90,9 @@ def main() -> None:
             return
         while True:
             outcome = worker.run_once()
-            if outcome is WorkerRunOutcome.IDLE:
-                time.sleep(1)
+            delay = _poll_delay(outcome)
+            if delay is not None:
+                time.sleep(delay)
     except KeyboardInterrupt:
         logger.info("worker stopped")
     finally:

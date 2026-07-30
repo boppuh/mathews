@@ -344,15 +344,22 @@ def _begin_serialized(session: Session) -> None:
 
 
 def _ensure_fencing_counter(session: Session) -> BackgroundJobFencingCounter:
-    counter = session.scalar(
+    query = (
         select(BackgroundJobFencingCounter)
         .where(BackgroundJobFencingCounter.id == 1)
         .with_for_update()
     )
+    counter = session.scalar(query)
     if counter is None:
-        counter = BackgroundJobFencingCounter(id=1, next_token=1)
-        session.add(counter)
-        session.flush()
+        try:
+            with session.begin_nested():
+                counter = BackgroundJobFencingCounter(id=1, next_token=1)
+                session.add(counter)
+                session.flush()
+        except IntegrityError:
+            counter = session.scalar(query)
+            if counter is None:
+                raise
     return counter
 
 

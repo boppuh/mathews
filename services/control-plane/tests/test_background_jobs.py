@@ -39,6 +39,7 @@ from mathews_control_plane.domain_models import (
     BackgroundJobCheckpoint,
     BackgroundJobEffect,
     BackgroundJobEffectStatus,
+    BackgroundJobFencingCounter,
     BackgroundJobLease,
     BackgroundJobStatus,
     BackgroundJobTaskTransition,
@@ -233,6 +234,30 @@ def test_schedule_rejects_sensitive_payloads(job_harness: JobHarness) -> None:
             idempotency_key="task-action:sensitive",
             input_payload={"api_token": "secret-value"},
         )
+
+
+def test_concurrent_cold_start_schedules_share_one_fencing_counter(
+    job_harness: JobHarness,
+) -> None:
+    task_id, _evidence_id = _create_task(job_harness)
+    service = job_harness.service()
+
+    def schedule(position: int) -> UUID:
+        return service.schedule(
+            task_id=task_id,
+            job_type="task-action",
+            idempotency_key=f"cold-start:{position}",
+            input_payload={"position": position},
+        ).job_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        job_ids = tuple(executor.map(schedule, (1, 2)))
+
+    assert len(set(job_ids)) == 2
+    with job_harness.factory() as session:
+        counters = tuple(session.scalars(select(BackgroundJobFencingCounter)))
+    assert len(counters) == 1
+    assert counters[0].next_token == 1
 
 
 def test_claim_is_exclusive_and_heartbeat_cannot_revive_expiry(
