@@ -1,6 +1,6 @@
 """Typed persistence models for the Mathews control-plane domain."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
@@ -14,6 +14,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     Text,
@@ -96,6 +97,12 @@ class BackgroundJobStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class BackgroundJobEffectStatus(StrEnum):
+    PENDING = "PENDING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
 
 
 def _enum(enum_class: type[StrEnum], *, name: str, length: int = 64) -> Enum:
@@ -194,6 +201,8 @@ class Task(RecordContext, Base):
         _enum(TaskState, name="task_escalation_resume_state", length=32)
     )
     terminal_outcome: Mapped[str | None] = mapped_column(Text)
+
+
 class Brief(RecordContext, Base):
     """Immutable, versioned statement of task scope and acceptance."""
 
@@ -383,13 +392,11 @@ class EvidenceRecord(RecordContext, Base):
             "correction_of_id IS NULL OR correction_of_id <> id", name="correction_not_self"
         ),
         CheckConstraint(
-            "access_classification IN "
-            "('TASK_OWNER', 'OWNER', 'RECENT_PASSWORD', 'INTERNAL')",
+            "access_classification IN ('TASK_OWNER', 'OWNER', 'RECENT_PASSWORD', 'INTERNAL')",
             name="access_classification",
         ),
         CheckConstraint(
-            "retention_policy IN "
-            "('TASK_LIFETIME', 'REPOSITORY_LIFETIME', 'AUDIT')",
+            "retention_policy IN ('TASK_LIFETIME', 'REPOSITORY_LIFETIME', 'AUDIT')",
             name="retention_policy",
         ),
         UniqueConstraint("correction_of_id", name="uq_evidence_records_correction"),
@@ -1037,12 +1044,64 @@ class BackgroundJob(RecordContext, Base):
     __tablename__ = "background_jobs"
     __table_args__ = (
         CheckConstraint("attempt_count >= 0", name="attempt_count_non_negative"),
+        CheckConstraint(
+            "max_attempts BETWEEN 1 AND 100",
+            name="max_attempts_bounded",
+        ),
+        CheckConstraint(
+            "attempt_count <= max_attempts",
+            name="attempt_count_within_budget",
+        ),
+        CheckConstraint(
+            "retry_base_seconds > 0",
+            name="retry_base_seconds_positive",
+        ),
+        CheckConstraint(
+            "retry_max_seconds >= retry_base_seconds",
+            name="retry_max_seconds_not_below_base",
+        ),
+        CheckConstraint(
+            "checkpoint_version >= 0",
+            name="checkpoint_version_non_negative",
+        ),
+        CheckConstraint(
+            "(current_lease_id IS NULL "
+            "AND current_fencing_token IS NULL "
+            "AND lease_owner IS NULL "
+            "AND lease_expires_at IS NULL) "
+            "OR (current_lease_id IS NOT NULL "
+            "AND current_fencing_token IS NOT NULL "
+            "AND lease_owner IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL)",
+            name="current_lease_projection_shape",
+        ),
+        Index(
+            "ix_background_jobs_schedule",
+            "status",
+            "available_at",
+            "created_at",
+        ),
         UniqueConstraint("idempotency_key", name="uq_background_jobs_idempotency_key"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    task_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("tasks.id", ondelete="CASCADE"))
+    task_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+    )
     job_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    input_payload: Mapped[dict[str, object]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    input_fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="0" * 64,
+        server_default="0" * 64,
+    )
     status: Mapped[BackgroundJobStatus] = mapped_column(
         _enum(BackgroundJobStatus, name="background_job_status"),
         nullable=False,
@@ -1053,7 +1112,31 @@ class BackgroundJob(RecordContext, Base):
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5, server_default="5"
+    )
+    retry_base_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    retry_max_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=300, server_default="300"
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
     checkpoint: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    checkpoint_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    current_lease_id: Mapped[UUID | None] = mapped_column(Uuid)
+    current_fencing_token: Mapped[int | None] = mapped_column(BigInteger)
+    lease_owner: Mapped[str | None] = mapped_column(String(255))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_fencing_token: Mapped[int | None] = mapped_column(BigInteger)
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
     cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -1065,7 +1148,33 @@ class BackgroundJobLease(RecordContext, Base):
     __table_args__ = (
         CheckConstraint("attempt > 0", name="attempt_positive"),
         CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        CheckConstraint(
+            "checkpoint_version >= 0",
+            name="checkpoint_version_non_negative",
+        ),
+        CheckConstraint(
+            "expires_at > heartbeat_at",
+            name="expires_after_heartbeat",
+        ),
+        CheckConstraint(
+            "(released_at IS NULL AND release_reason IS NULL) "
+            "OR (released_at IS NOT NULL AND release_reason IN "
+            "('SUPERSEDED', 'EXPIRED', 'RETRY', 'SUCCEEDED', 'FAILED', "
+            "'CANCELLED'))",
+            name="release_shape",
+        ),
+        Index(
+            "ix_background_job_leases_expiry",
+            "job_id",
+            "expires_at",
+        ),
         UniqueConstraint("job_id", "attempt", name="uq_background_job_leases_job_attempt"),
+        UniqueConstraint(
+            "job_id",
+            "id",
+            "fencing_token",
+            name="uq_background_job_leases_job_id_token",
+        ),
         UniqueConstraint("fencing_token", name="uq_background_job_leases_fencing_token"),
         UniqueConstraint(
             "idempotency_key",
@@ -1075,16 +1184,231 @@ class BackgroundJobLease(RecordContext, Base):
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     job_id: Mapped[UUID] = mapped_column(
-        Uuid, ForeignKey("background_jobs.id", ondelete="CASCADE"), nullable=False
+        Uuid, ForeignKey("background_jobs.id", ondelete="RESTRICT"), nullable=False
     )
     lease_owner: Mapped[str] = mapped_column(String(255), nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    lease_protocol_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    claim_fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="0" * 64,
+        server_default="0" * 64,
+    )
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     checkpoint: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    checkpoint_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    release_reason: Mapped[str | None] = mapped_column(String(32))
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_code: Mapped[str | None] = mapped_column(String(100))
     cancellation_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class BackgroundJobCheckpoint(RecordContext, Base):
+    """Append-only durable progress accepted from one current lease."""
+
+    __tablename__ = "background_job_checkpoints"
+    __table_args__ = (
+        CheckConstraint("sequence > 0", name="sequence_positive"),
+        CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        CheckConstraint(
+            "length(payload_fingerprint) = 64",
+            name="payload_fingerprint_length",
+        ),
+        CheckConstraint(
+            _hex_only_sql("payload_fingerprint"),
+            name="payload_fingerprint_hex",
+        ),
+        UniqueConstraint(
+            "job_id",
+            "sequence",
+            name="uq_background_job_checkpoints_job_sequence",
+        ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_background_job_checkpoints_idempotency_key",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "lease_id", "fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_background_job_checkpoints_lease",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BackgroundJobEffect(RecordContext, Base):
+    """Durable idempotent external-effect intent and reconciled outcome."""
+
+    __tablename__ = "background_job_effects"
+    __table_args__ = (
+        CheckConstraint(
+            "length(request_fingerprint) = 64",
+            name="request_fingerprint_length",
+        ),
+        CheckConstraint(
+            _hex_only_sql("request_fingerprint"),
+            name="request_fingerprint_hex",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING' AND completed_at IS NULL "
+            "AND completion_lease_id IS NULL "
+            "AND completion_fencing_token IS NULL) "
+            "OR (status IN ('SUCCEEDED', 'FAILED') "
+            "AND completed_at IS NOT NULL "
+            "AND completion_lease_id IS NOT NULL "
+            "AND completion_fencing_token IS NOT NULL)",
+            name="completion_shape",
+        ),
+        Index(
+            "ix_background_job_effects_reconciliation",
+            "job_id",
+            "status",
+            "started_at",
+        ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_background_job_effects_idempotency_key",
+        ),
+        UniqueConstraint(
+            "job_id",
+            "effect_type",
+            "idempotency_key",
+            name="uq_background_job_effects_job_effect_key",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "started_lease_id", "started_fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_background_job_effects_started_lease",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "completion_lease_id", "completion_fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_background_job_effects_completion_lease",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    effect_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    status: Mapped[BackgroundJobEffectStatus] = mapped_column(
+        _enum(BackgroundJobEffectStatus, name="background_job_effect_status"),
+        nullable=False,
+        default=BackgroundJobEffectStatus.PENDING,
+        server_default=BackgroundJobEffectStatus.PENDING.value,
+    )
+    started_lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    started_fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    completion_lease_id: Mapped[UUID | None] = mapped_column(Uuid)
+    completion_fencing_token: Mapped[int | None] = mapped_column(BigInteger)
+    result_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class BackgroundJobFencingCounter(Base):
+    """Singleton allocator that prevents fencing-token reuse across jobs."""
+
+    __tablename__ = "background_job_fencing_counter"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+        CheckConstraint("next_token > 0", name="next_token_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    next_token: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+
+
+class BackgroundJobTaskTransition(RecordContext, Base):
+    """Lease provenance for a task transition initiated by a background job."""
+
+    __tablename__ = "background_job_task_transitions"
+    __table_args__ = (
+        CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        UniqueConstraint(
+            "task_event_id",
+            name="uq_background_job_task_transitions_task_event",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "lease_id", "fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_background_job_task_transitions_lease",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["task_id", "task_event_id"],
+            ["task_events.task_id", "task_events.id"],
+            name="fk_background_job_task_transitions_task_event",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("background_jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    task_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    task_event_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class WebhookDelivery(RecordContext, Base):
