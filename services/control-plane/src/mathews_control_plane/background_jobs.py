@@ -661,6 +661,7 @@ class BackgroundJobService:
         with self._factory() as session, session.begin():
             _begin_serialized(session)
             outage_job = aliased(BackgroundJob)
+            reconciliation_job = aliased(BackgroundJob)
             while True:
                 scan_time = _as_utc(self._clock())
                 eligible = and_(
@@ -692,14 +693,31 @@ class BackgroundJobService:
                             ReconciliationTarget.task_id
                             == BackgroundJob.task_id,
                         ),
+                        # PENDING is the normal live registration state.
+                        # Startup observes it before polling and promotes any
+                        # unresolved target to a blocking status below.
                         ReconciliationTarget.status.in_(
                             (
-                                ReconciliationStatus.PENDING,
                                 ReconciliationStatus.UPDATED,
                                 ReconciliationStatus.RETRY_REQUIRED,
                                 ReconciliationStatus.QUARANTINED,
                             )
                         ),
+                    ),
+                    # A PENDING target becomes a restart fence only after its
+                    # owning lease expires; live registrations must not stall
+                    # unrelated queued work on the same task.
+                    ~exists().where(
+                        ReconciliationTarget.status
+                        == ReconciliationStatus.PENDING,
+                        reconciliation_job.id
+                        == ReconciliationTarget.job_id,
+                        reconciliation_job.task_id
+                        == BackgroundJob.task_id,
+                        reconciliation_job.status
+                        == BackgroundJobStatus.RUNNING,
+                        reconciliation_job.lease_expires_at.is_not(None),
+                        reconciliation_job.lease_expires_at <= scan_time,
                     ),
                     or_(
                         and_(

@@ -37,6 +37,7 @@ from mathews_control_plane.domain_models import (
     BackgroundJobLease,
     BackgroundJobStatus,
     BackgroundJobToolGrant,
+    DependencyOutageAttempt,
     EvidenceRecord,
     OwnedHostProcess,
     OwnedHostProcessStatus,
@@ -188,6 +189,21 @@ class StartupRecoveryResult:
     resolved_outage_ids: tuple[UUID, ...]
     completed_cancellation_ids: tuple[UUID, ...]
     reconciled_target_ids: tuple[UUID, ...]
+
+
+def _drain_recovery_batches(
+    operation: Callable[[], tuple[UUID, ...]],
+    *,
+    batch_size: int,
+) -> tuple[UUID, ...]:
+    """Drain a recovery query whose successful rows leave its result set."""
+
+    recovered: list[UUID] = []
+    while True:
+        batch = operation()
+        recovered.extend(batch)
+        if len(batch) < batch_size:
+            return tuple(dict.fromkeys(recovered))
 
 
 def _utc_now() -> datetime:
@@ -970,6 +986,34 @@ class CancellationService:
         ]
         return tuple(completed)
 
+    def has_unfenced_terminal_tasks(self) -> bool:
+        """Return whether a terminal task transition still lacks its fence."""
+
+        with self._factory() as session:
+            return bool(
+                session.scalar(
+                    select(
+                        exists().where(
+                            TaskEvent.task_id == Task.id,
+                            Task.state.in_(
+                                (TaskState.CANCELLED, TaskState.FAILED)
+                            ),
+                            TaskEvent.transition_kind.in_(
+                                (
+                                    TaskTransitionKind.CANCEL.value,
+                                    TaskTransitionKind.FAIL.value,
+                                )
+                            ),
+                            TaskEvent.transition_id.is_not(None),
+                            ~exists().where(
+                                TaskCancellation.task_id
+                                == TaskEvent.task_id
+                            ),
+                        )
+                    )
+                )
+            )
+
     def reconcile_unfenced_terminal_tasks(
         self,
         *,
@@ -1090,24 +1134,30 @@ class StartupRecoveryService:
             raise InvalidBackgroundJobError(
                 "startup recovery limit must be between 1 and 1000"
             )
-        recovered_jobs = self._jobs.reconcile_expired_leases(limit=limit)
-        escalated_jobs = self._jobs.reconcile_pending_outage_escalations(
-            limit=limit
+        recovered_jobs = _drain_recovery_batches(
+            lambda: self._jobs.reconcile_expired_leases(limit=limit),
+            batch_size=limit,
         )
-        resolved_outages = self._jobs.reconcile_outage_decisions(limit=limit)
-        recovered_cancellations = (
-            self._cancellations.reconcile_unfenced_terminal_tasks(
-                limit=limit,
-                terminator=terminator,
-                cleaner=cleaner,
-            )
+        escalated_jobs = self._reconcile_pending_outage_pages(
+            limit=limit,
         )
-        resumed_cancellations = (
-            self._cancellations.resume_pending_cleanups(
-                limit=limit,
-                terminator=terminator,
-                cleaner=cleaner,
+        resolved_outages = _drain_recovery_batches(
+            lambda: self._jobs.reconcile_outage_decisions(limit=limit),
+            batch_size=limit,
+        )
+        recovered_cancellations: list[UUID] = []
+        while self._cancellations.has_unfenced_terminal_tasks():
+            recovered_cancellations.extend(
+                self._cancellations.reconcile_unfenced_terminal_tasks(
+                    limit=limit,
+                    terminator=terminator,
+                    cleaner=cleaner,
+                )
             )
+        resumed_cancellations = self._resume_pending_cleanup_pages(
+            limit=limit,
+            terminator=terminator,
+            cleaner=cleaner,
         )
         completed_cancellations = tuple(
             dict.fromkeys(
@@ -1126,6 +1176,82 @@ class StartupRecoveryService:
             reconciled_target_ids=reconciled_targets,
         )
 
+    def _reconcile_pending_outage_pages(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[UUID, ...]:
+        reconciled: list[UUID] = []
+        seen_jobs: set[UUID] = set()
+        after_id: UUID | None = None
+        while True:
+            with self._factory() as session:
+                query = (
+                    select(
+                        DependencyOutageAttempt.id,
+                        DependencyOutageAttempt.job_id,
+                    )
+                    .where(
+                        DependencyOutageAttempt.exhausted.is_(True),
+                        DependencyOutageAttempt.approval_request_id.is_(None),
+                    )
+                    .order_by(DependencyOutageAttempt.id)
+                    .limit(limit)
+                )
+                if after_id is not None:
+                    query = query.where(
+                        DependencyOutageAttempt.id > after_id
+                    )
+                candidates = tuple(session.execute(query).tuples())
+            if not candidates:
+                return tuple(reconciled)
+            after_id = candidates[-1][0]
+            for _attempt_id, job_id in candidates:
+                if job_id in seen_jobs:
+                    continue
+                seen_jobs.add(job_id)
+                if self._jobs.reconcile_outage_escalation(job_id) is not None:
+                    reconciled.append(job_id)
+            if len(candidates) < limit:
+                return tuple(reconciled)
+
+    def _resume_pending_cleanup_pages(
+        self,
+        *,
+        limit: int,
+        terminator: OwnedProcessTerminator | None,
+        cleaner: OwnedWorkspaceCleaner | None,
+    ) -> tuple[UUID, ...]:
+        completed: list[UUID] = []
+        after_id: UUID | None = None
+        while True:
+            with self._factory() as session:
+                query = (
+                    select(TaskCancellation.id)
+                    .where(
+                        TaskCancellation.cleanup_completed_at.is_(None)
+                    )
+                    .order_by(TaskCancellation.id)
+                    .limit(limit)
+                )
+                if after_id is not None:
+                    query = query.where(TaskCancellation.id > after_id)
+                cancellation_ids = tuple(session.scalars(query))
+            if not cancellation_ids:
+                return tuple(completed)
+            after_id = cancellation_ids[-1]
+            completed.extend(
+                cancellation_id
+                for cancellation_id in cancellation_ids
+                if self._cancellations.resume_cleanup(
+                    cancellation_id,
+                    terminator=terminator,
+                    cleaner=cleaner,
+                )
+            )
+            if len(cancellation_ids) < limit:
+                return tuple(completed)
+
     def _reconcile_targets(
         self,
         *,
@@ -1135,81 +1261,91 @@ class StartupRecoveryService:
         ],
         limit: int,
     ) -> tuple[UUID, ...]:
-        with self._factory() as session:
-            targets = tuple(
-                session.scalars(
-                    select(ReconciliationTarget)
-                    .where(
-                        ReconciliationTarget.status
-                        != ReconciliationStatus.CANCELLED
-                    )
-                    .order_by(
-                        ReconciliationTarget.updated_at,
-                        ReconciliationTarget.id,
-                    )
-                    .limit(limit)
-                )
-            )
-            snapshots = tuple(
-                (
-                    target.id,
-                    ReconciliationTargetKind(target.kind),
-                    target.target_key,
-                    dict(target.expected_payload),
-                    target.expected_fingerprint,
-                    target.reconciliation_version,
-                )
-                for target in targets
-            )
-        order = {kind: index for index, kind in enumerate(self._KIND_ORDER)}
         reconciled: list[UUID] = []
-        for (
-            target_id,
-            kind,
-            target_key,
-            expected_payload,
-            expected_fingerprint,
-            expected_version,
-        ) in sorted(snapshots, key=lambda item: (order[item[1]], item[2])):
-            adapter = adapters.get(kind)
-            if adapter is None:
-                observation = ReconciliationObservation(
-                    status=ReconciliationStatus.RETRY_REQUIRED,
-                    observed_payload={},
-                    error_code="ADAPTER_UNAVAILABLE",
-                )
-            else:
-                observation = adapter.reconcile(
-                    kind=kind,
-                    target_key=target_key,
-                    expected_payload=expected_payload,
-                )
-            with self._factory() as session, session.begin():
-                _begin_serialized(session)
-                target = session.scalar(
-                    select(ReconciliationTarget)
-                    .where(ReconciliationTarget.id == target_id)
-                    .with_for_update()
-                )
-                if target is None:
-                    raise ReliabilityConflictError(
-                        "reconciliation target disappeared"
+        for kind in self._KIND_ORDER:
+            after_id: UUID | None = None
+            while True:
+                with self._factory() as session:
+                    query = (
+                        select(ReconciliationTarget)
+                        .where(
+                            ReconciliationTarget.status
+                            != ReconciliationStatus.CANCELLED,
+                            ReconciliationTarget.kind == kind,
+                        )
+                        .order_by(ReconciliationTarget.id)
+                        .limit(limit)
                     )
-                if (
-                    target.expected_fingerprint != expected_fingerprint
-                    or target.reconciliation_version != expected_version
-                ):
-                    continue
-                now = _as_utc(self._clock())
-                target.observed_payload = dict(
-                    observation.observed_payload
-                )
-                target.status = observation.status
-                target.reconciliation_version += 1
-                target.last_reconciled_at = now
-                target.last_error_code = observation.error_code
-                target.actor_id = self._principal_id
-                target.updated_at = now
-                session.flush()
-                reconciled.append(target.id)
+                    if after_id is not None:
+                        query = query.where(
+                            ReconciliationTarget.id > after_id
+                        )
+                    targets = tuple(session.scalars(query))
+                    snapshots = tuple(
+                        (
+                            target.id,
+                            target.target_key,
+                            dict(target.expected_payload),
+                            target.expected_fingerprint,
+                            target.reconciliation_version,
+                        )
+                        for target in targets
+                    )
+                if not snapshots:
+                    break
+                after_id = snapshots[-1][0]
+                for (
+                    target_id,
+                    target_key,
+                    expected_payload,
+                    expected_fingerprint,
+                    expected_version,
+                ) in snapshots:
+                    adapter = adapters.get(kind)
+                    if adapter is None:
+                        observation = ReconciliationObservation(
+                            status=ReconciliationStatus.RETRY_REQUIRED,
+                            observed_payload={},
+                            error_code="ADAPTER_UNAVAILABLE",
+                        )
+                    else:
+                        observation = adapter.reconcile(
+                            kind=kind,
+                            target_key=target_key,
+                            expected_payload=expected_payload,
+                        )
+                    with self._factory() as session, session.begin():
+                        _begin_serialized(session)
+                        target = session.scalar(
+                            select(ReconciliationTarget)
+                            .where(
+                                ReconciliationTarget.id == target_id
+                            )
+                            .with_for_update()
+                        )
+                        if target is None:
+                            raise ReliabilityConflictError(
+                                "reconciliation target disappeared"
+                            )
+                        if (
+                            target.expected_fingerprint
+                            != expected_fingerprint
+                            or target.reconciliation_version
+                            != expected_version
+                        ):
+                            continue
+                        now = _as_utc(self._clock())
+                        target.observed_payload = dict(
+                            observation.observed_payload
+                        )
+                        target.status = observation.status
+                        target.reconciliation_version += 1
+                        target.last_reconciled_at = now
+                        target.last_error_code = observation.error_code
+                        target.actor_id = self._principal_id
+                        target.updated_at = now
+                        session.flush()
+                        reconciled.append(target.id)
+                if len(snapshots) < limit:
+                    break
         return tuple(reconciled)

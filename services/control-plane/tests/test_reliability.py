@@ -131,19 +131,26 @@ def _task(
             actor_id="local-user",
         )
         task.state = state
-        session.add(
-            PolicyVersion(
-                lineage_key="mvp",
-                version=1,
-                predecessor_id=None,
-                workflow_thresholds={},
-                approved_by="local-user",
-                approved_at=harness.clock.now,
-                owner_id=task.owner_id,
-                actor_id="local-user",
-                root_correlation_id=task.root_correlation_id,
+        policy = session.scalar(
+            select(PolicyVersion).where(
+                PolicyVersion.lineage_key == "mvp",
+                PolicyVersion.version == 1,
             )
         )
+        if policy is None:
+            session.add(
+                PolicyVersion(
+                    lineage_key="mvp",
+                    version=1,
+                    predecessor_id=None,
+                    workflow_thresholds={},
+                    approved_by="local-user",
+                    approved_at=harness.clock.now,
+                    owner_id=task.owner_id,
+                    actor_id="local-user",
+                    root_correlation_id=task.root_correlation_id,
+                )
+            )
         session.flush()
         return task.id
 
@@ -566,6 +573,45 @@ class CurrentAdapter:
         )
 
 
+def test_live_pending_target_does_not_block_sibling_job(
+    reliability_harness: ReliabilityHarness,
+) -> None:
+    task_id = _task(reliability_harness)
+    jobs = reliability_harness.jobs()
+    first = jobs.schedule(
+        task_id=task_id,
+        job_type="live-target",
+        idempotency_key="live-target:1",
+        input_payload={"step": 1},
+    )
+    first_grant = jobs.claim_next(
+        worker_id="worker-1",
+        lease_duration=timedelta(seconds=30),
+    )
+    assert first_grant is not None
+    assert first_grant.job_id == first.job_id
+    jobs.register_reconciliation_target(
+        first_grant,
+        kind=ReconciliationTargetKind.HERMES_RUN,
+        target_key="hermes:live",
+        expected_payload={"run_id": "live"},
+    )
+    second = jobs.schedule(
+        task_id=task_id,
+        job_type="sibling",
+        idempotency_key="live-target:2",
+        input_payload={"step": 2},
+    )
+
+    second_grant = jobs.claim_next(
+        worker_id="worker-2",
+        lease_duration=timedelta(seconds=30),
+    )
+
+    assert second_grant is not None
+    assert second_grant.job_id == second.job_id
+
+
 def test_startup_recovers_expired_lease_and_all_external_target_kinds(
     reliability_harness: ReliabilityHarness,
 ) -> None:
@@ -632,3 +678,46 @@ def test_startup_recovers_expired_lease_and_all_external_target_kinds(
         and target.reconciliation_version == 1
         for target in targets
     )
+
+
+def test_startup_recovery_drains_every_bounded_page(
+    reliability_harness: ReliabilityHarness,
+) -> None:
+    jobs = reliability_harness.jobs()
+    scheduled_ids: list[UUID] = []
+    for index in range(2):
+        task_id = _task(reliability_harness)
+        scheduled = jobs.schedule(
+            task_id=task_id,
+            job_type="paged-restart",
+            idempotency_key=f"paged-restart:{index}",
+            input_payload={"index": index},
+            retry_policy=RetryPolicy(max_attempts=2),
+        )
+        grant = jobs.claim_next(
+            worker_id=f"worker-{index}",
+            lease_duration=timedelta(seconds=5),
+        )
+        assert grant is not None
+        jobs.register_reconciliation_target(
+            grant,
+            kind=ReconciliationTargetKind.HERMES_RUN,
+            target_key=f"hermes:paged:{index}",
+            expected_payload={"index": index},
+        )
+        scheduled_ids.append(scheduled.job_id)
+    reliability_harness.clock.advance(seconds=5)
+    adapter = CurrentAdapter()
+
+    recovery = StartupRecoveryService(
+        reliability_harness.factory,
+        reliability_harness.store,
+        clock=reliability_harness.clock,
+    ).recover(
+        adapters={ReconciliationTargetKind.HERMES_RUN: adapter},
+        limit=1,
+    )
+
+    assert set(recovery.recovered_job_ids) == set(scheduled_ids)
+    assert len(recovery.reconciled_target_ids) == 2
+    assert len(adapter.calls) == 2

@@ -786,108 +786,114 @@ def _create_postgresql_reliability_guards() -> None:
                 IF TG_TABLE_NAME IN (
                     'background_job_tool_grants',
                     'owned_host_processes'
-                ) AND NOT EXISTS (
-                    SELECT 1
-                    FROM background_jobs job
-                    JOIN background_job_leases lease
-                      ON lease.id = NEW.lease_id
-                     AND lease.job_id = NEW.job_id
-                     AND lease.fencing_token = NEW.fencing_token
-                    WHERE job.id = NEW.job_id
-                      AND job.status = 'RUNNING'
-                      AND job.current_lease_id = NEW.lease_id
-                      AND job.current_fencing_token = NEW.fencing_token
-                      AND job.cancellation_requested_at IS NULL
-                      AND lease.released_at IS NULL
-                      AND job.owner_id = NEW.owner_id
-                      AND job.root_correlation_id
-                          = NEW.root_correlation_id
                 ) THEN
-                    RAISE EXCEPTION
-                        'reliability record is not currently fenced';
-                ELSIF TG_TABLE_NAME
-                    = 'background_job_ignored_results'
-                    AND NOT EXISTS (
+                    IF NOT EXISTS (
                         SELECT 1
                         FROM background_jobs job
                         JOIN background_job_leases lease
                           ON lease.id = NEW.lease_id
                          AND lease.job_id = NEW.job_id
                          AND lease.fencing_token = NEW.fencing_token
-                        JOIN evidence_records evidence
-                          ON evidence.id = NEW.evidence_id
-                         AND evidence.task_id = job.task_id
                         WHERE job.id = NEW.job_id
-                          AND (
-                              job.cancellation_requested_at IS NOT NULL
-                              OR job.status <> 'RUNNING'
-                              OR job.current_lease_id <> NEW.lease_id
-                              OR job.current_fencing_token
-                                  <> NEW.fencing_token
-                              OR lease.released_at IS NOT NULL
-                          )
-                    ) THEN
-                    RAISE EXCEPTION
-                        'ignored result is not historically fenced';
-                ELSIF TG_TABLE_NAME = 'dependency_outage_attempts'
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM background_jobs job
-                        JOIN background_job_leases lease
-                          ON lease.id = NEW.lease_id
-                         AND lease.job_id = NEW.job_id
-                         AND lease.fencing_token = NEW.fencing_token
-                        JOIN evidence_records evidence
-                          ON evidence.id = NEW.checkpoint_evidence_id
-                         AND evidence.task_id = job.task_id
-                        WHERE job.id = NEW.job_id
-                          AND lease.attempt = NEW.attempt
-                          AND lease.failure_code = NEW.error_code
-                          AND lease.release_reason IN ('RETRY', 'FAILED')
-                          AND (
-                              (
-                                  NEW.exhausted = false
-                                  AND lease.release_reason = 'RETRY'
-                                  AND job.status = 'QUEUED'
-                              )
-                              OR (
-                                  NEW.exhausted = true
-                                  AND lease.release_reason = 'FAILED'
-                                  AND job.status = 'FAILED'
-                              )
-                          )
-                    ) THEN
-                    RAISE EXCEPTION 'outage attempt is not fenced';
-                ELSIF TG_TABLE_NAME = 'task_cancellations'
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM tasks task
-                        JOIN task_events event
-                          ON event.id = NEW.transition_event_id
-                         AND event.task_id = NEW.task_id
-                         AND event.transition_id = NEW.id
-                        JOIN evidence_records evidence
-                          ON evidence.id = NEW.partial_evidence_id
-                         AND evidence.task_id = NEW.task_id
-                        WHERE task.id = NEW.task_id
-                          AND event.transition_kind IN ('CANCEL', 'FAIL')
-                          AND event.transition_to_state = task.state
-                          AND task.state IN ('CANCELLED', 'FAILED')
-                    ) THEN
-                    RAISE EXCEPTION
-                        'terminal work fence lacks transition provenance';
-                ELSIF TG_TABLE_NAME = 'reconciliation_targets'
-                    AND NEW.job_id IS NOT NULL
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM background_jobs job
-                        WHERE job.id = NEW.job_id
-                          AND job.task_id = NEW.task_id
                           AND job.status = 'RUNNING'
+                          AND job.current_lease_id = NEW.lease_id
+                          AND job.current_fencing_token = NEW.fencing_token
                           AND job.cancellation_requested_at IS NULL
+                          AND lease.released_at IS NULL
+                          AND job.owner_id = NEW.owner_id
+                          AND job.root_correlation_id
+                              = NEW.root_correlation_id
                     ) THEN
-                    RAISE EXCEPTION
-                        'reconciliation target is not currently fenced';
+                        RAISE EXCEPTION
+                            'reliability record is not currently fenced';
+                    END IF;
+                ELSIF TG_TABLE_NAME
+                    = 'background_job_ignored_results' THEN
+                    IF NOT EXISTS (
+                            SELECT 1
+                            FROM background_jobs job
+                            JOIN background_job_leases lease
+                              ON lease.id = NEW.lease_id
+                             AND lease.job_id = NEW.job_id
+                             AND lease.fencing_token = NEW.fencing_token
+                            JOIN evidence_records evidence
+                              ON evidence.id = NEW.evidence_id
+                             AND evidence.task_id = job.task_id
+                            WHERE job.id = NEW.job_id
+                              AND (
+                                  job.cancellation_requested_at IS NOT NULL
+                                  OR job.status <> 'RUNNING'
+                                  OR job.current_lease_id <> NEW.lease_id
+                                  OR job.current_fencing_token
+                                      <> NEW.fencing_token
+                                  OR lease.released_at IS NOT NULL
+                              )
+                        ) THEN
+                        RAISE EXCEPTION
+                            'ignored result is not historically fenced';
+                    END IF;
+                ELSIF TG_TABLE_NAME = 'dependency_outage_attempts' THEN
+                    IF NOT EXISTS (
+                            SELECT 1
+                            FROM background_jobs job
+                            JOIN background_job_leases lease
+                              ON lease.id = NEW.lease_id
+                             AND lease.job_id = NEW.job_id
+                             AND lease.fencing_token = NEW.fencing_token
+                            JOIN evidence_records evidence
+                              ON evidence.id = NEW.checkpoint_evidence_id
+                             AND evidence.task_id = job.task_id
+                            WHERE job.id = NEW.job_id
+                              AND lease.attempt = NEW.attempt
+                              AND lease.failure_code = NEW.error_code
+                              AND lease.release_reason IN ('RETRY', 'FAILED')
+                              AND (
+                                  (
+                                      NEW.exhausted = false
+                                      AND lease.release_reason = 'RETRY'
+                                      AND job.status = 'QUEUED'
+                                  )
+                                  OR (
+                                      NEW.exhausted = true
+                                      AND lease.release_reason = 'FAILED'
+                                      AND job.status = 'FAILED'
+                                  )
+                              )
+                        ) THEN
+                        RAISE EXCEPTION 'outage attempt is not fenced';
+                    END IF;
+                ELSIF TG_TABLE_NAME = 'task_cancellations' THEN
+                    IF NOT EXISTS (
+                            SELECT 1
+                            FROM tasks task
+                            JOIN task_events event
+                              ON event.id = NEW.transition_event_id
+                             AND event.task_id = NEW.task_id
+                             AND event.transition_id = NEW.id
+                            JOIN evidence_records evidence
+                              ON evidence.id = NEW.partial_evidence_id
+                             AND evidence.task_id = NEW.task_id
+                            WHERE task.id = NEW.task_id
+                              AND event.transition_kind IN ('CANCEL', 'FAIL')
+                              AND event.transition_to_state = task.state
+                              AND task.state IN ('CANCELLED', 'FAILED')
+                        ) THEN
+                        RAISE EXCEPTION
+                            'terminal work fence lacks transition provenance';
+                    END IF;
+                ELSIF TG_TABLE_NAME = 'reconciliation_targets' THEN
+                    IF NEW.job_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM background_jobs job
+                           WHERE job.id = NEW.job_id
+                             AND job.task_id = NEW.task_id
+                             AND job.status = 'RUNNING'
+                             AND job.cancellation_requested_at IS NULL
+                       ) THEN
+                        RAISE EXCEPTION
+                            'reconciliation target is not currently fenced';
+                    END IF;
                 END IF;
                 RETURN NEW;
             END IF;
