@@ -1,13 +1,25 @@
 import hashlib
+import json
+import signal
+import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
-from mathews_configuration import RepositoryConfiguration, TaskLeaseHostAuthority
+from mathews_configuration import (
+    E2EFlow,
+    RepositoryConfiguration,
+    SecretValue,
+    TaskLeaseHostAuthority,
+)
 from mathews_host_agent.execution import (
     ConfiguredExecutionError,
     ConfiguredOperationRunner,
@@ -18,6 +30,9 @@ from mathews_host_agent.workspaces import GitWorkspaceLifecycle, WorkspaceLifecy
 
 class _Kind(StrEnum):
     BUILD = "BUILD"
+
+
+_CONFIGURATION_ID = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
 
 
 @dataclass(frozen=True)
@@ -37,7 +52,7 @@ class _Artifacts:
 class _Configuration:
     operations: tuple[_Operation, ...]
     artifacts: _Artifacts
-    configuration_id: UUID = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    configuration_id: UUID = _CONFIGURATION_ID
     version: int = 7
     digest: str = "sha256:" + "c" * 64
 
@@ -77,14 +92,18 @@ def _authority() -> TaskLeaseHostAuthority:
         fencing_token=9,
         lease_expires_at_ms=1_900_000_000_000,
         repository_key="boppuh/mathews",
-        configuration_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        configuration_id=_CONFIGURATION_ID,
         configuration_digest="sha256:" + "c" * 64,
     )
 
 
-def _artifact_bytes(root: Path, address: object) -> bytes:
+def _artifact_bytes(
+    root: Path,
+    task_id: UUID,
+    address: object,
+) -> bytes:
     assert isinstance(address, str)
-    return (root / address.removeprefix("sha256:")).read_bytes()
+    return (root / str(task_id) / address.removeprefix("sha256:")).read_bytes()
 
 
 def test_configured_operation_returns_exact_evidence_and_immutable_artifacts(
@@ -118,11 +137,12 @@ def test_configured_operation_returns_exact_evidence_and_immutable_artifacts(
     mutation_starts: list[str] = []
     yielded: list[str] = []
 
+    authority = _authority()
     result = ConfiguredOperationRunner(
         cast(GitWorkspaceLifecycle, workspaces),
         HostArtifactStore(store_root),
     ).run(
-        _authority(),
+        authority,
         configuration,
         operation_id="build",
         expected_head_sha="a" * 40,
@@ -153,8 +173,8 @@ def test_configured_operation_returns_exact_evidence_and_immutable_artifacts(
     configured = next(
         reference for reference in references if reference["role"] == "CONFIGURED"
     )
-    assert _artifact_bytes(store_root, stdout["address"]) == b"build output\n"
-    assert _artifact_bytes(store_root, configured["address"]) == b"result"
+    assert _artifact_bytes(store_root, authority.task_id, stdout["address"]) == b"build output\n"
+    assert _artifact_bytes(store_root, authority.task_id, configured["address"]) == b"result"
     assert configured["source_path"] == "artifacts/result.txt"
 
 
@@ -180,11 +200,12 @@ def test_timed_out_operation_retains_partial_output_and_never_passes(
     )
     store_root = (tmp_path / "store").resolve()
 
+    authority = _authority()
     result = ConfiguredOperationRunner(
         cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
         HostArtifactStore(store_root),
     ).run(
-        _authority(),
+        authority,
         configuration,
         operation_id="unit-tests",
         expected_head_sha="a" * 40,
@@ -196,7 +217,7 @@ def test_timed_out_operation_retains_partial_output_and_never_passes(
     assert result["passed"] is False
     assert result["cancellation_status"] == "TIMED_OUT"
     assert isinstance(result["exit_status"], int)
-    assert _artifact_bytes(store_root, stdout["address"]) == b"partial\n"
+    assert _artifact_bytes(store_root, authority.task_id, stdout["address"]) == b"partial\n"
 
 
 def test_artifact_store_reuses_verified_content_and_rejects_corruption(
@@ -206,15 +227,16 @@ def test_artifact_store_reuses_verified_content_and_rejects_corruption(
     source.write_bytes(b"immutable")
     store_root = (tmp_path / "store").resolve()
     store = HostArtifactStore(store_root)
+    task_id = uuid4()
 
-    first = store.put_file(source, role="STDOUT", source_path=None)
-    second = store.put_file(source, role="STDOUT", source_path=None)
+    first = store.put_file(source, task_id=task_id, role="STDOUT", source_path=None)
+    second = store.put_file(source, task_id=task_id, role="STDOUT", source_path=None)
 
     assert first == second
-    destination = store_root / hashlib.sha256(b"immutable").hexdigest()
+    destination = store_root / str(task_id) / hashlib.sha256(b"immutable").hexdigest()
     destination.write_bytes(b"corrupt")
     with pytest.raises(ConfiguredExecutionError, match="ARTIFACT_CORRUPT"):
-        store.put_file(source, role="STDOUT", source_path=None)
+        store.put_file(source, task_id=task_id, role="STDOUT", source_path=None)
 
 
 def test_authorization_error_terminates_work_retains_output_and_is_not_relabelled(
@@ -242,12 +264,12 @@ def test_authorization_error_terminates_work_retains_output_and_is_not_relabelle
     )
     store_root = (tmp_path / "store").resolve()
 
-    with pytest.raises(RuntimeError, match="journal unavailable"):
-        ConfiguredOperationRunner(
+    authority = _authority()
+    result = ConfiguredOperationRunner(
             cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
             HostArtifactStore(store_root),
         ).run(
-            _authority(),
+            authority,
             configuration,
             operation_id="build",
             expected_head_sha="a" * 40,
@@ -258,7 +280,9 @@ def test_authorization_error_terminates_work_retains_output_and_is_not_relabelle
         )
 
     partial_address = hashlib.sha256(b"partial\n").hexdigest()
-    assert (store_root / partial_address).read_bytes() == b"partial\n"
+    assert result["passed"] is False
+    assert result["cancellation_status"] == "AUTHORIZATION_LOST"
+    assert (store_root / str(authority.task_id) / partial_address).read_bytes() == b"partial\n"
 
 
 def test_execution_rejects_unknown_operation_before_starting_effect(
@@ -289,3 +313,358 @@ def test_execution_rejects_unknown_operation_before_starting_effect(
         )
 
     assert starts == []
+
+
+def test_configured_simulator_is_resolved_to_available_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "runtimes": [
+            {
+                "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-0",
+                "name": "iOS 18.0",
+                "isAvailable": True,
+            }
+        ],
+        "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-18-0": [
+                {
+                    "udid": "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB",
+                    "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-16",
+                    "isAvailable": True,
+                },
+                {
+                    "udid": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+                    "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-16",
+                    "isAvailable": True,
+                },
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        ),
+    )
+    configuration = SimpleNamespace(
+        xcode=SimpleNamespace(
+            simulator=SimpleNamespace(
+                runtime_identifier="com.apple.CoreSimulator.SimRuntime.iOS-18-0",
+                device_type_identifier="com.apple.CoreSimulator.SimDeviceType.iPhone-16",
+            )
+        )
+    )
+
+    argv, simulator_id = ConfiguredOperationRunner._resolved_argv(
+        tmp_path,
+        ("xcodebuild", "test", "MATHEWS_CONFIGURED_SIMULATOR"),
+        cast(RepositoryConfiguration, configuration),
+    )
+
+    assert simulator_id == "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+    assert argv == (
+        "xcodebuild",
+        "test",
+        "id=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    )
+
+
+def test_e2e_execution_prepares_simulator_and_exposes_only_secret_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fixture = workspace / "fixture.json"
+    recipe = workspace / "recipe.json"
+    fixture.write_text("{}")
+    recipe.write_text("{}")
+    flow = cast(
+        E2EFlow,
+        SimpleNamespace(
+            fixture_file=SimpleNamespace(path="fixture.json"),
+            test_account_recipe_file=SimpleNamespace(path="recipe.json"),
+            locale_identifier="en_US_POSIX",
+            time_zone_identifier="UTC",
+        ),
+    )
+    runner = ConfiguredOperationRunner(
+        cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
+        HostArtifactStore((tmp_path / "store").resolve()),
+    )
+    prepared: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "_prepare_simulator",
+        lambda _workspace, simulator_id, **_kwargs: prepared.append(simulator_id),
+    )
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    stdout_path = output_root / "stdout"
+    stderr_path = output_root / "stderr"
+    program = (
+        "import os, pathlib; "
+        "secret = pathlib.Path(os.environ['MATHEWS_E2E_ACCOUNT_SECRET_PATH']); "
+        "assert secret.read_text() == 'credential'; "
+        "assert os.environ['MATHEWS_E2E_FIXTURE_PATH'].endswith('fixture.json'); "
+        "assert os.environ['MATHEWS_E2E_ACCOUNT_RECIPE_PATH'].endswith('recipe.json')"
+    )
+
+    result = runner._execute(
+        workspace,
+        (sys.executable, "-c", program),
+        5,
+        stdout_path,
+        stderr_path,
+        simulator_id="simulator-1",
+        e2e_flow=flow,
+        e2e_secret=SecretValue("credential"),
+        effect_started=None,
+        effect_yielded=None,
+        assert_authorized=None,
+    )
+
+    assert result == (0, "NOT_REQUESTED", False)
+    assert prepared == ["simulator-1"]
+    assert not (output_root / "e2e-account-secret").exists()
+
+
+def test_simulator_preparation_applies_fixed_clean_state_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = ConfiguredOperationRunner(
+        cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
+        HostArtifactStore((tmp_path / "store").resolve()),
+    )
+    commands: list[tuple[str, ...]] = []
+    authorization_checks: list[str] = []
+
+    def run(command: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    runner._prepare_simulator(
+        workspace,
+        "simulator-1",
+        assert_authorized=lambda: authorization_checks.append("checked"),
+    )
+
+    assert commands == [
+        ("xcrun", "simctl", "shutdown", "simulator-1"),
+        ("xcrun", "simctl", "erase", "simulator-1"),
+        ("xcrun", "simctl", "boot", "simulator-1"),
+        ("xcrun", "simctl", "bootstatus", "simulator-1", "-b"),
+    ]
+    assert authorization_checks == ["checked"] * 4
+
+
+def test_e2e_inputs_are_rehashed_and_exact_before_launch(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    harness = workspace / "Harness"
+    harness.mkdir(parents=True)
+    runner_source = harness / "Runner.swift"
+    fixture = workspace / "fixture.json"
+    recipe = workspace / "recipe.json"
+    runner_source.write_bytes(b"runner")
+    fixture.write_bytes(b"fixture")
+    recipe.write_bytes(b"recipe")
+
+    def pinned(path: str, payload: bytes) -> SimpleNamespace:
+        return SimpleNamespace(
+            path=path,
+            digest=f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        )
+
+    flow = cast(
+        E2EFlow,
+        SimpleNamespace(
+            harness_source_root="Harness",
+            harness_files=(pinned("Harness/Runner.swift", b"runner"),),
+            fixture_file=pinned("fixture.json", b"fixture"),
+            test_account_recipe_file=pinned("recipe.json", b"recipe"),
+        ),
+    )
+
+    ConfiguredOperationRunner._verify_e2e_inputs(workspace, flow)
+    runner_source.write_bytes(b"changed")
+
+    with pytest.raises(ConfiguredExecutionError, match="E2E_INPUT_INVALID"):
+        ConfiguredOperationRunner._verify_e2e_inputs(workspace, flow)
+
+
+def test_artifact_reads_are_bounded_and_task_scoped(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"immutable-evidence")
+    store = HostArtifactStore((tmp_path / "store").resolve())
+    task_id = uuid4()
+    reference = store.put_file(
+        source,
+        task_id=task_id,
+        role="STDOUT",
+        source_path=None,
+    )
+
+    first = store.read_chunk(
+        task_id,
+        address=reference.address,
+        offset=0,
+        length=9,
+    )
+    second = store.read_chunk(
+        task_id,
+        address=reference.address,
+        offset=9,
+        length=256,
+    )
+
+    assert first["data_base64"] == "aW1tdXRhYmxl"
+    assert first["eof"] is False
+    assert second["data_base64"] == "LWV2aWRlbmNl"
+    assert second["eof"] is True
+    with pytest.raises(ConfiguredExecutionError, match="ARTIFACT_UNAVAILABLE"):
+        store.read_chunk(
+            uuid4(),
+            address=reference.address,
+            offset=0,
+            length=9,
+        )
+
+
+def test_spontaneous_signal_is_not_reported_as_cancellation(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    configuration = cast(
+        RepositoryConfiguration,
+        _Configuration(
+            operations=(
+                _Operation(
+                    "crash",
+                    _Kind.BUILD,
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+                    ),
+                    5,
+                ),
+            ),
+            artifacts=_Artifacts(()),
+        ),
+    )
+
+    result = ConfiguredOperationRunner(
+        cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
+        HostArtifactStore((tmp_path / "store").resolve()),
+    ).run(
+        _authority(),
+        configuration,
+        operation_id="crash",
+        expected_head_sha="a" * 40,
+        validation_contract_version=1,
+    )
+
+    assert result["exit_status"] == -signal.SIGTERM
+    assert result["termination_signal"] == signal.SIGTERM
+    assert result["cancellation_status"] == "NOT_REQUESTED"
+    assert result["passed"] is False
+
+
+def test_capacity_rejection_preserves_a_worker_for_renewals_and_shutdown(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    configuration = cast(
+        RepositoryConfiguration,
+        _Configuration(
+            operations=(
+                _Operation(
+                    "long",
+                    _Kind.BUILD,
+                    (sys.executable, "-c", "import time; time.sleep(30)"),
+                    60,
+                ),
+            ),
+            artifacts=_Artifacts(()),
+        ),
+    )
+    runner = ConfiguredOperationRunner(
+        cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
+        HostArtifactStore((tmp_path / "store").resolve()),
+        maximum_concurrent_operations=1,
+    )
+    started = threading.Event()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        active = executor.submit(
+            runner.run,
+            _authority(),
+            configuration,
+            operation_id="long",
+            expected_head_sha="a" * 40,
+            validation_contract_version=1,
+            effect_started=started.set,
+        )
+        assert started.wait(timeout=2)
+        with pytest.raises(
+            ConfiguredExecutionError,
+            match="VALIDATION_CAPACITY_UNAVAILABLE",
+        ):
+            runner.run(
+                _authority(),
+                configuration,
+                operation_id="long",
+                expected_head_sha="a" * 40,
+                validation_contract_version=1,
+            )
+        runner.request_shutdown()
+        result = active.result(timeout=7)
+
+    assert result["cancellation_status"] == "AGENT_SHUTDOWN"
+    assert result["passed"] is False
+
+
+def test_termination_kills_descendants_that_ignore_term(tmp_path: Path) -> None:
+    pid_path = tmp_path / "child.pid"
+    child_program = (
+        "import os, signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"open({str(pid_path)!r}, 'w').write(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    parent_program = (
+        "import signal, subprocess, sys, time; "
+        "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+        f"subprocess.Popen([sys.executable, '-c', {child_program!r}]); "
+        "time.sleep(30)"
+    )
+    process = subprocess.Popen(
+        (sys.executable, "-c", parent_program),
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 2
+    while not pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert pid_path.exists()
+    child_pid = int(pid_path.read_text())
+
+    ConfiguredOperationRunner._terminate(process)
+    process.wait(timeout=5)
+    observed = subprocess.run(
+        ("/bin/ps", "-p", str(child_pid), "-o", "stat="),
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert not observed or observed.startswith("Z")

@@ -88,6 +88,14 @@ class HostOperationRejected(RuntimeError):
         super().__init__(code)
 
 
+class HostEffectAmbiguous(RuntimeError):
+    """Carry bounded recovery evidence when a completed effect cannot journal."""
+
+    def __init__(self, result: object) -> None:
+        self.result = result
+        super().__init__("authorized effect became ambiguous")
+
+
 class HostTaskGuard:
     """Re-entrant, bounded-stripe guard for one task lease's host effects."""
 
@@ -204,8 +212,11 @@ class HostOperationContext:
         finally:
             if guard_held:
                 guard.release()
-        with guard:
-            self._journal.assert_authorized(self.request)
+        try:
+            with guard:
+                self._journal.assert_authorized(self.request)
+        except HostJournalError:
+            raise HostEffectAmbiguous(result) from None
         self._authorized_effects += 1
         return result
 
@@ -384,6 +395,13 @@ class HostRequestDispatcher:
                 result=normalize_host_json_object(result),
                 execution_fencing_token=_fencing_token(request),
             )
+        except HostEffectAmbiguous as error:
+            return self._ambiguous_response(
+                request,
+                result=normalize_host_json_object(
+                    cast(dict[str, object], error.result)
+                ),
+            )
         except HostOperationRejected as error:
             journal_result = JournalResult(
                 status=HostResponseStatus.REJECTED,
@@ -426,12 +444,14 @@ class HostRequestDispatcher:
     def _ambiguous_response(
         self,
         request: HostRequestMessage,
+        *,
+        result: dict[str, JsonValue] | None = None,
     ) -> SignedHostResponse:
         return self._signed_response(
             request,
             status=HostResponseStatus.AMBIGUOUS,
             code="OPERATION_AMBIGUOUS",
-            result={},
+            result={} if result is None else result,
             replayed=False,
         )
 
@@ -478,15 +498,22 @@ def default_operation_registry(
     push_transport = git_push_transport or GitCredentialPushTransport(
         Path.home() / "Library" / "Application Support" / "Mathews" / "git-helpers"
     )
+    default_artifact_store = HostArtifactStore(
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "Mathews"
+        / "validation-artifacts"
+    )
     execution_runner = configured_execution or ConfiguredOperationRunner(
         workspace_lifecycle,
-        HostArtifactStore(
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "Mathews"
-            / "validation-artifacts"
-        ),
+        default_artifact_store,
+        secrets=credential_provider,
+    )
+    artifact_store = getattr(
+        execution_runner,
+        "artifact_store",
+        default_artifact_store,
     )
 
     def health(
@@ -645,6 +672,22 @@ def default_operation_registry(
             raise HostOperationRejected(error.code) from None
         return cast(dict[str, JsonValue], result)
 
+    def artifact_read(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        try:
+            result = artifact_store.read_chunk(
+                authority.task_id,
+                address=cast(str, arguments["address"]),
+                offset=cast(int, arguments["offset"]),
+                length=cast(int, arguments["length"]),
+            )
+        except ConfiguredExecutionError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
     def lease_probe(
         context: HostOperationContext,
         _arguments: dict[str, JsonValue],
@@ -685,6 +728,11 @@ def default_operation_registry(
 
     return HostOperationRegistry(
         {
+            "artifact.read": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_artifact_read,
+                handle=artifact_read,
+            ),
             "git.commit": HostOperationDefinition(
                 authority=HostAuthorityKind.TASK_LEASE,
                 validate=_validate_git_commit,
@@ -841,10 +889,32 @@ def _validate_validation_run(
     contract_version = arguments["validation_contract_version"]
     if (
         not isinstance(operation_id, str)
-        or re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,79}", operation_id) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}", operation_id) is None
         or isinstance(contract_version, bool)
         or not isinstance(contract_version, int)
         or not 0 < contract_version <= 2_147_483_647
+    ):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    return arguments
+
+
+def _validate_artifact_read(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"address", "offset", "length"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    address = arguments["address"]
+    offset = arguments["offset"]
+    length = arguments["length"]
+    if (
+        not isinstance(address, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", address) is None
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+        or isinstance(length, bool)
+        or not isinstance(length, int)
+        or not 0 < length <= 256 * 1024
     ):
         raise HostOperationRejected("INVALID_ARGUMENTS")
     return arguments

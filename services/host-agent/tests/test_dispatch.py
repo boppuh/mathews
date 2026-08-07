@@ -32,7 +32,7 @@ from mathews_host_agent.dispatch import (
     HostRequestDispatcher,
     default_operation_registry,
 )
-from mathews_host_agent.execution import ConfiguredOperationRunner
+from mathews_host_agent.execution import ConfiguredOperationRunner, HostArtifactStore
 from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import (
     HostJournalError,
@@ -769,10 +769,166 @@ def test_handler_crossing_lease_expiry_cannot_commit(tmp_path: Path) -> None:
     assert retry.code == "OPERATION_AMBIGUOUS"
 
 
+def test_renewable_effect_returns_recovery_evidence_when_authority_is_lost(
+    tmp_path: Path,
+) -> None:
+    clock = [NOW_MS]
+    authenticator = HostMessageAuthenticator(
+        SecretValue("a" * 32),
+        key_id="control-plane-v1",
+        clock_ms=lambda: clock[0],
+    )
+    journal = HostOperationJournal(
+        _runtime_directory(tmp_path) / "journal.sqlite3",
+        clock_ms=lambda: clock[0],
+    )
+
+    def validation(
+        context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        def run(
+            effect_started: Callable[[], None],
+            effect_yielded: Callable[[], None],
+            _assert_authorized: Callable[[], None],
+        ) -> dict[str, JsonValue]:
+            effect_started()
+            effect_yielded()
+            clock[0] = NOW_MS + 20
+            return {
+                "passed": False,
+                "cancellation_status": "AUTHORIZATION_LOST",
+                "artifacts": [
+                    {
+                        "address": "sha256:" + "a" * 64,
+                        "size_bytes": 7,
+                        "role": "STDOUT",
+                        "source_path": None,
+                    }
+                ],
+            }
+
+        return context.perform_renewable_authorized_effect(run)
+
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=journal,
+        registry=HostOperationRegistry(
+            {
+                "test.execute": HostOperationDefinition(
+                    authority=HostAuthorityKind.TASK_LEASE,
+                    validate=_empty,
+                    handle=validation,
+                    mutates_host=True,
+                )
+            }
+        ),
+        host_id="host-1",
+        clock_ms=lambda: clock[0],
+    )
+    request = _request(
+        authority=_task_authority(lease_expires_at_ms=NOW_MS + 10)
+    )
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(request))
+    )
+
+    assert response.status is HostResponseStatus.AMBIGUOUS
+    assert response.code == "OPERATION_AMBIGUOUS"
+    assert response.result["cancellation_status"] == "AUTHORIZATION_LOST"
+    assert response.result["artifacts"] == [
+        {
+            "address": "sha256:" + "a" * 64,
+            "size_bytes": 7,
+            "role": "STDOUT",
+            "source_path": None,
+        }
+    ]
+
+
+def test_artifact_read_is_authenticated_bounded_and_task_scoped(
+    tmp_path: Path,
+) -> None:
+    authority = _task_authority()
+    source = tmp_path / "artifact"
+    source.write_bytes(b"immutable-evidence")
+    artifact_store = HostArtifactStore((tmp_path / "artifacts").resolve())
+    reference = artifact_store.put_file(
+        source,
+        task_id=authority.task_id,
+        role="STDOUT",
+        source_path=None,
+    )
+
+    class FakeExecution:
+        @property
+        def artifact_store(self) -> HostArtifactStore:
+            return artifact_store
+
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=default_operation_registry(
+            configured_execution=cast(
+                ConfiguredOperationRunner,
+                FakeExecution(),
+            )
+        ),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+    arguments: dict[str, JsonValue] = {
+        "address": reference.address,
+        "offset": 0,
+        "length": 9,
+    }
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(
+            authenticator.sign_request(
+                _request(
+                    name="artifact.read",
+                    authority=authority,
+                    arguments=arguments,
+                )
+            )
+        )
+    )
+    foreign = authenticator.verify_response(
+        dispatcher.dispatch(
+            authenticator.sign_request(
+                _request(
+                    name="artifact.read",
+                    authority=replace(
+                        authority,
+                        task_id=uuid4(),
+                        job_id=uuid4(),
+                        lease_id=uuid4(),
+                    ),
+                    idempotency_key="foreign-artifact",
+                    arguments=arguments,
+                )
+            )
+        )
+    )
+
+    assert response.status is HostResponseStatus.OK
+    assert response.result["data_base64"] == "aW1tdXRhYmxl"
+    assert response.result["eof"] is False
+    assert foreign.status is HostResponseStatus.REJECTED
+    assert foreign.code == "ARTIFACT_UNAVAILABLE"
+
+
 def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
     registry = default_operation_registry()
 
     assert registry.capabilities == (
+        "artifact.read",
         "git.commit",
         "git.inspect",
         "git.push",
