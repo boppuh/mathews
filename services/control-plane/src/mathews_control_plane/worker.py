@@ -19,6 +19,13 @@ from mathews_control_plane.database import (
     create_session_factory,
 )
 from mathews_control_plane.domain_models import ReconciliationTargetKind
+from mathews_control_plane.hermes_adapter import (
+    HermesHttpRuntime,
+    HermesRunJobHandler,
+    HermesRuntime,
+    KeychainSecretProvider,
+    UnavailableHermesRuntime,
+)
 from mathews_control_plane.reliability import (
     OwnedProcessTerminator,
     OwnedWorkspaceCleaner,
@@ -41,16 +48,24 @@ def build_worker(
     runtime_settings: Settings,
     *,
     handlers: dict[str, BackgroundJobHandler] | None = None,
+    hermes_runtime: HermesRuntime | None = None,
 ) -> tuple[DurableJobWorker, Engine]:
     """Build one database-backed worker and return its disposable engine."""
 
-    handler_registry = {} if handlers is None else dict(handlers)
+    engine = create_database_engine(runtime_settings.database_url)
+    factory = create_session_factory(engine)
+    store = ArtifactStore(runtime_settings.artifact_root)
+    runtime = hermes_runtime or configured_hermes_runtime(runtime_settings)
+    handler_registry = (
+        {"hermes-run": HermesRunJobHandler(factory, store, runtime)}
+        if handlers is None
+        else dict(handlers)
+    )
     if not handler_registry:
         logger.warning("worker has no registered handlers; durable polling will remain idle")
-    engine = create_database_engine(runtime_settings.database_url)
     service = BackgroundJobService(
-        create_session_factory(engine),
-        ArtifactStore(runtime_settings.artifact_root),
+        factory,
+        store,
     )
     worker = DurableJobWorker(
         service,
@@ -83,16 +98,38 @@ def recover_worker_startup(
     | None = None,
     terminator: OwnedProcessTerminator | None = None,
     cleaner: OwnedWorkspaceCleaner | None = None,
+    hermes_runtime: HermesRuntime | None = None,
 ) -> StartupRecoveryResult:
     """Reconcile durable external state before the worker may claim work."""
 
+    configured_adapters = {} if adapters is None else dict(adapters)
+    if hermes_runtime is not None:
+        configured_adapters.setdefault(
+            ReconciliationTargetKind.HERMES_RUN,
+            hermes_runtime,
+        )
     return StartupRecoveryService(
         create_session_factory(engine),
         ArtifactStore(runtime_settings.artifact_root),
     ).recover(
-        adapters=adapters,
+        adapters=configured_adapters,
         terminator=terminator,
         cleaner=cleaner,
+    )
+
+
+def configured_hermes_runtime(runtime_settings: Settings) -> HermesRuntime:
+    """Build the production Hermes boundary or a bounded fail-closed substitute."""
+
+    if (
+        runtime_settings.hermes_endpoint is None
+        or runtime_settings.hermes_api_key_ref is None
+    ):
+        return UnavailableHermesRuntime()
+    return HermesHttpRuntime(
+        str(runtime_settings.hermes_endpoint),
+        runtime_settings.hermes_api_key_ref,
+        secrets=KeychainSecretProvider(),
     )
 
 
@@ -116,9 +153,14 @@ def main() -> None:
     if args.once:
         logger.info(probe())
         return
-    worker, engine = build_worker(settings)
+    hermes_runtime = configured_hermes_runtime(settings)
+    worker, engine = build_worker(settings, hermes_runtime=hermes_runtime)
     try:
-        recovery = recover_worker_startup(settings, engine)
+        recovery = recover_worker_startup(
+            settings,
+            engine,
+            hermes_runtime=hermes_runtime,
+        )
         logger.info(
             "worker startup recovery completed",
             extra={

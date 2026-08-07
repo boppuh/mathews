@@ -46,9 +46,30 @@ def test_empty_handler_registry_is_reported_as_fail_closed(
         artifact_root=tmp_path / "artifacts",
     )
     with caplog.at_level(logging.WARNING, logger="mathews.worker"):
-        _worker, engine = build_worker(runtime_settings)
+        _worker, engine = build_worker(runtime_settings, handlers={})
     try:
         assert "no registered handlers" in caplog.text
         assert "remain idle" in caplog.text
+    finally:
+        engine.dispose()
+
+
+def test_default_worker_registers_the_fail_closed_hermes_handler(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from mathews_control_plane.settings import Settings
+    from mathews_control_plane.worker import build_worker
+
+    runtime_settings = Settings(
+        environment="test",
+        database_url=SecretStr(f"sqlite:///{tmp_path / 'worker.sqlite3'}"),
+        artifact_root=tmp_path / "artifacts",
+    )
+    with caplog.at_level(logging.WARNING, logger="mathews.worker"):
+        worker, engine = build_worker(runtime_settings)
+    try:
+        assert set(worker._handlers) == {"hermes-run"}
+        assert "no registered handlers" not in caplog.text
     finally:
         engine.dispose()
