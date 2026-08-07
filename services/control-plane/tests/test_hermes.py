@@ -55,6 +55,7 @@ from mathews_control_plane.hermes_adapter import (
     HermesObservedStatus,
     HermesRunJobHandler,
     HermesRuntime,
+    _observation_payload,
 )
 from mathews_control_plane.prompt_compiler import (
     CompiledPrompt,
@@ -341,6 +342,19 @@ def test_unsafe_provider_failure_code_uses_the_durable_fallback(
     with hermes_harness.factory() as session:
         run = session.get(HermesRun, run_id)
         assert run is not None and run.failure_code == "HERMES_RUN_FAILED"
+
+
+def test_runtime_observation_preserves_a_bounded_provider_error_code() -> None:
+    payload = _observation_payload(
+        {
+            "run_id": "run-1",
+            "status": "failed",
+            "error": "provider rejected the request",
+            "error_code": "RATE_LIMITED",
+        }
+    )
+
+    assert payload["error_code"] == "RATE_LIMITED"
 
 
 def test_hermes_outage_uses_bounded_background_job_retry(

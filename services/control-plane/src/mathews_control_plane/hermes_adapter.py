@@ -486,6 +486,9 @@ def _observation_payload(response: Mapping[str, object]) -> dict[str, object]:
     error = response.get("error")
     if isinstance(error, str):
         payload["error"] = error[:1_000]
+    error_code = response.get("error_code")
+    if isinstance(error_code, str):
+        payload["error_code"] = error_code[:100]
     usage = response.get("usage")
     if isinstance(usage, dict):
         payload["usage"] = {
