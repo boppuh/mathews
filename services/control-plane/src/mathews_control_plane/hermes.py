@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.background_jobs import (
+    BackgroundJobLeaseLostError,
     BackgroundJobService,
     JobFailureDisposition,
     JobLeaseGrant,
@@ -28,6 +29,7 @@ from mathews_control_plane.domain_models import (
     BackgroundJobLease,
     BackgroundJobStatus,
     BackgroundJobToolGrant,
+    DependencyOutageAttempt,
     DependencyService,
     HermesRun,
     HermesRunEvent,
@@ -408,28 +410,57 @@ class HermesRunService:
     ) -> JobFailureDisposition:
         code = _error_code(error_code)
         now = _as_utc(self._clock())
-        with self._factory() as session, session.begin():
-            _begin_serialized(session)
-            _current_lease(session, grant, now)
-            run = _run_for_grant(session, run_id, grant)
-            if run.status not in {HermesRunStatus.STARTING, HermesRunStatus.RUNNING}:
-                raise HermesConflictError("terminal Hermes run cannot fail its dependency")
-            run.status = HermesRunStatus.TIMED_OUT if timed_out else HermesRunStatus.FAILED
-            run.failure_code = code
-            run.completed_at = now
-            run.actor_id = self._principal_id
-            run.updated_at = now
-            session.flush()
-        return BackgroundJobService(
+        target_status = HermesRunStatus.TIMED_OUT if timed_out else HermesRunStatus.FAILED
+        jobs = BackgroundJobService(
             self._factory,
             self._store,
             principal_id=self._principal_id,
             clock=self._clock,
-        ).fail_dependency_attempt(
-            grant,
-            service=DependencyService.HERMES,
-            error_code=code,
         )
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            run = _run_for_grant(session, run_id, grant)
+            recovered = _outage_disposition(session, grant, code)
+            if recovered is None:
+                if run.status not in {HermesRunStatus.STARTING, HermesRunStatus.RUNNING}:
+                    raise HermesConflictError("terminal Hermes run cannot fail its dependency")
+                _current_lease(session, grant, now)
+        if recovered is None:
+            try:
+                disposition = jobs.fail_dependency_attempt(
+                    grant,
+                    service=DependencyService.HERMES,
+                    error_code=code,
+                )
+            except BackgroundJobLeaseLostError:
+                with self._factory() as session:
+                    recovered = _outage_disposition(session, grant, code)
+                if recovered is None:
+                    raise HermesConflictError("Hermes job lease is no longer current") from None
+                disposition = recovered
+        else:
+            disposition = recovered
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            run = _run_for_grant(session, run_id, grant)
+            _project_dependency_failure(
+                run,
+                target_status=target_status,
+                error_code=code,
+                principal_id=self._principal_id,
+                now=now,
+            )
+            session.flush()
+        if disposition.exhausted and disposition.escalation_request_id is None:
+            escalation_id = jobs.reconcile_outage_escalation(grant.job_id)
+            return JobFailureDisposition(
+                status=disposition.status,
+                next_attempt_at=disposition.next_attempt_at,
+                exhausted=True,
+                retry_delay=disposition.retry_delay,
+                escalation_request_id=escalation_id,
+            )
+        return disposition
 
 
 def _current_lease(
@@ -482,6 +513,69 @@ def _run_for_grant(session: Session, run_id: UUID, grant: JobLeaseGrant) -> Herm
     ):
         raise HermesConflictError("Hermes run lease correlation conflicts")
     return run
+
+
+def _outage_disposition(
+    session: Session,
+    grant: JobLeaseGrant,
+    error_code: str,
+) -> JobFailureDisposition | None:
+    outage = session.scalar(
+        select(DependencyOutageAttempt).where(
+            DependencyOutageAttempt.job_id == grant.job_id,
+            DependencyOutageAttempt.attempt == grant.attempt,
+        )
+    )
+    if outage is None:
+        return None
+    if (
+        outage.lease_id != grant.lease_id
+        or outage.fencing_token != grant.fencing_token
+        or outage.service != DependencyService.HERMES
+        or outage.error_code != error_code
+    ):
+        raise HermesConflictError("Hermes outage attempt conflicts")
+    job = session.get(BackgroundJob, grant.job_id)
+    lease = session.get(BackgroundJobLease, grant.lease_id)
+    if job is None or lease is None:
+        raise HermesConflictError("Hermes outage disposition is unavailable")
+    retry_at = (
+        None
+        if outage.exhausted or lease.retry_at is None
+        else _as_utc(lease.retry_at)
+    )
+    retry_delay = (
+        None
+        if retry_at is None
+        else retry_at - _as_utc(outage.occurred_at)
+    )
+    return JobFailureDisposition(
+        status=BackgroundJobStatus(job.status),
+        next_attempt_at=retry_at,
+        exhausted=outage.exhausted,
+        retry_delay=retry_delay,
+        escalation_request_id=outage.approval_request_id,
+    )
+
+
+def _project_dependency_failure(
+    run: HermesRun,
+    *,
+    target_status: HermesRunStatus,
+    error_code: str,
+    principal_id: str,
+    now: datetime,
+) -> None:
+    if run.status in {HermesRunStatus.STARTING, HermesRunStatus.RUNNING}:
+        run.status = target_status
+        run.failure_code = error_code
+        run.completed_at = now
+        run.actor_id = principal_id
+        run.updated_at = now
+        return
+    if run.status is target_status and run.failure_code == error_code:
+        return
+    raise HermesConflictError("terminal Hermes run cannot fail its dependency")
 
 
 def _run_tool_grant(session: Session, run: HermesRun) -> BackgroundJobToolGrant:

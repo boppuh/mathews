@@ -292,6 +292,39 @@ def test_hermes_outage_uses_bounded_background_job_retry(
         assert outage is not None and outage.service is DependencyService.HERMES
 
 
+def test_hermes_outage_projection_resumes_after_a_committed_job_failure(
+    hermes_harness: HermesHarness,
+) -> None:
+    service, run_id = _started(hermes_harness)
+    durable = BackgroundJobService(
+        hermes_harness.factory,
+        hermes_harness.store,
+        clock=lambda: _NOW,
+    ).fail_dependency_attempt(
+        hermes_harness.grant,
+        service=DependencyService.HERMES,
+        error_code="HERMES_UNAVAILABLE",
+    )
+
+    recovered = service.fail_dependency(
+        hermes_harness.grant,
+        run_id=run_id,
+        error_code="HERMES_UNAVAILABLE",
+    )
+    replayed = service.fail_dependency(
+        hermes_harness.grant,
+        run_id=run_id,
+        error_code="HERMES_UNAVAILABLE",
+    )
+
+    assert recovered == durable
+    assert replayed == durable
+    with hermes_harness.factory() as session:
+        run = session.get(HermesRun, run_id)
+        assert run is not None and run.status is HermesRunStatus.FAILED
+        assert session.scalar(select(func.count()).select_from(DependencyOutageAttempt)) == 1
+
+
 def test_dependency_failure_cannot_overwrite_a_successful_run(
     hermes_harness: HermesHarness,
 ) -> None:
