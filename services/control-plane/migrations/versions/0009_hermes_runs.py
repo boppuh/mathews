@@ -179,6 +179,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    connection = op.get_bind()
+    has_provenance = connection.execute(
+        sa.text(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM hermes_runs) "
+            "OR EXISTS (SELECT 1 FROM hermes_run_events) THEN 1 ELSE 0 END"
+        )
+    ).scalar_one()
+    if has_provenance:
+        raise RuntimeError(
+            "cannot downgrade while durable Hermes run provenance exists"
+        )
     if op.get_bind().dialect.name == "postgresql":
         op.execute(sa.text("DROP TRIGGER hermes_run_events_append_only ON hermes_run_events"))
         op.execute(sa.text("DROP FUNCTION reject_hermes_event_mutation()"))

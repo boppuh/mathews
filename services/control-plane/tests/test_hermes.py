@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,6 +12,7 @@ from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.background_jobs import (
     BackgroundJobService,
     JobLeaseGrant,
+    LeasedJobContext,
     RetryPolicy,
 )
 from mathews_control_plane.database import (
@@ -33,6 +35,8 @@ from mathews_control_plane.domain_models import (
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PromptTemplateVersion,
+    ReconciliationTarget,
+    ReconciliationTargetKind,
     Task,
     TaskEvent,
     TaskState,
@@ -43,6 +47,14 @@ from mathews_control_plane.hermes import (
     HermesEventType,
     HermesProviderEvent,
     HermesRunService,
+)
+from mathews_control_plane.hermes_adapter import (
+    HermesJobInput,
+    HermesJobPrompt,
+    HermesObservation,
+    HermesObservedStatus,
+    HermesRunJobHandler,
+    HermesRuntime,
 )
 from mathews_control_plane.prompt_compiler import (
     CompiledPrompt,
@@ -185,6 +197,11 @@ def test_run_correlation_and_prose_safe_event_normalization(
         task = session.get(Task, hermes_harness.task_id)
         task_event = session.get(TaskEvent, first.task_event_id)
         evidence = session.get(EvidenceRecord, first.evidence_id)
+        target = session.scalar(
+            select(ReconciliationTarget).where(
+                ReconciliationTarget.kind == ReconciliationTargetKind.HERMES_RUN
+            )
+        )
         assert run is not None
         assert run.job_id == hermes_harness.job_id
         assert run.lease_id == hermes_harness.grant.lease_id
@@ -195,6 +212,8 @@ def test_run_correlation_and_prose_safe_event_normalization(
         assert "declare the task complete" not in str(task_event.payload)
         assert task_event.payload["agent_prose_is_authoritative"] is False
         assert evidence is not None
+        assert target is not None
+        assert target.expected_payload["external_run_id"] == "run-1"
         loaded = load_evidence(session, hermes_harness.store, evidence)
         assert "declare the task complete" in str(loaded.content)
 
@@ -243,6 +262,43 @@ def test_out_of_order_and_cancelled_events_are_durably_fenced(
         assert task is not None and task.state is TaskState.IMPLEMENTING
 
 
+def test_out_of_order_event_can_be_replayed_after_the_gap_closes(
+    hermes_harness: HermesHarness,
+) -> None:
+    service, run_id = _started(hermes_harness)
+    second = HermesProviderEvent(
+        provider_event_id="event-2",
+        external_run_id="run-1",
+        sequence=2,
+        event_type=HermesEventType.HEARTBEAT,
+        payload={"state": "two"},
+    )
+
+    early = service.ingest(run_id, second)
+    first = service.ingest(
+        run_id,
+        HermesProviderEvent(
+            provider_event_id="event-1",
+            external_run_id="run-1",
+            sequence=1,
+            event_type=HermesEventType.HEARTBEAT,
+            payload={"state": "one"},
+        ),
+    )
+    recovered = service.ingest(run_id, second)
+
+    assert early.accepted is False and early.ignored_reason == "OUT_OF_ORDER"
+    assert first.accepted is True
+    assert recovered.accepted is True
+    with hermes_harness.factory() as session:
+        events = tuple(
+            session.scalars(
+                select(HermesRunEvent).order_by(HermesRunEvent.provider_sequence)
+            )
+        )
+        assert [event.provider_sequence for event in events] == [1, 2]
+
+
 def test_completion_updates_run_but_never_task_state(
     hermes_harness: HermesHarness,
 ) -> None:
@@ -264,6 +320,27 @@ def test_completion_updates_run_but_never_task_state(
         task = session.get(Task, hermes_harness.task_id)
         assert run is not None and run.status is HermesRunStatus.SUCCEEDED
         assert task is not None and task.state is TaskState.IMPLEMENTING
+
+
+def test_unsafe_provider_failure_code_uses_the_durable_fallback(
+    hermes_harness: HermesHarness,
+) -> None:
+    service, run_id = _started(hermes_harness)
+    result = service.ingest(
+        run_id,
+        HermesProviderEvent(
+            provider_event_id="failure-1",
+            external_run_id="run-1",
+            sequence=1,
+            event_type=HermesEventType.FAILED,
+            payload={"error_code": "model.rate-limit"},
+        ),
+    )
+
+    assert result.accepted is True
+    with hermes_harness.factory() as session:
+        run = session.get(HermesRun, run_id)
+        assert run is not None and run.failure_code == "HERMES_RUN_FAILED"
 
 
 def test_hermes_outage_uses_bounded_background_job_retry(
@@ -421,3 +498,56 @@ def test_unapproved_prompt_cannot_obtain_a_tool_grant(
 
     with hermes_harness.factory() as session:
         assert session.scalar(select(func.count()).select_from(BackgroundJobToolGrant)) == 0
+
+
+class _CompletingRuntime:
+    def start(self, **_kwargs: object) -> str:
+        return "worker-run-1"
+
+    def observe(self, external_run_id: str) -> HermesObservation:
+        return HermesObservation(
+            external_run_id,
+            HermesObservedStatus.COMPLETED,
+            {"run_id": external_run_id, "status": "completed", "output": "done"},
+        )
+
+    def stop(self, _external_run_id: str) -> None:
+        raise AssertionError("completed run must not be stopped")
+
+    def reconcile(self, **_kwargs: object) -> object:
+        raise AssertionError("startup reconciliation is not used by the handler")
+
+
+def test_registered_worker_handler_executes_a_hermes_run(
+    hermes_harness: HermesHarness,
+) -> None:
+    prompt = HermesJobPrompt(
+        task_id=hermes_harness.prompt.task_id,
+        role=hermes_harness.prompt.role,
+        template_id=hermes_harness.prompt.template_id,
+        template_version=hermes_harness.prompt.template_version,
+        policy_version_id=hermes_harness.prompt.policy_version_id,
+        evaluation_label=hermes_harness.prompt.evaluation_label,
+        content=hermes_harness.prompt.content,
+        evidence_ids=hermes_harness.prompt.evidence_ids,
+    )
+    grant = replace(
+        hermes_harness.grant,
+        input_payload=HermesJobInput(prompt=prompt).model_dump(mode="json"),
+    )
+    context = LeasedJobContext(
+        BackgroundJobService(hermes_harness.factory, hermes_harness.store, clock=lambda: _NOW),
+        grant,
+    )
+    result = HermesRunJobHandler(
+        hermes_harness.factory,
+        hermes_harness.store,
+        cast(HermesRuntime, _CompletingRuntime()),
+        sleeper=lambda _seconds: None,
+        clock=lambda: _NOW,
+    )(context)
+
+    assert result["status"] == "SUCCEEDED"
+    with hermes_harness.factory() as session:
+        run = session.scalar(select(HermesRun))
+        assert run is not None and run.status is HermesRunStatus.SUCCEEDED

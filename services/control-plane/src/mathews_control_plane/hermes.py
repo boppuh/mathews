@@ -31,12 +31,16 @@ from mathews_control_plane.domain_models import (
     BackgroundJobToolGrant,
     DependencyOutageAttempt,
     DependencyService,
+    EvidenceRecord,
     HermesRun,
     HermesRunEvent,
     HermesRunStatus,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PromptTemplateVersion,
+    ReconciliationStatus,
+    ReconciliationTarget,
+    ReconciliationTargetKind,
     Task,
     TaskEvent,
     TaskEventEvidenceReference,
@@ -46,6 +50,7 @@ from mathews_control_plane.evidence import (
     EvidenceRetentionClass,
     EvidenceSourceKind,
     capture_evidence,
+    load_evidence,
 )
 from mathews_control_plane.prompt_compiler import CompiledPrompt
 
@@ -145,6 +150,42 @@ class HermesRunService:
             )
             if existing_attempt is not None and existing_attempt.id != run_id:
                 raise HermesConflictError("Hermes job attempt already has a run")
+        now = _as_utc(self._clock())
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            job, lease = _current_lease(session, grant, now)
+            existing = session.get(HermesRun, run_id)
+            if existing is not None:
+                if not _run_matches(existing, grant, prompt):
+                    raise HermesConflictError("Hermes run id conflicts")
+                status = HermesRunStatus(existing.status)
+                replayed = True
+            else:
+                _validate_prompt(session, prompt, owner_id=job.owner_id)
+                run = HermesRun(
+                    id=run_id,
+                    task_id=job.task_id,
+                    job_id=job.id,
+                    lease_id=lease.id,
+                    fencing_token=lease.fencing_token,
+                    attempt=grant.attempt,
+                    prompt_template_version_id=prompt.template_id,
+                    policy_version_id=prompt.policy_version_id,
+                    evaluation_label=prompt.evaluation_label,
+                    prompt_fingerprint=_prompt_fingerprint(prompt),
+                    status=HermesRunStatus.STARTING,
+                    last_event_sequence=0,
+                    started_at=now,
+                    owner_id=job.owner_id,
+                    actor_id=self._principal_id,
+                    root_correlation_id=job.root_correlation_id,
+                    causation_id=lease.id,
+                    parent_correlation_id=job.id,
+                )
+                session.add(run)
+                session.flush()
+                status = HermesRunStatus.STARTING
+                replayed = False
         tool = BackgroundJobService(
             self._factory,
             self._store,
@@ -155,44 +196,7 @@ class HermesRunService:
             grant_key=f"hermes:{run_id}",
             capability_scope={"run_id": str(run_id), "task_id": str(grant.task_id)},
         )
-        now = _as_utc(self._clock())
-        with self._factory() as session, session.begin():
-            _begin_serialized(session)
-            job, lease = _current_lease(session, grant, now)
-            existing = session.get(HermesRun, run_id)
-            if existing is not None:
-                if not _run_matches(existing, grant, prompt):
-                    raise HermesConflictError("Hermes run id conflicts")
-                return HermesRunResult(
-                    run_id=existing.id,
-                    status=HermesRunStatus(existing.status),
-                    tool_grant_id=tool.grant_id,
-                    replayed=True,
-                )
-            _validate_prompt(session, prompt, owner_id=job.owner_id)
-            run = HermesRun(
-                id=run_id,
-                task_id=job.task_id,
-                job_id=job.id,
-                lease_id=lease.id,
-                fencing_token=lease.fencing_token,
-                attempt=grant.attempt,
-                prompt_template_version_id=prompt.template_id,
-                policy_version_id=prompt.policy_version_id,
-                evaluation_label=prompt.evaluation_label,
-                prompt_fingerprint=_prompt_fingerprint(prompt),
-                status=HermesRunStatus.STARTING,
-                last_event_sequence=0,
-                started_at=now,
-                owner_id=job.owner_id,
-                actor_id=self._principal_id,
-                root_correlation_id=job.root_correlation_id,
-                causation_id=lease.id,
-                parent_correlation_id=job.id,
-            )
-            session.add(run)
-            session.flush()
-            return HermesRunResult(run.id, run.status, tool.grant_id, False)
+        return HermesRunResult(run_id, status, tool.grant_id, replayed)
 
     def record_started(
         self,
@@ -218,6 +222,41 @@ class HermesRunService:
             run.status = HermesRunStatus.RUNNING
             run.actor_id = self._principal_id
             run.updated_at = now
+            expected = {
+                "external_run_id": external,
+                "fencing_token": run.fencing_token,
+                "job_id": str(run.job_id),
+                "lease_id": str(run.lease_id),
+                "run_id": str(run.id),
+            }
+            target_key = f"hermes:{run.id}"
+            target = session.scalar(
+                select(ReconciliationTarget).where(
+                    ReconciliationTarget.kind == ReconciliationTargetKind.HERMES_RUN,
+                    ReconciliationTarget.target_key == target_key,
+                )
+            )
+            fingerprint = sha256(_canonical_json(expected).encode()).hexdigest()
+            if target is None:
+                session.add(
+                    ReconciliationTarget(
+                        task_id=run.task_id,
+                        job_id=run.job_id,
+                        kind=ReconciliationTargetKind.HERMES_RUN,
+                        target_key=target_key,
+                        expected_payload=expected,
+                        expected_fingerprint=fingerprint,
+                        status=ReconciliationStatus.PENDING,
+                        reconciliation_version=0,
+                        owner_id=run.owner_id,
+                        actor_id=self._principal_id,
+                        root_correlation_id=run.root_correlation_id,
+                        causation_id=run.id,
+                        parent_correlation_id=run.job_id,
+                    )
+                )
+            elif target.expected_fingerprint != fingerprint:
+                raise HermesConflictError("Hermes reconciliation target conflicts")
             session.flush()
             return HermesRunResult(run.id, run.status, tool.id, False)
 
@@ -258,33 +297,54 @@ class HermesRunService:
             )
             if sequence_delivery is not None:
                 raise HermesConflictError("Hermes provider sequence conflicts")
-            captured = capture_evidence(
-                session,
-                self._store,
-                payload={
-                    "run_id": str(run.id),
-                    "external_run_id": event.external_run_id,
-                    "provider_event_id": event.provider_event_id,
-                    "sequence": event.sequence,
-                    "event_type": event.event_type.value,
-                    "payload": payload,
-                },
-                media_type="application/json",
-                source_kind=EvidenceSourceKind.RESULT,
-                evidence_type="hermes-event",
-                origin="hermes:provider-event",
-                access_classification=EvidenceAccessClass.TASK_OWNER,
-                retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
-                owner_id=run.owner_id,
-                actor_id=self._principal_id,
-                root_correlation_id=run.root_correlation_id,
-                task_id=run.task_id,
-                causation_id=run.id,
-                parent_correlation_id=run.job_id,
-                evidence_id=evidence_id,
-                captured_at=now,
-            )
+            evidence_payload = {
+                "run_id": str(run.id),
+                "external_run_id": event.external_run_id,
+                "provider_event_id": event.provider_event_id,
+                "sequence": event.sequence,
+                "event_type": event.event_type.value,
+                "payload": payload,
+                "payload_fingerprint": payload_fingerprint,
+            }
+            evidence = session.get(EvidenceRecord, evidence_id)
+            if evidence is None:
+                evidence = capture_evidence(
+                    session,
+                    self._store,
+                    payload=evidence_payload,
+                    media_type="application/json",
+                    source_kind=EvidenceSourceKind.RESULT,
+                    evidence_type="hermes-event",
+                    origin="hermes:provider-event",
+                    access_classification=EvidenceAccessClass.TASK_OWNER,
+                    retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+                    owner_id=run.owner_id,
+                    actor_id=self._principal_id,
+                    root_correlation_id=run.root_correlation_id,
+                    task_id=run.task_id,
+                    causation_id=run.id,
+                    parent_correlation_id=run.job_id,
+                    evidence_id=evidence_id,
+                    captured_at=now,
+                ).record
+            else:
+                loaded_content = load_evidence(session, self._store, evidence).content
+                if (
+                    not isinstance(loaded_content, dict)
+                    or loaded_content.get("payload_fingerprint") != payload_fingerprint
+                ):
+                    raise HermesConflictError("Hermes provider event evidence conflicts")
             ignored = _ignored_reason(session, run, event, now)
+            if ignored == "OUT_OF_ORDER":
+                return HermesEventResult(
+                    run_id=run.id,
+                    event_id=event_id,
+                    accepted=False,
+                    ignored_reason=ignored,
+                    task_event_id=None,
+                    evidence_id=evidence.id,
+                    replayed=False,
+                )
             task_event: TaskEvent | None = None
             if ignored is None:
                 task_event = TaskEvent(
@@ -298,7 +358,7 @@ class HermesRunService:
                         "fencing_token": run.fencing_token,
                         "provider_sequence": event.sequence,
                         "event_type": event.event_type.value,
-                        "evidence_id": str(captured.record.id),
+                        "evidence_id": str(evidence.id),
                         "agent_prose_is_authoritative": False,
                     },
                     occurred_at=now,
@@ -314,7 +374,7 @@ class HermesRunService:
                     TaskEventEvidenceReference(
                         task_id=run.task_id,
                         task_event_id=task_event.id,
-                        evidence_id=captured.record.id,
+                        evidence_id=evidence.id,
                         position=1,
                         owner_id=run.owner_id,
                         actor_id=self._principal_id,
@@ -343,7 +403,7 @@ class HermesRunService:
                 provider_sequence=event.sequence,
                 event_type=event.event_type.value,
                 payload_fingerprint=payload_fingerprint,
-                payload_evidence_id=captured.record.id,
+                payload_evidence_id=evidence.id,
                 accepted=ignored is None,
                 ignored_reason=ignored,
                 task_event_id=None if task_event is None else task_event.id,
@@ -705,7 +765,12 @@ def _bounded_payload(value: Mapping[str, object]) -> dict[str, object]:
 
 def _payload_error_code(payload: Mapping[str, object]) -> str:
     value = payload.get("error_code", "HERMES_RUN_FAILED")
-    return _error_code(value) if isinstance(value, str) else "HERMES_RUN_FAILED"
+    if not isinstance(value, str):
+        return "HERMES_RUN_FAILED"
+    try:
+        return _error_code(value)
+    except HermesConflictError:
+        return "HERMES_RUN_FAILED"
 
 
 def _event_result(event: HermesRunEvent, *, replayed: bool) -> HermesEventResult:
