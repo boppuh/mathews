@@ -885,6 +885,57 @@ def test_candidate_commit_is_pushable_after_post_ref_process_interruption(
     assert pushed["remote_head_after"] == candidate_sha
 
 
+def test_candidate_commit_rolls_back_manifest_when_ref_update_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+    original_run_git = lifecycle._run_git
+    rejected = False
+
+    def reject_ref_update(
+        repository_root: Path,
+        *arguments: str,
+        failure_code: str,
+        extra_environment: Mapping[str, str] | None = None,
+    ) -> str:
+        nonlocal rejected
+        if arguments[:2] == ("update-ref", "HEAD") and not rejected:
+            rejected = True
+            raise WorkspaceLifecycleError("GIT_COMMIT_FAILED")
+        return original_run_git(
+            repository_root,
+            *arguments,
+            failure_code=failure_code,
+            extra_environment=extra_environment,
+        )
+
+    monkeypatch.setattr(lifecycle, "_run_git", reject_ref_update)
+    with pytest.raises(WorkspaceLifecycleError, match="GIT_COMMIT_FAILED"):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            message="Rejected candidate",
+        )
+    monkeypatch.setattr(lifecycle, "_run_git", original_run_git)
+
+    assert _git(workspace, "rev-parse", "HEAD") == base
+    committed = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=base,
+        message="Retried candidate",
+    )
+    assert committed["head_sha"] != base
+
+
 def test_candidate_push_rejects_the_frozen_base(
     tmp_path: Path,
 ) -> None:

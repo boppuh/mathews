@@ -268,20 +268,38 @@ class GitWorkspaceLifecycle:
                 candidate_head_sha=candidate_head_sha,
             )
             self._write_ownership(manifest_path, candidate_ownership)
-            self._run_git(
-                workspace_path,
-                "read-tree",
-                candidate_head_sha,
-                failure_code="GIT_COMMIT_FAILED",
-            )
-            self._run_git(
-                workspace_path,
-                "update-ref",
-                "HEAD",
-                candidate_head_sha,
-                expected_head_sha,
-                failure_code="GIT_COMMIT_FAILED",
-            )
+            try:
+                self._run_git(
+                    workspace_path,
+                    "read-tree",
+                    candidate_head_sha,
+                    failure_code="GIT_COMMIT_FAILED",
+                )
+                self._run_git(
+                    workspace_path,
+                    "update-ref",
+                    "HEAD",
+                    candidate_head_sha,
+                    expected_head_sha,
+                    failure_code="GIT_COMMIT_FAILED",
+                )
+            except WorkspaceLifecycleError:
+                current_head_sha = self._git_object(
+                    workspace_path,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                    failure_code="GIT_COMMIT_FAILED",
+                )
+                if current_head_sha == expected_head_sha:
+                    self._run_git(
+                        workspace_path,
+                        "read-tree",
+                        expected_head_sha,
+                        failure_code="GIT_COMMIT_FAILED",
+                    )
+                    self._write_ownership(manifest_path, ownership)
+                raise
             after = self._git_boundary_state(ownership, configuration)
             parents = after["parent_shas"]
             if (
