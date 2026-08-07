@@ -635,17 +635,15 @@ class ConfiguredOperationRunner:
         try:
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 if simulator_id is not None and e2e_flow is not None:
-                    if effect_started is not None:
-                        effect_started()
-                        effect_started = None
-                    if effect_yielded is not None:
-                        effect_yielded()
-                        effect_yielded = None
                     self._prepare_simulator(
                         workspace,
                         simulator_id,
+                        effect_started=effect_started,
+                        effect_yielded=effect_yielded,
                         assert_authorized=assert_authorized,
                     )
+                    effect_started = None
+                    effect_yielded = None
                 process = subprocess.Popen(
                     argv,
                     cwd=workspace,
@@ -732,6 +730,8 @@ class ConfiguredOperationRunner:
         workspace: Path,
         simulator_id: str,
         *,
+        effect_started: Callable[[], None] | None,
+        effect_yielded: Callable[[], None] | None,
         assert_authorized: Callable[[], None] | None,
     ) -> None:
         """Apply the fixed clean-state sequence before xcodebuild installs/tests."""
@@ -743,23 +743,53 @@ class ConfiguredOperationRunner:
             (("xcrun", "simctl", "bootstatus", simulator_id, "-b"), False, 120),
         )
         environment = {"LANG": "C", "LC_ALL": "C", "PATH": os.defpath}
+        marked_effect = False
         for command, allow_failure, timeout in commands:
             if self._shutdown.is_set():
                 raise ConfiguredExecutionError("HOST_SHUTTING_DOWN")
             if assert_authorized is not None:
                 assert_authorized()
             try:
-                result = subprocess.run(
+                process = subprocess.Popen(
                     command,
                     cwd=workspace,
-                    check=False,
-                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     env=environment,
-                    timeout=timeout,
+                    start_new_session=True,
                 )
-            except (OSError, subprocess.SubprocessError):
+            except OSError:
                 raise ConfiguredExecutionError("SIMULATOR_PREPARATION_FAILED") from None
-            if result.returncode != 0 and not allow_failure:
+            with self._active_lock:
+                self._active_processes[process.pid] = process
+            try:
+                if not marked_effect:
+                    try:
+                        if effect_started is not None:
+                            effect_started()
+                        if effect_yielded is not None:
+                            effect_yielded()
+                    except Exception:
+                        self._terminate(process)
+                        raise
+                    marked_effect = True
+                if self._shutdown.is_set():
+                    self._terminate(process)
+                    raise ConfiguredExecutionError("HOST_SHUTTING_DOWN")
+                try:
+                    returncode = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self._terminate(process)
+                    process.wait(timeout=2)
+                    raise ConfiguredExecutionError(
+                        "SIMULATOR_PREPARATION_FAILED"
+                    ) from None
+            finally:
+                with self._active_lock:
+                    self._active_processes.pop(process.pid, None)
+                    self._shutdown_process_ids.discard(process.pid)
+            if returncode != 0 and not allow_failure:
                 raise ConfiguredExecutionError("SIMULATOR_PREPARATION_FAILED")
         # The configured `xcodebuild test` invocation performs INSTALL_CANDIDATE
         # before launching the single pinned XCTest journey.

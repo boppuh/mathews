@@ -447,16 +447,30 @@ def test_simulator_preparation_applies_fixed_clean_state_sequence(
     )
     commands: list[tuple[str, ...]] = []
     authorization_checks: list[str] = []
+    events: list[str] = []
 
-    def run(command: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0, b"", b"")
+    class FakeProcess:
+        def __init__(
+            self,
+            command: tuple[str, ...],
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            self.pid = 10_000 + len(commands)
+            commands.append(command)
+            events.append("spawned")
 
-    monkeypatch.setattr(subprocess, "run", run)
+        def wait(self, *, timeout: float) -> int:
+            assert timeout > 0
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", FakeProcess)
 
     runner._prepare_simulator(
         workspace,
         "simulator-1",
+        effect_started=lambda: events.append("started"),
+        effect_yielded=lambda: events.append("yielded"),
         assert_authorized=lambda: authorization_checks.append("checked"),
     )
 
@@ -467,6 +481,41 @@ def test_simulator_preparation_applies_fixed_clean_state_sequence(
         ("xcrun", "simctl", "bootstatus", "simulator-1", "-b"),
     ]
     assert authorization_checks == ["checked"] * 4
+    assert events[:3] == ["spawned", "started", "yielded"]
+    assert events.count("started") == 1
+    assert events.count("yielded") == 1
+
+
+def test_simulator_spawn_failure_precedes_effect_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = ConfiguredOperationRunner(
+        cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
+        HostArtifactStore((tmp_path / "store").resolve()),
+    )
+    effects: list[str] = []
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> None:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_spawn)
+
+    with pytest.raises(
+        ConfiguredExecutionError,
+        match="SIMULATOR_PREPARATION_FAILED",
+    ):
+        runner._prepare_simulator(
+            workspace,
+            "simulator-1",
+            effect_started=lambda: effects.append("started"),
+            effect_yielded=lambda: effects.append("yielded"),
+            assert_authorized=None,
+        )
+
+    assert effects == []
 
 
 def test_e2e_inputs_are_rehashed_and_exact_before_launch(tmp_path: Path) -> None:
