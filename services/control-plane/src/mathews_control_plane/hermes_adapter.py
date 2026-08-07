@@ -10,9 +10,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Protocol, cast
+from typing import NoReturn, Protocol, cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import Request, urlopen
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -132,7 +132,9 @@ class HermesHttpRuntime:
         opener: Callable[..., object] = urlopen,
     ) -> None:
         normalized = endpoint.rstrip("/") + "/"
-        if not normalized.startswith(("http://", "https://")):
+        parsed = urlsplit(normalized)
+        loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
             raise HermesRuntimeError("HERMES_ENDPOINT_INVALID")
         self._endpoint = normalized
         self._api_key_ref = api_key_ref
@@ -174,7 +176,11 @@ class HermesHttpRuntime:
             observed_status = HermesObservedStatus(status.lower())
         except ValueError:
             raise HermesRuntimeError("HERMES_RESPONSE_INVALID") from None
-        return HermesObservation(external_run_id, observed_status, response)
+        return HermesObservation(
+            external_run_id,
+            observed_status,
+            _observation_payload(response),
+        )
 
     def stop(self, external_run_id: str) -> None:
         response = self._request(
@@ -347,6 +353,14 @@ class HermesRunJobHandler:
         )
         prepared = self._runs.prepare(context.grant, run_id=run_id, prompt=prompt)
         external_run_id = self._external_run_id(run_id)
+        if prepared.status is HermesRunStatus.SUCCEEDED:
+            return {"hermes_run_id": str(run_id), "status": "SUCCEEDED"}
+        if prepared.status in {
+            HermesRunStatus.FAILED,
+            HermesRunStatus.CANCELLED,
+            HermesRunStatus.TIMED_OUT,
+        }:
+            raise TerminalBackgroundJobError("HERMES_RUN_TERMINAL")
         if prepared.status is HermesRunStatus.STARTING:
             try:
                 started_id = self._runtime.start(
@@ -389,7 +403,10 @@ class HermesRunJobHandler:
                 self._runs.cancel(run_id)
                 raise TerminalBackgroundJobError("HERMES_RUN_CANCELLED")
             if self._monotonic() >= deadline:
-                self._runtime.stop(external_run_id)
+                try:
+                    self._runtime.stop(external_run_id)
+                except HermesRuntimeError:
+                    pass
                 self._runs.fail_dependency(
                     context.grant,
                     run_id=run_id,
@@ -436,7 +453,7 @@ class HermesRunJobHandler:
         context: LeasedJobContext,
         run_id: UUID,
         error_code: str,
-    ) -> None:
+    ) -> NoReturn:
         self._runs.fail_dependency(
             context.grant,
             run_id=run_id,
@@ -453,3 +470,27 @@ class HermesRunJobHandler:
             self._runs.cancel(run_id)
         except RuntimeError:
             pass
+
+
+def _observation_payload(response: Mapping[str, object]) -> dict[str, object]:
+    """Project bounded run status without forwarding an unlimited response body."""
+
+    payload: dict[str, object] = {
+        "run_id": response.get("run_id"),
+        "status": response.get("status"),
+    }
+    output = response.get("output")
+    if isinstance(output, str):
+        payload["output"] = output[:8_000]
+        payload["output_truncated"] = len(output) > 8_000
+    error = response.get("error")
+    if isinstance(error, str):
+        payload["error"] = error[:1_000]
+    usage = response.get("usage")
+    if isinstance(usage, dict):
+        payload["usage"] = {
+            key: value
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+            if isinstance((value := usage.get(key)), (int, float))
+        }
+    return payload

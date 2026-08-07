@@ -610,8 +610,17 @@ def test_registered_worker_handler_executes_a_hermes_run(
         sleeper=lambda _seconds: None,
         clock=lambda: _NOW,
     )(context)
+    replay_context = LeasedJobContext(context.service, grant)
+    replayed = HermesRunJobHandler(
+        hermes_harness.factory,
+        hermes_harness.store,
+        cast(HermesRuntime, _CompletingRuntime()),
+        sleeper=lambda _seconds: None,
+        clock=lambda: _NOW,
+    )(replay_context)
 
     assert result["status"] == "SUCCEEDED"
+    assert replayed == result
     with hermes_harness.factory() as session:
         run = session.scalar(select(HermesRun))
         assert run is not None and run.status is HermesRunStatus.SUCCEEDED
