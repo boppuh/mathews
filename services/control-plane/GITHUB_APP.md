@@ -88,4 +88,13 @@ authorize merge and release APIs. The host resolves the versioned
 configuration's opaque Keychain reference and consumes the value through an
 anonymous file descriptor plus an ephemeral credential helper; it never becomes
 an agent tool argument or host result. Draft-PR and observation calls remain
-inside the GitHub adapter.
+inside the GitHub adapter. For the current repository, the operator creates a
+generic-password Keychain item with service `com.boppuh.mathews.git` and account
+`mathews-push`. Its value is a fine-grained token selected for only the
+configured repository with repository Contents read/write permission and no
+unrelated permissions. The matching
+`keychain://com.boppuh.mathews.git/mathews-push` reference must be both
+`git_settings.push_credential` and an entry in the configuration's
+`secret_references`. Existing configuration versions that predate this field
+remain readable, but `git.push` rejects them until an operator creates a new
+version with an explicitly selected credential.

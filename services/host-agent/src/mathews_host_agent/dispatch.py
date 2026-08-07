@@ -520,7 +520,10 @@ def default_operation_registry(
     ) -> dict[str, JsonValue]:
         authority = _task_authority(context)
         configuration = _configuration_argument(authority, arguments)
-        credential = credential_provider.get(configuration.git.push_credential)
+        credential_reference = configuration.git.push_credential
+        if credential_reference is None:
+            raise HostOperationRejected("GIT_PUSH_CREDENTIAL_REQUIRED")
+        credential = credential_provider.get(credential_reference)
         try:
             result = context.perform_authorized_effect(
                 lambda: workspace_lifecycle.push_candidate(

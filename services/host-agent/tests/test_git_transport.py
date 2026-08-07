@@ -9,12 +9,26 @@ from mathews_host_agent.git_transport import (
 )
 
 
-def _fake_git(tmp_path: Path, *, expected_sha: str, token: str) -> tuple[Path, Path]:
+def _fake_git(
+    tmp_path: Path,
+    *,
+    expected_sha: str,
+    token: str,
+    mode: str = "success",
+) -> tuple[Path, Path]:
     binary_directory = tmp_path / "bin"
     binary_directory.mkdir()
     state_path = tmp_path / "remote-head"
     log_path = tmp_path / "git-arguments"
     script = binary_directory / "git"
+    reported_sha = "b" * 40 if mode == "divergent" else expected_sha
+    push_result = {
+        "push_rejected": "    exit 1",
+        "transport_failure": "    exit 128",
+    }.get(
+        mode,
+        f"    printf '{expected_sha}' > {shlex.quote(str(state_path))}",
+    )
     script.write_text(
         "\n".join(
             (
@@ -23,7 +37,7 @@ def _fake_git(tmp_path: Path, *, expected_sha: str, token: str) -> tuple[Path, P
                 "case \"$*\" in",
                 "  *ls-remote*)",
                 f"    if [ -f {shlex.quote(str(state_path))} ]; then",
-                f"      printf '{expected_sha}\\trefs/heads/mathews/test\\n'",
+                f"      printf '{reported_sha}\\trefs/heads/mathews/test\\n'",
                 "      exit 0",
                 "    fi",
                 "    exit 2",
@@ -33,7 +47,7 @@ def _fake_git(tmp_path: Path, *, expected_sha: str, token: str) -> tuple[Path, P
                 "    password=$(\"$GIT_ASKPASS\" \"Password for GitHub\") || exit 4",
                 '    [ "$username" = "x-access-token" ] || exit 5',
                 f"    [ \"$password\" = {shlex.quote(token)} ] || exit 6",
-                f"    printf '{expected_sha}' > {shlex.quote(str(state_path))}",
+                push_result,
                 "    exit 0",
                 "    ;;",
                 "esac",
@@ -105,6 +119,89 @@ def test_push_rejects_invalid_secret_before_creating_helper_material(
             branch_name="mathews/test",
             expected_sha="a" * 40,
             credential=SecretValue("token with spaces"),
+        )
+
+    assert not helper_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_error"),
+    (
+        ("push_rejected", "GIT_PUSH_REJECTED"),
+        ("transport_failure", "GIT_TRANSPORT_UNAVAILABLE"),
+        ("divergent", "REMOTE_HEAD_MISMATCH"),
+    ),
+)
+def test_push_failure_paths_remove_ephemeral_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_error: str,
+) -> None:
+    expected_sha = "a" * 40
+    token = "ephemeral-push-token"
+    binary_directory, _log_path = _fake_git(
+        tmp_path,
+        expected_sha=expected_sha,
+        token=token,
+        mode=mode,
+    )
+    monkeypatch.setenv("PATH", f"{binary_directory}:/usr/bin:/bin")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    helper_root = (tmp_path / "helpers").resolve()
+
+    with pytest.raises(GitTransportError, match=expected_error):
+        GitCredentialPushTransport(helper_root).push(
+            workspace_path=workspace,
+            remote_url="https://github.com/boppuh/mathews.git",
+            branch_name="mathews/test",
+            expected_sha=expected_sha,
+            credential=SecretValue(token),
+        )
+
+    assert list(helper_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("remote_url", "branch_name", "expected_sha", "expected_error"),
+    (
+        (
+            "https://github.com/boppuh/mathews.git",
+            "mathews/test",
+            "not-a-sha",
+            "INVALID_EXPECTED_HEAD",
+        ),
+        (
+            "--upload-pack=malicious",
+            "mathews/test",
+            "a" * 40,
+            "INVALID_REMOTE_URL",
+        ),
+        (
+            "https://github.com/boppuh/mathews.git",
+            "--force",
+            "a" * 40,
+            "INVALID_BRANCH_NAME",
+        ),
+    ),
+)
+def test_transport_rejects_unsafe_inputs_before_creating_helper_material(
+    tmp_path: Path,
+    remote_url: str,
+    branch_name: str,
+    expected_sha: str,
+    expected_error: str,
+) -> None:
+    helper_root = (tmp_path / "helpers").resolve()
+
+    with pytest.raises(GitTransportError, match=expected_error):
+        GitCredentialPushTransport(helper_root).push(
+            workspace_path=tmp_path,
+            remote_url=remote_url,
+            branch_name=branch_name,
+            expected_sha=expected_sha,
+            credential=SecretValue("ephemeral-push-token"),
         )
 
     assert not helper_root.exists()

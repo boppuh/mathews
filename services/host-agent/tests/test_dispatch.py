@@ -1035,6 +1035,63 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
     assert calls == ["inspect", "commit", "credential", "push"]
 
 
+def test_git_push_rejects_legacy_configuration_without_a_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LegacyGit:
+        push_credential = None
+
+    class LegacyConfiguration:
+        repository_key = "boppuh/mathews"
+        digest = "sha256:" + "1" * 64
+        git = LegacyGit()
+
+    class LegacyConfigurationFactory:
+        @staticmethod
+        def from_dict(
+            _configuration_id: UUID,
+            _value: object,
+        ) -> LegacyConfiguration:
+            return LegacyConfiguration()
+
+    monkeypatch.setattr(
+        dispatch_module,
+        "RepositoryConfiguration",
+        LegacyConfigurationFactory,
+    )
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=default_operation_registry(),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(
+            authenticator.sign_request(
+                _request(
+                    name="git.push",
+                    authority=_task_authority(),
+                    idempotency_key="legacy-git-push",
+                    arguments={
+                        "configuration": {"legacy": True},
+                        "expected_head_sha": "a" * 40,
+                    },
+                )
+            )
+        )
+    )
+
+    assert response.status is HostResponseStatus.REJECTED
+    assert response.code == "GIT_PUSH_CREDENTIAL_REQUIRED"
+
+
 @pytest.mark.parametrize(
     ("name", "arguments"),
     (

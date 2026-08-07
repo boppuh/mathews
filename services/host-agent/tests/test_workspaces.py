@@ -1,6 +1,7 @@
 import os
 import subprocess
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
@@ -25,33 +26,42 @@ class _Repository:
 
 
 @dataclass(frozen=True)
-class _Git:
-    default_base_ref: str = "main"
-    task_branch_template: str = "mathews/{task_id}"
-    remote_name: str = "origin"
-    push_credential: SecretReference = SecretReference(
-        provider="keychain",
-        service="mathews",
-        account="git-push",
-    )
-    author: object = None
-    committer: object = None
-
-
-@dataclass(frozen=True)
 class _Identity:
     name: str
     email: str
 
 
 @dataclass(frozen=True)
+class _Git:
+    default_base_ref: str = "main"
+    task_branch_template: str = "mathews/{task_id}"
+    remote_name: str = "origin"
+    push_credential: SecretReference = field(
+        default_factory=lambda: SecretReference(
+            provider="keychain",
+            service="mathews",
+            account="git-push",
+        )
+    )
+    author: _Identity = field(
+        default_factory=lambda: _Identity(
+            "Configured Author",
+            "author@example.invalid",
+        )
+    )
+    committer: _Identity = field(
+        default_factory=lambda: _Identity(
+            "Configured Committer",
+            "committer@example.invalid",
+        )
+    )
+
+
+@dataclass(frozen=True)
 class _Configuration:
     repository_key: str
     repository: _Repository
-    git: _Git = _Git(
-        author=_Identity("Configured Author", "author@example.invalid"),
-        committer=_Identity("Configured Committer", "committer@example.invalid"),
-    )
+    git: _Git = field(default_factory=_Git)
     prohibited_paths: tuple[str, ...] = (".git", ".env")
 
 
@@ -415,7 +425,103 @@ def test_candidate_commit_rejects_head_drift_and_prohibited_paths(
             expected_head_sha=base,
             message="Unsafe candidate",
         )
+    (workspace / ".env").unlink()
+    (workspace / ".ENV").write_text("SECRET=value\n")
+    with pytest.raises(WorkspaceLifecycleError, match="PROHIBITED_PATH_CHANGED"):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            message="Case-variant unsafe candidate",
+        )
     assert _git(workspace, "rev-parse", "HEAD") == base
+
+
+def test_candidate_commit_rejects_unconfigured_head_identity(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "foreign.txt").write_text("foreign\n")
+    _git(workspace, "add", "foreign.txt")
+    _git(
+        workspace,
+        "-c",
+        "user.name=Foreign Author",
+        "-c",
+        "user.email=foreign@example.invalid",
+        "commit",
+        "-m",
+        "foreign candidate",
+    )
+    foreign_head = _git(workspace, "rev-parse", "HEAD")
+    (workspace / "feature.txt").write_text("candidate\n")
+
+    with pytest.raises(WorkspaceLifecycleError, match="COMMIT_IDENTITY_MISMATCH"):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=foreign_head,
+            message="Add candidate feature",
+        )
+
+
+def test_candidate_commit_revalidates_paths_after_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+    original_run_git = lifecycle._run_git
+
+    def inject_prohibited_path(
+        repository_root: Path,
+        *arguments: str,
+        failure_code: str,
+        extra_environment: Mapping[str, str] | None = None,
+    ) -> str:
+        if arguments[:2] == ("add", "--all"):
+            (workspace / ".ENV").write_text("SECRET=value\n")
+        return original_run_git(
+            repository_root,
+            *arguments,
+            failure_code=failure_code,
+            extra_environment=extra_environment,
+        )
+
+    monkeypatch.setattr(lifecycle, "_run_git", inject_prohibited_path)
+
+    with pytest.raises(WorkspaceLifecycleError, match="PROHIBITED_PATH_CHANGED"):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            message="Unsafe staged candidate",
+        )
+
+    assert _git(workspace, "rev-parse", "HEAD") == base
+
+
+def test_git_runner_rejects_restricted_environment_overrides(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+
+    with pytest.raises(WorkspaceLifecycleError, match="GIT_ENVIRONMENT_OVERRIDE"):
+        GitWorkspaceLifecycle._run_git_result(
+            repository,
+            "status",
+            extra_environment={"GIT_TERMINAL_PROMPT": "1"},
+        )
 
 
 def test_candidate_push_is_exact_non_force_idempotent_and_credential_free(
@@ -459,6 +565,7 @@ def test_candidate_push_is_exact_non_force_idempotent_and_credential_free(
     assert second["pushed"] is False
     assert len(transport.calls) == 2
     assert "transport-secret" not in repr(first)
+    assert configuration.git.push_credential is not None
     assert configuration.git.push_credential.uri not in repr(first)
 
 

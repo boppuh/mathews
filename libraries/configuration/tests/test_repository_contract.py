@@ -1,5 +1,6 @@
 import json
 from dataclasses import replace
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -474,7 +475,7 @@ def test_configuration_accepts_only_opaque_keychain_references() -> None:
         RepositoryConfiguration.from_dict(configuration.configuration_id, payload)
 
 
-def test_git_push_credential_must_be_an_explicit_opaque_configuration_reference() -> None:
+def test_configured_git_push_credential_must_be_an_explicit_opaque_reference() -> None:
     configuration = _configuration()
 
     with pytest.raises(RepositoryConfigurationError, match="Git push credential"):
@@ -490,6 +491,42 @@ def test_git_push_credential_must_be_an_explicit_opaque_configuration_reference(
                 push_credential=configuration.secret_references[0],
             ),
         )
+
+
+def test_legacy_configuration_without_push_credential_remains_readable() -> None:
+    configuration = _configuration()
+    payload = configuration.to_dict()
+    git_settings = cast(dict[str, object], payload["git_settings"])
+    push_reference = cast(str, git_settings.pop("push_credential"))
+    payload["secret_references"] = [
+        reference
+        for reference in cast(list[str], payload["secret_references"])
+        if reference != push_reference
+    ]
+
+    restored = RepositoryConfiguration.from_dict(
+        configuration.configuration_id,
+        payload,
+    )
+
+    assert restored.git.push_credential is None
+    assert restored.to_dict() == payload
+    assert (
+        RepositoryConfiguration.from_dict(
+            configuration.configuration_id,
+            restored.to_dict(),
+        ).digest
+        == restored.digest
+    )
+
+
+def test_push_credential_cannot_be_explicitly_null() -> None:
+    configuration = _configuration()
+    payload = configuration.to_dict()
+    cast(dict[str, object], payload["git_settings"])["push_credential"] = None
+
+    with pytest.raises(RepositoryConfigurationError, match="must be text"):
+        RepositoryConfiguration.from_dict(configuration.configuration_id, payload)
 
 
 def test_assertion_vocabulary_is_exactly_the_frozen_five_kinds() -> None:

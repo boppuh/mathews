@@ -36,11 +36,19 @@ task branch. No force, tag, merge, or release operation is available.
    signed host identity and stronger credential isolation.
 
 3. Create a second, distinct generic-password item for the repository's
-   `git_settings.push_credential` reference. Its value must authorize only the
-   configured repository and should be protected by repository branch rules.
-   Do not reuse the host HMAC, GitHub App, webhook, or E2E account credential.
+   `git_settings.push_credential` reference. For this repository, use service
+   `com.boppuh.mathews.git` and account `mathews-push`, and store a fine-grained
+   token selected for only the configured repository with repository Contents
+   read/write permission and no unrelated permissions. Include the opaque
+   reference in the repository configuration's `secret_references`. Do not
+   reuse the host HMAC, GitHub App, webhook, or E2E account credential.
 
-4. Configure the control plane with the host HMAC reference and socket path:
+4. Configure the repository's effective fetch and push remote as credential-free
+   HTTPS, for example `https://github.com/boppuh/mathews.git`. SSH/SCP remotes,
+   embedded credentials, queries, and fragments fail preflight. Re-point an
+   existing SSH remote before deployment.
+
+5. Configure the control plane with the host HMAC reference and socket path:
 
    ```dotenv
    MATHEWS_HOST_AUTH_KEY_REF=keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1

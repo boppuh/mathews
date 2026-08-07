@@ -231,6 +231,8 @@ class GitWorkspaceLifecycle:
                 ":/",
                 failure_code="GIT_STAGE_FAILED",
             )
+            staged_paths = self._staged_paths(ownership)
+            self._assert_paths_allowed(staged_paths, configuration)
             if self._quiet_git_clean(
                 workspace_path,
                 "diff",
@@ -502,6 +504,7 @@ class GitWorkspaceLifecycle:
             raise WorkspaceLifecycleError("BASE_NOT_ANCESTOR")
         if ancestry.returncode != 0:
             raise WorkspaceLifecycleError("COMMIT_ANCESTRY_UNAVAILABLE")
+        # Validate the effective push remote at every Git boundary.
         self._push_remote_url(ownership, configuration)
         metadata = self._run_git(
             Path(ownership.workspace_path),
@@ -558,14 +561,30 @@ class GitWorkspaceLifecycle:
             paths.update(path for path in output.split("\0") if path)
         return tuple(sorted(paths))
 
+    def _staged_paths(self, ownership: WorkspaceOwnership) -> tuple[str, ...]:
+        output = self._run_git(
+            Path(ownership.workspace_path),
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            failure_code="GIT_STATUS_UNAVAILABLE",
+        )
+        return tuple(sorted(path for path in output.split("\0") if path))
+
     @staticmethod
     def _assert_paths_allowed(
         changed_paths: tuple[str, ...],
         configuration: RepositoryConfiguration,
     ) -> None:
-        prohibited = tuple(PurePosixPath(path) for path in configuration.prohibited_paths)
+        prohibited = tuple(
+            PurePosixPath(path.casefold())
+            for path in configuration.prohibited_paths
+        )
         for raw_path in changed_paths:
             path = PurePosixPath(raw_path)
+            folded_path = PurePosixPath(raw_path.casefold())
             if (
                 not raw_path
                 or path.is_absolute()
@@ -573,7 +592,10 @@ class GitWorkspaceLifecycle:
                 or "\\" in raw_path
                 or len(raw_path) > 4096
                 or any(ord(character) < 32 for character in raw_path)
-                or any(denied == path or denied in path.parents for denied in prohibited)
+                or any(
+                    denied == folded_path or denied in folded_path.parents
+                    for denied in prohibited
+                )
             ):
                 raise WorkspaceLifecycleError("PROHIBITED_PATH_CHANGED")
 
@@ -969,6 +991,8 @@ class GitWorkspaceLifecycle:
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         }
         if extra_environment is not None:
+            if set(environment) & set(extra_environment):
+                raise WorkspaceLifecycleError("GIT_ENVIRONMENT_OVERRIDE")
             environment.update(extra_environment)
         try:
             result = subprocess.run(

@@ -417,6 +417,9 @@ def _configuration(root: Path) -> RepositoryConfiguration:
     test_account = SecretReference.parse(
         "keychain://com.boppuh.mathews.test/account"
     )
+    push_credential = SecretReference.parse(
+        "keychain://com.boppuh.mathews.git/mathews-push"
+    )
     e2e_flow = E2EFlow(
         flow_id="primary",
         version=1,
@@ -473,9 +476,7 @@ def _configuration(root: Path) -> RepositoryConfiguration:
             default_base_ref="main",
             task_branch_template="mathews/{task_id}",
             remote_name="origin",
-            push_credential=SecretReference.parse(
-                "keychain://com.boppuh.mathews.git/mathews-push"
-            ),
+            push_credential=push_credential,
             author=GitIdentity("Mathews", "mathews@example.invalid"),
             committer=GitIdentity("Mathews", "mathews@example.invalid"),
         ),
@@ -629,12 +630,7 @@ def _configuration(root: Path) -> RepositoryConfiguration:
             "Fixtures/primary.json",
             "Fixtures/primary-account.json",
         ),
-        secret_references=(
-            test_account,
-            SecretReference.parse(
-                "keychain://com.boppuh.mathews.git/mathews-push"
-            ),
-        ),
+        secret_references=(test_account, push_credential),
     )
 
 

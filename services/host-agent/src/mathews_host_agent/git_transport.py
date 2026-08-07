@@ -11,11 +11,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from mathews_configuration import SecretValue
 
 _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _TOKEN = re.compile(r"[^\s\x00]{1,8192}\Z")
+_BRANCH_NAME = re.compile(r"[0-9A-Za-z][0-9A-Za-z._/-]{0,250}\Z")
 _MAX_OUTPUT_BYTES = 64 * 1024
 _TIMEOUT_SECONDS = 60
 _ASKPASS_SOURCE = """\
@@ -81,6 +83,14 @@ class GitCredentialPushTransport:
     ) -> GitPushObservation:
         if _GIT_OBJECT.fullmatch(expected_sha) is None:
             raise GitTransportError("INVALID_EXPECTED_HEAD")
+        self._validate_remote_url(remote_url)
+        if (
+            _BRANCH_NAME.fullmatch(branch_name) is None
+            or ".." in branch_name
+            or "//" in branch_name
+            or branch_name.endswith(("/", ".", ".lock"))
+        ):
+            raise GitTransportError("INVALID_BRANCH_NAME")
         token = credential.reveal()
         if _TOKEN.fullmatch(token) is None:
             raise GitTransportError("GIT_CREDENTIAL_INVALID")
@@ -111,8 +121,10 @@ class GitCredentialPushTransport:
                     credential_fd=credential_file.fileno(),
                     push=True,
                 )
-                if result.returncode != 0:
+                if result.returncode == 1:
                     raise GitTransportError("GIT_PUSH_REJECTED")
+                if result.returncode != 0:
+                    raise GitTransportError("GIT_TRANSPORT_UNAVAILABLE")
                 after_sha = self._remote_sha(
                     workspace_path=workspace_path,
                     remote_url=remote_url,
@@ -245,6 +257,35 @@ class GitCredentialPushTransport:
             or stat.S_IMODE(root_stat.st_mode) & 0o077
         ):
             raise GitTransportError("GIT_CREDENTIAL_HELPER_UNSAFE")
+
+    @staticmethod
+    def _validate_remote_url(remote_url: str) -> None:
+        if (
+            not isinstance(remote_url, str)
+            or len(remote_url) > 1000
+            or any(
+                character.isspace() or character == "\x00"
+                for character in remote_url
+            )
+        ):
+            raise GitTransportError("INVALID_REMOTE_URL")
+        try:
+            parsed = urlsplit(remote_url)
+            port = parsed.port
+        except ValueError:
+            raise GitTransportError("INVALID_REMOTE_URL") from None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in {None, 443}
+            or not parsed.path.startswith("/")
+            or parsed.path in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise GitTransportError("INVALID_REMOTE_URL")
 
     def _write_askpass_helper(self) -> Path:
         executable = Path(sys.executable)
