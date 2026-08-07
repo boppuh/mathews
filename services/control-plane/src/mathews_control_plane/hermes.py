@@ -412,6 +412,8 @@ class HermesRunService:
             _begin_serialized(session)
             _current_lease(session, grant, now)
             run = _run_for_grant(session, run_id, grant)
+            if run.status not in {HermesRunStatus.STARTING, HermesRunStatus.RUNNING}:
+                raise HermesConflictError("terminal Hermes run cannot fail its dependency")
             run.status = HermesRunStatus.TIMED_OUT if timed_out else HermesRunStatus.FAILED
             run.failure_code = code
             run.completed_at = now
@@ -454,7 +456,13 @@ def _current_lease(
         or job.status is not BackgroundJobStatus.RUNNING
         or job.current_lease_id != lease.id
         or job.current_fencing_token != lease.fencing_token
+        or job.lease_owner != grant.worker_id
+        or job.lease_expires_at is None
+        or job.cancellation_requested_at is not None
+        or lease.lease_owner != grant.worker_id
+        or lease.attempt != grant.attempt
         or lease.released_at is not None
+        or _as_utc(job.lease_expires_at) <= now
         or _as_utc(lease.expires_at) <= now
     ):
         raise HermesConflictError("Hermes job lease is no longer current")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -290,6 +290,55 @@ def test_hermes_outage_uses_bounded_background_job_retry(
         assert run is not None and run.status is HermesRunStatus.FAILED
         assert job is not None and job.status is BackgroundJobStatus.QUEUED
         assert outage is not None and outage.service is DependencyService.HERMES
+
+
+def test_dependency_failure_cannot_overwrite_a_successful_run(
+    hermes_harness: HermesHarness,
+) -> None:
+    service, run_id = _started(hermes_harness)
+    service.ingest(
+        run_id,
+        HermesProviderEvent(
+            provider_event_id="complete-1",
+            external_run_id="run-1",
+            sequence=1,
+            event_type=HermesEventType.COMPLETED,
+            payload={},
+        ),
+    )
+
+    with pytest.raises(HermesConflictError, match="terminal"):
+        service.fail_dependency(
+            hermes_harness.grant,
+            run_id=run_id,
+            error_code="HERMES_UNAVAILABLE",
+        )
+
+    with hermes_harness.factory() as session:
+        run = session.get(HermesRun, run_id)
+        job = session.get(BackgroundJob, hermes_harness.job_id)
+        assert run is not None and run.status is HermesRunStatus.SUCCEEDED
+        assert job is not None and job.status is BackgroundJobStatus.RUNNING
+        assert session.scalar(select(func.count()).select_from(DependencyOutageAttempt)) == 0
+
+
+def test_run_commands_require_the_exact_lease_owner(
+    hermes_harness: HermesHarness,
+) -> None:
+    service = _service(hermes_harness)
+    run_id = uuid4()
+    service.prepare(hermes_harness.grant, run_id=run_id, prompt=hermes_harness.prompt)
+
+    with pytest.raises(HermesConflictError, match="no longer current"):
+        service.record_started(
+            replace(hermes_harness.grant, worker_id="other-worker"),
+            run_id=run_id,
+            external_run_id="run-1",
+        )
+
+    with hermes_harness.factory() as session:
+        run = session.get(HermesRun, run_id)
+        assert run is not None and run.status is HermesRunStatus.STARTING
 
 
 def test_provider_event_ids_cannot_be_reused_with_other_content(
