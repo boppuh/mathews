@@ -147,6 +147,9 @@ def _configuration() -> RepositoryConfiguration:
             default_base_ref="refs/remotes/origin/main",
             task_branch_template="mathews/{task_id}",
             remote_name="origin",
+            push_credential=SecretReference.parse(
+                "keychain://com.boppuh.mathews.git/example-ios-push"
+            ),
             author=GitIdentity(name="Mathews", email="mathews@example.test"),
             committer=GitIdentity(name="Mathews", email="mathews@example.test"),
         ),
@@ -260,7 +263,12 @@ def _configuration() -> RepositoryConfiguration:
             "Fixtures/primary.json",
             "Fixtures/primary-account.json",
         ),
-        secret_references=(test_account,),
+        secret_references=(
+            test_account,
+            SecretReference.parse(
+                "keychain://com.boppuh.mathews.git/example-ios-push"
+            ),
+        ),
     )
 
 
@@ -464,6 +472,24 @@ def test_configuration_accepts_only_opaque_keychain_references() -> None:
 
     with pytest.raises(ValueError, match="keychain"):
         RepositoryConfiguration.from_dict(configuration.configuration_id, payload)
+
+
+def test_git_push_credential_must_be_an_explicit_opaque_configuration_reference() -> None:
+    configuration = _configuration()
+
+    with pytest.raises(RepositoryConfigurationError, match="Git push credential"):
+        replace(
+            configuration,
+            secret_references=(configuration.secret_references[0],),
+        )
+    with pytest.raises(RepositoryConfigurationError, match="distinct"):
+        replace(
+            configuration,
+            git=replace(
+                configuration.git,
+                push_credential=configuration.secret_references[0],
+            ),
+        )
 
 
 def test_assertion_vocabulary_is_exactly_the_frozen_five_kinds() -> None:

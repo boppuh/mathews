@@ -6,7 +6,13 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
-from mathews_configuration import RepositoryConfiguration, TaskLeaseHostAuthority
+from mathews_configuration import (
+    RepositoryConfiguration,
+    SecretReference,
+    SecretValue,
+    TaskLeaseHostAuthority,
+)
+from mathews_host_agent.git_transport import GitPushObservation, GitPushTransport
 from mathews_host_agent.workspaces import (
     GitWorkspaceLifecycle,
     WorkspaceLifecycleError,
@@ -22,13 +28,31 @@ class _Repository:
 class _Git:
     default_base_ref: str = "main"
     task_branch_template: str = "mathews/{task_id}"
+    remote_name: str = "origin"
+    push_credential: SecretReference = SecretReference(
+        provider="keychain",
+        service="mathews",
+        account="git-push",
+    )
+    author: object = None
+    committer: object = None
+
+
+@dataclass(frozen=True)
+class _Identity:
+    name: str
+    email: str
 
 
 @dataclass(frozen=True)
 class _Configuration:
     repository_key: str
     repository: _Repository
-    git: _Git = _Git()
+    git: _Git = _Git(
+        author=_Identity("Configured Author", "author@example.invalid"),
+        committer=_Identity("Configured Committer", "committer@example.invalid"),
+    )
+    prohibited_paths: tuple[str, ...] = (".git", ".env")
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -56,6 +80,13 @@ def _repository(tmp_path: Path) -> tuple[Path, str]:
         "commit",
         "-m",
         "base",
+    )
+    _git(
+        root,
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/boppuh/mathews.git",
     )
     return root.resolve(), _git(root, "rev-parse", "HEAD")
 
@@ -297,3 +328,235 @@ def test_cleanup_recovers_an_owned_but_unregistered_partial_directory(
 
     assert result["state"] == "CLEANED"
     assert not workspace.exists()
+
+
+class _PushTransport:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.remote_sha: str | None = None
+
+    def push(
+        self,
+        *,
+        workspace_path: Path,
+        remote_url: str,
+        branch_name: str,
+        expected_sha: str,
+        credential: SecretValue,
+    ) -> GitPushObservation:
+        assert credential.reveal() == "transport-secret"
+        self.calls.append((str(workspace_path), remote_url, branch_name))
+        before = self.remote_sha
+        self.remote_sha = expected_sha
+        return GitPushObservation(
+            before_sha=before,
+            after_sha=expected_sha,
+            pushed=before != expected_sha,
+        )
+
+
+def test_candidate_commit_uses_configured_identity_and_returns_exact_clean_state(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+
+    committed = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=base,
+        message="Add candidate feature",
+    )
+
+    assert committed["committed"] is True
+    assert committed["head_sha"] != base
+    assert committed["parent_shas"] == [base]
+    assert committed["changed_paths"] == ["feature.txt"]
+    assert committed["author_name"] == "Configured Author"
+    assert committed["author_email"] == "author@example.invalid"
+    assert committed["committer_name"] == "Configured Committer"
+    assert committed["committer_email"] == "committer@example.invalid"
+    assert committed["index_clean"] is True
+    assert committed["worktree_clean"] is True
+    assert committed["clean"] is True
+    assert lifecycle.inspect_git(authority, configuration) == {
+        key: value for key, value in committed.items() if key not in {"committed", "changed_paths"}
+    }
+
+
+def test_candidate_commit_rejects_head_drift_and_prohibited_paths(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+
+    with pytest.raises(WorkspaceLifecycleError, match="HEAD_MISMATCH"):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha="f" * 40,
+            message="Wrong boundary",
+        )
+    (workspace / ".env").write_text("SECRET=value\n")
+    with pytest.raises(WorkspaceLifecycleError, match="PROHIBITED_PATH_CHANGED"):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            message="Unsafe candidate",
+        )
+    assert _git(workspace, "rev-parse", "HEAD") == base
+
+
+def test_candidate_push_is_exact_non_force_idempotent_and_credential_free(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+    committed = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=base,
+        message="Add candidate feature",
+    )
+    candidate_sha = cast(str, committed["head_sha"])
+    transport = _PushTransport()
+
+    first = lifecycle.push_candidate(
+        authority,
+        configuration,
+        expected_head_sha=candidate_sha,
+        credential=SecretValue("transport-secret"),
+        transport=cast(GitPushTransport, transport),
+    )
+    second = lifecycle.push_candidate(
+        authority,
+        configuration,
+        expected_head_sha=candidate_sha,
+        credential=SecretValue("transport-secret"),
+        transport=cast(GitPushTransport, transport),
+    )
+
+    assert first["remote_head_before"] is None
+    assert first["remote_head_after"] == candidate_sha
+    assert first["pushed"] is True
+    assert second["remote_head_before"] == candidate_sha
+    assert second["pushed"] is False
+    assert len(transport.calls) == 2
+    assert "transport-secret" not in repr(first)
+    assert configuration.git.push_credential.uri not in repr(first)
+
+
+def test_candidate_push_rejects_the_frozen_base(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    lifecycle.create(authority, configuration)
+    transport = _PushTransport()
+
+    with pytest.raises(
+        WorkspaceLifecycleError,
+        match="CANDIDATE_COMMIT_REQUIRED",
+    ):
+        lifecycle.push_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            credential=SecretValue("transport-secret"),
+            transport=cast(GitPushTransport, transport),
+        )
+
+    assert transport.calls == []
+
+
+def test_candidate_push_rejects_dirty_state_and_remote_rebinding(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    transport = _PushTransport()
+    (workspace / "feature.txt").write_text("candidate\n")
+    committed = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=base,
+        message="Add candidate feature",
+    )
+    candidate_sha = cast(str, committed["head_sha"])
+    (workspace / "dirty.txt").write_text("dirty\n")
+
+    with pytest.raises(WorkspaceLifecycleError, match="WORKSPACE_NOT_CLEAN"):
+        lifecycle.push_candidate(
+            authority,
+            configuration,
+            expected_head_sha=candidate_sha,
+            credential=SecretValue("transport-secret"),
+            transport=cast(GitPushTransport, transport),
+        )
+    (workspace / "dirty.txt").unlink()
+    _git(
+        workspace,
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "https://github.com/boppuh/unrelated.git",
+    )
+    with pytest.raises(WorkspaceLifecycleError, match="GIT_REMOTE_BINDING_MISMATCH"):
+        lifecycle.push_candidate(
+            authority,
+            configuration,
+            expected_head_sha=candidate_sha,
+            credential=SecretValue("transport-secret"),
+            transport=cast(GitPushTransport, transport),
+        )
+    assert transport.calls == []
+
+
+def test_git_boundary_rejects_a_task_branch_detached_from_frozen_base(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    empty_tree = _git(workspace, "hash-object", "-t", "tree", "/dev/null")
+    unrelated = _git(
+        workspace,
+        "-c",
+        "user.name=Unrelated",
+        "-c",
+        "user.email=unrelated@example.invalid",
+        "commit-tree",
+        empty_tree,
+        "-m",
+        "unrelated root",
+    )
+    _git(workspace, "reset", "--hard", unrelated)
+
+    with pytest.raises(WorkspaceLifecycleError, match="BASE_NOT_ANCESTOR"):
+        lifecycle.inspect_git(authority, configuration)

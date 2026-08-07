@@ -22,6 +22,7 @@ from mathews_configuration.host_protocol import (
 
 from mathews_host_agent import __version__
 from mathews_host_agent.dispatch import HostRequestDispatcher, default_operation_registry
+from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import HostJournalError, HostOperationJournal
 from mathews_host_agent.launchd import (
     LaunchdConfigurationError,
@@ -65,7 +66,8 @@ def run(settings: HostAgentSettings) -> None:
 
     if _running_as_root():
         raise HostServerError("host agent must run as a non-root user")
-    secret = KeychainSecretProvider().get(settings.authentication_reference)
+    secret_provider = KeychainSecretProvider()
+    secret = secret_provider.get(settings.authentication_reference)
     authenticator = HostMessageAuthenticator(
         secret,
         key_id=settings.authentication_key_id,
@@ -77,7 +79,11 @@ def run(settings: HostAgentSettings) -> None:
         registry=default_operation_registry(
             workspaces=GitWorkspaceLifecycle(
                 settings.journal_path.parent / "workspaces"
-            )
+            ),
+            git_credentials=secret_provider,
+            git_push_transport=GitCredentialPushTransport(
+                settings.journal_path.parent / "git-helpers"
+            ),
         ),
         host_id=settings.host_id,
     )

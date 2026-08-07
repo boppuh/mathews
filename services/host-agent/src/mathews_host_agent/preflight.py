@@ -752,24 +752,6 @@ def _remote_identity(value: str) -> str | None:
     if not value or len(value) > 1000 or any(ord(character) < 32 for character in value):
         return None
 
-    scp_match = (
-        re.fullmatch(
-            r"(?:(?P<user>[A-Za-z0-9._-]+)@)?"
-            r"(?P<host>[A-Za-z0-9.-]+):(?P<path>[^?#]+)",
-            value,
-        )
-        if "://" not in value
-        else None
-    )
-    if scp_match is not None:
-        user = scp_match.group("user")
-        if user != "git":
-            return None
-        return _host_path_identity(
-            scp_match.group("host"),
-            scp_match.group("path"),
-        )
-
     try:
         parsed = urlsplit(value)
         hostname = parsed.hostname
@@ -782,15 +764,9 @@ def _remote_identity(value: str) -> str | None:
         and parsed.password is None
         and port in {None, 443}
     )
-    ssh_transport = (
-        parsed.scheme == "ssh"
-        and parsed.username == "git"
-        and parsed.password is None
-        and port in {None, 22}
-    )
     if (
         hostname is None
-        or not (https_transport or ssh_transport)
+        or not https_transport
         or parsed.query
         or parsed.fragment
     ):

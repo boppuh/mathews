@@ -82,8 +82,10 @@ ready result. Token values are opaque and redacted; only repository ID and
 canonical `owner/repository` context may cross the future Hermes prompt
 boundary.
 
-Task `3.4` must define a separate repository- and host-bound Git transport
+Task `3.4` defines a separate repository- and host-bound Git transport
 credential. The GitHub App cannot supply it because Contents write would also
-authorize merge and release APIs. That future push credential must be consumed
-through an ephemeral credential helper and must never become an agent tool
-argument. Draft-PR and observation calls remain inside the GitHub adapter.
+authorize merge and release APIs. The host resolves the versioned
+configuration's opaque Keychain reference and consumes the value through an
+anonymous file descriptor plus an ephemeral credential helper; it never becomes
+an agent tool argument or host result. Draft-PR and observation calls remain
+inside the GitHub adapter.

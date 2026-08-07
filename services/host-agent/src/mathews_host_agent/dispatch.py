@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
@@ -12,7 +13,11 @@ from types import TracebackType
 from typing import TypeVar, cast
 from uuid import UUID
 
-from mathews_configuration import RepositoryConfiguration, RepositoryConfigurationError
+from mathews_configuration import (
+    RepositoryConfiguration,
+    RepositoryConfigurationError,
+    SecretProvider,
+)
 from mathews_configuration.host_protocol import (
     HostAuthorityKind,
     HostMessageAuthenticator,
@@ -31,6 +36,7 @@ from mathews_configuration.host_protocol import (
 )
 
 from mathews_host_agent import __version__
+from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import (
     HostJournalError,
     HostOperationJournal,
@@ -39,6 +45,7 @@ from mathews_host_agent.journal import (
     OperationStatus,
 )
 from mathews_host_agent.preflight import RepositoryPreflightRunner
+from mathews_host_agent.secrets import KeychainSecretProvider
 from mathews_host_agent.workspaces import (
     GitWorkspaceLifecycle,
     WorkspaceLifecycleError,
@@ -50,6 +57,8 @@ HostOperationHandler = Callable[
 ]
 HostArgumentValidator = Callable[[dict[str, JsonValue]], dict[str, JsonValue]]
 EffectResult = TypeVar("EffectResult")
+
+_GIT_OBJECT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 _SAFE_JOURNAL_CODES = frozenset(
     {
@@ -388,10 +397,16 @@ def default_operation_registry(
     *,
     preflight: RepositoryPreflightRunner | None = None,
     workspaces: GitWorkspaceLifecycle | None = None,
+    git_credentials: SecretProvider | None = None,
+    git_push_transport: GitCredentialPushTransport | None = None,
 ) -> HostOperationRegistry:
     runner = preflight or RepositoryPreflightRunner()
     workspace_lifecycle = workspaces or GitWorkspaceLifecycle(
         Path.home() / "Library" / "Application Support" / "Mathews" / "workspaces"
+    )
+    credential_provider = git_credentials or KeychainSecretProvider()
+    push_transport = git_push_transport or GitCredentialPushTransport(
+        Path.home() / "Library" / "Application Support" / "Mathews" / "git-helpers"
     )
 
     def health(
@@ -468,6 +483,58 @@ def default_operation_registry(
             raise HostOperationRejected(error.code) from None
         return cast(dict[str, JsonValue], result)
 
+    def git_inspect(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = workspace_lifecycle.inspect_git(authority, configuration)
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def git_commit(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = context.perform_authorized_effect(
+                lambda: workspace_lifecycle.commit_candidate(
+                    authority,
+                    configuration,
+                    expected_head_sha=cast(str, arguments["expected_head_sha"]),
+                    message=cast(str, arguments["message"]),
+                )
+            )
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def git_push(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        credential = credential_provider.get(configuration.git.push_credential)
+        try:
+            result = context.perform_authorized_effect(
+                lambda: workspace_lifecycle.push_candidate(
+                    authority,
+                    configuration,
+                    expected_head_sha=cast(str, arguments["expected_head_sha"]),
+                    credential=credential,
+                    transport=push_transport,
+                )
+            )
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
     def lease_probe(
         context: HostOperationContext,
         _arguments: dict[str, JsonValue],
@@ -508,6 +575,23 @@ def default_operation_registry(
 
     return HostOperationRegistry(
         {
+            "git.commit": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_git_commit,
+                handle=git_commit,
+                mutates_host=True,
+            ),
+            "git.inspect": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_configuration,
+                handle=git_inspect,
+            ),
+            "git.push": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_git_push,
+                handle=git_push,
+                mutates_host=True,
+            ),
             "host.health": HostOperationDefinition(
                 authority=HostAuthorityKind.SYSTEM,
                 validate=_validate_empty,
@@ -592,6 +676,48 @@ def _validate_workspace_cleanup(
     elif cancellation_id is not None:
         raise HostOperationRejected("INVALID_ARGUMENTS")
     return arguments
+
+
+def _validate_git_commit(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"configuration", "expected_head_sha", "message"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    _validate_configuration_field(arguments)
+    _git_object_argument(arguments["expected_head_sha"])
+    message = arguments["message"]
+    if (
+        not isinstance(message, str)
+        or not message
+        or message.strip() != message
+        or len(message) > 255
+        or not message.isprintable()
+        or "\n" in message
+        or "\r" in message
+    ):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    return arguments
+
+
+def _validate_git_push(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"configuration", "expected_head_sha"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    _validate_configuration_field(arguments)
+    _git_object_argument(arguments["expected_head_sha"])
+    return arguments
+
+
+def _validate_configuration_field(arguments: dict[str, JsonValue]) -> None:
+    if not isinstance(arguments["configuration"], dict):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+
+
+def _git_object_argument(value: JsonValue) -> str:
+    if not isinstance(value, str) or _GIT_OBJECT_PATTERN.fullmatch(value) is None:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    return value
 
 
 def _configuration_argument(

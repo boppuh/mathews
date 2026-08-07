@@ -473,6 +473,9 @@ def _configuration(root: Path) -> RepositoryConfiguration:
             default_base_ref="main",
             task_branch_template="mathews/{task_id}",
             remote_name="origin",
+            push_credential=SecretReference.parse(
+                "keychain://com.boppuh.mathews.git/mathews-push"
+            ),
             author=GitIdentity("Mathews", "mathews@example.invalid"),
             committer=GitIdentity("Mathews", "mathews@example.invalid"),
         ),
@@ -626,7 +629,12 @@ def _configuration(root: Path) -> RepositoryConfiguration:
             "Fixtures/primary.json",
             "Fixtures/primary-account.json",
         ),
-        secret_references=(test_account,),
+        secret_references=(
+            test_account,
+            SecretReference.parse(
+                "keychain://com.boppuh.mathews.git/mathews-push"
+            ),
+        ),
     )
 
 
@@ -1270,6 +1278,8 @@ def test_preflight_fails_closed_when_simulator_availability_is_omitted(
     "remote_url",
     (
         "git://github.com/boppuh/mathews.git",
+        "git@github.com:boppuh/mathews.git",
+        "ssh://git@github.com/boppuh/mathews.git",
         "ssh://git@github.com:2222/boppuh/mathews.git",
         "https://credential@github.com/boppuh/mathews.git",
         "https://[invalid/path",

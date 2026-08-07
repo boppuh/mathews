@@ -12,6 +12,13 @@ configuration and removes only a path with the exact task/configuration
 ownership record. Cancellation cleanup also requires a canonical cancellation
 identifier.
 
+Controlled Git operations are limited to `git.inspect`, `git.commit`, and
+`git.push`. Commit identity is read from the signed versioned repository
+configuration. Push resolves the configuration's opaque Keychain reference only
+inside the host process, supplies the value to Git through an anonymous file
+descriptor and ephemeral askpass helper, and sends only `HEAD` to the exact
+task branch. No force, tag, merge, or release operation is available.
+
 ## Prerequisites
 
 1. Create the runtime directory with mode `0700`:
@@ -28,7 +35,12 @@ identifier.
    as the same user in the unlocked login session. The production roadmap adds
    signed host identity and stronger credential isolation.
 
-3. Configure the control plane with the same opaque reference and socket path:
+3. Create a second, distinct generic-password item for the repository's
+   `git_settings.push_credential` reference. Its value must authorize only the
+   configured repository and should be protected by repository branch rules.
+   Do not reuse the host HMAC, GitHub App, webhook, or E2E account credential.
+
+4. Configure the control plane with the host HMAC reference and socket path:
 
    ```dotenv
    MATHEWS_HOST_AUTH_KEY_REF=keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1
