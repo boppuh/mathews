@@ -17,6 +17,7 @@ from mathews_host_agent.git_transport import GitPushObservation, GitPushTranspor
 from mathews_host_agent.workspaces import (
     GitWorkspaceLifecycle,
     WorkspaceLifecycleError,
+    WorkspaceOwnership,
 )
 
 
@@ -101,6 +102,21 @@ def _repository(tmp_path: Path) -> tuple[Path, str]:
     return root.resolve(), _git(root, "rev-parse", "HEAD")
 
 
+def _commit_with_configured_identity(workspace: Path, message: str) -> str:
+    _git(
+        workspace,
+        "-c",
+        "user.name=Configured Committer",
+        "-c",
+        "user.email=committer@example.invalid",
+        "commit",
+        "--author=Configured Author <author@example.invalid>",
+        "-m",
+        message,
+    )
+    return _git(workspace, "rev-parse", "HEAD")
+
+
 def _configuration(root: Path) -> RepositoryConfiguration:
     return cast(
         RepositoryConfiguration,
@@ -128,6 +144,30 @@ def _authority(
         configuration_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
         configuration_digest="sha256:" + "1" * 64,
     )
+
+
+def test_version_one_ownership_manifest_remains_readable() -> None:
+    authority = _authority()
+    ownership = WorkspaceOwnership(
+        task_id=str(authority.task_id),
+        job_id=str(authority.job_id),
+        repository_key=authority.repository_key,
+        configuration_id=str(authority.configuration_id),
+        configuration_digest=authority.configuration_digest,
+        repository_root="/tmp/repository",
+        workspace_path="/tmp/workspace",
+        branch_name=f"mathews/{authority.task_id}",
+        base_sha="a" * 40,
+        state="ACTIVE",
+    )
+    payload = ownership.to_dict()
+    payload["version"] = 1
+    payload.pop("candidate_head_sha")
+
+    restored = WorkspaceOwnership.from_dict(payload)
+
+    assert restored.candidate_head_sha is None
+    assert restored.task_id == str(authority.task_id)
 
 
 def test_create_freezes_base_and_returns_exact_clean_repository_state(
@@ -587,6 +627,75 @@ def test_candidate_push_rejects_the_frozen_base(
             authority,
             configuration,
             expected_head_sha=base,
+            credential=SecretValue("transport-secret"),
+            transport=cast(GitPushTransport, transport),
+        )
+
+    assert transport.calls == []
+
+
+def test_candidate_push_requires_durable_host_commit_proof(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "writer.txt").write_text("writer-created\n")
+    _git(workspace, "add", "writer.txt")
+    writer_head = _commit_with_configured_identity(
+        workspace,
+        "Writer-created candidate",
+    )
+    transport = _PushTransport()
+
+    with pytest.raises(
+        WorkspaceLifecycleError,
+        match="CANDIDATE_COMMIT_NOT_HOST_OWNED",
+    ):
+        lifecycle.push_candidate(
+            authority,
+            configuration,
+            expected_head_sha=writer_head,
+            credential=SecretValue("transport-secret"),
+            transport=cast(GitPushTransport, transport),
+        )
+
+    assert transport.calls == []
+
+
+def test_candidate_push_revalidates_the_complete_host_candidate_history(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / ".env").write_text("SECRET=value\n")
+    _git(workspace, "add", ".env")
+    writer_head = _commit_with_configured_identity(
+        workspace,
+        "Writer-created prohibited parent",
+    )
+    (workspace / "feature.txt").write_text("candidate\n")
+    committed = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=writer_head,
+        message="Host candidate",
+    )
+    candidate_head = cast(str, committed["head_sha"])
+    transport = _PushTransport()
+
+    with pytest.raises(WorkspaceLifecycleError, match="PROHIBITED_PATH_CHANGED"):
+        lifecycle.push_candidate(
+            authority,
+            configuration,
+            expected_head_sha=candidate_head,
             credential=SecretValue("transport-secret"),
             transport=cast(GitPushTransport, transport),
         )

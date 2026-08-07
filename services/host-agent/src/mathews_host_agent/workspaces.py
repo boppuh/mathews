@@ -24,7 +24,7 @@ from mathews_configuration import (
 from mathews_host_agent.git_transport import GitPushTransport, GitTransportError
 
 _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_MANIFEST_VERSION = 1
+_MANIFEST_VERSION = 2
 _MAX_GIT_OUTPUT_BYTES = 64 * 1024
 _GIT_TIMEOUT_SECONDS = 30
 
@@ -49,6 +49,7 @@ class WorkspaceOwnership:
     branch_name: str
     base_sha: str
     state: str
+    candidate_head_sha: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -63,11 +64,12 @@ class WorkspaceOwnership:
             "branch_name": self.branch_name,
             "base_sha": self.base_sha,
             "state": self.state,
+            "candidate_head_sha": self.candidate_head_sha,
         }
 
     @classmethod
     def from_dict(cls, value: object) -> WorkspaceOwnership:
-        if not isinstance(value, dict) or set(value) != {
+        common_fields = {
             "version",
             "task_id",
             "job_id",
@@ -79,16 +81,31 @@ class WorkspaceOwnership:
             "branch_name",
             "base_sha",
             "state",
-        }:
+        }
+        if not isinstance(value, dict):
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
-        if value["version"] != _MANIFEST_VERSION:
+        version = value.get("version")
+        expected_fields = (
+            common_fields
+            if version == 1
+            else common_fields | {"candidate_head_sha"}
+            if version == _MANIFEST_VERSION
+            else set()
+        )
+        if not expected_fields or set(value) != expected_fields:
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
         string_fields = {
             name: value[name]
             for name in value
-            if name != "version"
+            if name not in {"version", "candidate_head_sha"}
         }
         if any(not isinstance(item, str) for item in string_fields.values()):
+            raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
+        candidate_head_sha = value.get("candidate_head_sha")
+        if candidate_head_sha is not None and (
+            not isinstance(candidate_head_sha, str)
+            or _GIT_OBJECT.fullmatch(candidate_head_sha) is None
+        ):
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
         try:
             task_id = UUID(string_fields["task_id"])
@@ -104,7 +121,7 @@ class WorkspaceOwnership:
             or string_fields["state"] not in {"CREATING", "ACTIVE", "CLEANED"}
         ):
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
-        return cls(**string_fields)
+        return cls(**string_fields, candidate_head_sha=candidate_head_sha)
 
 
 class GitWorkspaceLifecycle:
@@ -265,6 +282,12 @@ class GitWorkspaceLifecycle:
                 or parents != [expected_head_sha]
             ):
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            candidate_head_sha = after["head_sha"]
+            assert isinstance(candidate_head_sha, str)
+            self._write_ownership(
+                self._manifest_path(authority.task_id),
+                replace(ownership, candidate_head_sha=candidate_head_sha),
+            )
             return {
                 **after,
                 "committed": True,
@@ -287,8 +310,14 @@ class GitWorkspaceLifecycle:
                 raise WorkspaceLifecycleError("HEAD_MISMATCH")
             if expected_head_sha == ownership.base_sha:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_REQUIRED")
+            if ownership.candidate_head_sha != expected_head_sha:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_NOT_HOST_OWNED")
             if not state["clean"]:
                 raise WorkspaceLifecycleError("WORKSPACE_NOT_CLEAN")
+            self._assert_paths_allowed(
+                self._candidate_history_paths(ownership),
+                configuration,
+            )
             remote_url = self._push_remote_url(ownership, configuration)
             try:
                 observation = transport.push(
@@ -572,6 +601,23 @@ class GitWorkspaceLifecycle:
             failure_code="GIT_STATUS_UNAVAILABLE",
         )
         return tuple(sorted(path for path in output.split("\0") if path))
+
+    def _candidate_history_paths(
+        self,
+        ownership: WorkspaceOwnership,
+    ) -> tuple[str, ...]:
+        output = self._run_git(
+            Path(ownership.workspace_path),
+            "log",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            f"{ownership.base_sha}..HEAD",
+            "--",
+            failure_code="GIT_STATUS_UNAVAILABLE",
+        )
+        return tuple(sorted({path for path in output.split("\0") if path}))
 
     @staticmethod
     def _assert_paths_allowed(

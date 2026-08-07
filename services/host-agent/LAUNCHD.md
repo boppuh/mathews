@@ -16,8 +16,11 @@ Controlled Git operations are limited to `git.inspect`, `git.commit`, and
 `git.push`. Commit identity is read from the signed versioned repository
 configuration. Push resolves the configuration's opaque Keychain reference only
 inside the host process, supplies the value to Git through an anonymous file
-descriptor and ephemeral askpass helper, and sends only `HEAD` to the exact
-task branch. No force, tag, merge, or release operation is available.
+descriptor and ephemeral askpass helper, and sends only the durably recorded
+host-created candidate to the exact task branch. The authenticated transport
+uses a temporary, sanitized Git directory so repository-local proxy, CA, URL
+rewrite, follow-tag, and push-recursion settings are not trusted. No force, tag,
+merge, or release operation is available.
 
 ## Prerequisites
 

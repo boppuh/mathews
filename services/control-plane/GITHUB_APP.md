@@ -87,8 +87,11 @@ credential. The GitHub App cannot supply it because Contents write would also
 authorize merge and release APIs. The host resolves the versioned
 configuration's opaque Keychain reference and consumes the value through an
 anonymous file descriptor plus an ephemeral credential helper; it never becomes
-an agent tool argument or host result. Draft-PR and observation calls remain
-inside the GitHub adapter. For the current repository, the operator creates a
+an agent tool argument or host result. The transport reads objects through a
+temporary sanitized Git directory, binds pushes to the host's durable candidate
+record, and ignores repository-local transport and follow-tag configuration.
+Draft-PR and observation calls remain inside the GitHub adapter. For the current
+repository, the operator creates a
 generic-password Keychain item with service `com.boppuh.mathews.git` and account
 `mathews-push`. Its value is a fine-grained token selected for only the
 configured repository with repository Contents read/write permission and no

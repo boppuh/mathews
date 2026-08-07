@@ -8,6 +8,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -50,6 +52,12 @@ class GitPushObservation:
     before_sha: str | None
     after_sha: str
     pushed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _IsolatedGitRepository:
+    git_directory: Path
+    object_directory: Path
 
 
 class GitPushTransport(Protocol):
@@ -95,67 +103,70 @@ class GitCredentialPushTransport:
         if _TOKEN.fullmatch(token) is None:
             raise GitTransportError("GIT_CREDENTIAL_INVALID")
         self._prepare_helper_root()
-        helper_path = self._write_askpass_helper()
-        try:
-            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as credential_file:
-                credential_file.write(token)
-                credential_file.flush()
-                before_sha = self._remote_sha(
-                    workspace_path=workspace_path,
-                    remote_url=remote_url,
-                    branch_name=branch_name,
-                    helper_path=helper_path,
-                    credential_fd=credential_file.fileno(),
-                )
-                if before_sha == expected_sha:
+        with self._isolated_repository(workspace_path, expected_sha) as isolated:
+            helper_path = self._write_askpass_helper()
+            try:
+                with tempfile.TemporaryFile(
+                    mode="w+", encoding="utf-8"
+                ) as credential_file:
+                    credential_file.write(token)
+                    credential_file.flush()
+                    before_sha = self._remote_sha(
+                        isolated=isolated,
+                        remote_url=remote_url,
+                        branch_name=branch_name,
+                        helper_path=helper_path,
+                        credential_fd=credential_file.fileno(),
+                    )
+                    if before_sha == expected_sha:
+                        return GitPushObservation(
+                            before_sha=before_sha,
+                            after_sha=before_sha,
+                            pushed=False,
+                        )
+                    result = self._run_authenticated_git(
+                        isolated,
+                        remote_url,
+                        branch_name,
+                        helper_path=helper_path,
+                        credential_fd=credential_file.fileno(),
+                        push=True,
+                    )
+                    if result.returncode == 1:
+                        raise GitTransportError("GIT_PUSH_REJECTED")
+                    if result.returncode != 0:
+                        raise GitTransportError("GIT_TRANSPORT_UNAVAILABLE")
+                    after_sha = self._remote_sha(
+                        isolated=isolated,
+                        remote_url=remote_url,
+                        branch_name=branch_name,
+                        helper_path=helper_path,
+                        credential_fd=credential_file.fileno(),
+                    )
+                    if after_sha != expected_sha:
+                        raise GitTransportError("REMOTE_HEAD_MISMATCH")
                     return GitPushObservation(
                         before_sha=before_sha,
-                        after_sha=before_sha,
-                        pushed=False,
+                        after_sha=after_sha,
+                        pushed=True,
                     )
-                result = self._run_authenticated_git(
-                    workspace_path,
-                    remote_url,
-                    branch_name,
-                    helper_path=helper_path,
-                    credential_fd=credential_file.fileno(),
-                    push=True,
-                )
-                if result.returncode == 1:
-                    raise GitTransportError("GIT_PUSH_REJECTED")
-                if result.returncode != 0:
-                    raise GitTransportError("GIT_TRANSPORT_UNAVAILABLE")
-                after_sha = self._remote_sha(
-                    workspace_path=workspace_path,
-                    remote_url=remote_url,
-                    branch_name=branch_name,
-                    helper_path=helper_path,
-                    credential_fd=credential_file.fileno(),
-                )
-                if after_sha != expected_sha:
-                    raise GitTransportError("REMOTE_HEAD_MISMATCH")
-                return GitPushObservation(
-                    before_sha=before_sha,
-                    after_sha=after_sha,
-                    pushed=True,
-                )
-        finally:
-            try:
-                helper_path.unlink()
-            except OSError:
-                pass
+            finally:
+                try:
+                    helper_path.unlink()
+                except OSError:
+                    pass
 
     def _remote_sha(
         self,
         *,
-        workspace_path: Path,
+        isolated: _IsolatedGitRepository,
         remote_url: str,
         branch_name: str,
         helper_path: Path,
         credential_fd: int,
     ) -> str | None:
         result = self._run_authenticated_git(
-            workspace_path,
+            isolated,
             remote_url,
             branch_name,
             helper_path=helper_path,
@@ -178,7 +189,7 @@ class GitCredentialPushTransport:
 
     def _run_authenticated_git(
         self,
-        workspace_path: Path,
+        isolated: _IsolatedGitRepository,
         remote_url: str,
         branch_name: str,
         *,
@@ -191,8 +202,10 @@ class GitCredentialPushTransport:
                 "push",
                 "--porcelain",
                 "--no-verify",
+                "--no-follow-tags",
+                "--recurse-submodules=no",
                 remote_url,
-                f"HEAD:refs/heads/{branch_name}",
+                f"refs/heads/candidate:refs/heads/{branch_name}",
             )
             if push
             else (
@@ -205,7 +218,11 @@ class GitCredentialPushTransport:
         )
         environment = {
             "GIT_ASKPASS": str(helper_path),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_OBJECT_DIRECTORY": str(isolated.object_directory),
+            "GIT_PROTOCOL_FROM_USER": "0",
             "GIT_TERMINAL_PROMPT": "0",
             "LC_ALL": "C",
             "MATHEWS_GIT_CREDENTIAL_FD": str(credential_fd),
@@ -215,6 +232,7 @@ class GitCredentialPushTransport:
             result = subprocess.run(
                 (
                     "git",
+                    f"--git-dir={isolated.git_directory}",
                     "-c",
                     "core.hooksPath=/dev/null",
                     "-c",
@@ -225,8 +243,12 @@ class GitCredentialPushTransport:
                     "http.followRedirects=false",
                     "-c",
                     "http.sslVerify=true",
-                    "-C",
-                    str(workspace_path),
+                    "-c",
+                    "push.followTags=false",
+                    "-c",
+                    "push.gpgSign=false",
+                    "-c",
+                    "push.recurseSubmodules=no",
                     *operation,
                 ),
                 check=False,
@@ -244,6 +266,112 @@ class GitCredentialPushTransport:
         ):
             raise GitTransportError("GIT_TRANSPORT_OUTPUT_TOO_LARGE")
         return result
+
+    @contextmanager
+    def _isolated_repository(
+        self,
+        workspace_path: Path,
+        expected_sha: str,
+    ) -> Iterator[_IsolatedGitRepository]:
+        object_directory = self._object_directory(workspace_path)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="repository-",
+                dir=self._helper_root,
+            ) as raw_directory:
+                git_directory = Path(raw_directory)
+                refs = git_directory / "refs" / "heads"
+                refs.mkdir(mode=0o700, parents=True)
+                object_format = "sha256" if len(expected_sha) == 64 else "sha1"
+                repository_version = "1" if object_format == "sha256" else "0"
+                config = (
+                    "[core]\n"
+                    f"\trepositoryformatversion = {repository_version}\n"
+                    "\tbare = true\n"
+                )
+                if object_format == "sha256":
+                    config += "[extensions]\n\tobjectformat = sha256\n"
+                self._write_private_file(git_directory / "config", config)
+                self._write_private_file(
+                    git_directory / "HEAD",
+                    "ref: refs/heads/candidate\n",
+                )
+                self._write_private_file(
+                    refs / "candidate",
+                    f"{expected_sha}\n",
+                )
+                yield _IsolatedGitRepository(
+                    git_directory=git_directory,
+                    object_directory=object_directory,
+                )
+        except GitTransportError:
+            raise
+        except OSError:
+            raise GitTransportError("GIT_TRANSPORT_ISOLATION_UNAVAILABLE") from None
+
+    def _object_directory(self, workspace_path: Path) -> Path:
+        if not workspace_path.is_absolute() or not workspace_path.is_dir():
+            raise GitTransportError("GIT_OBJECT_DIRECTORY_INVALID")
+        environment = {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }
+        try:
+            result = subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(workspace_path),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "objects",
+                ),
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=True,
+                timeout=_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise GitTransportError("GIT_OBJECT_DIRECTORY_INVALID") from None
+        if result.returncode != 0 or len(result.stdout.encode()) > _MAX_OUTPUT_BYTES:
+            raise GitTransportError("GIT_OBJECT_DIRECTORY_INVALID")
+        try:
+            object_directory = Path(result.stdout.rstrip("\n")).resolve(strict=True)
+            directory_stat = object_directory.lstat()
+        except OSError:
+            raise GitTransportError("GIT_OBJECT_DIRECTORY_INVALID") from None
+        if (
+            not object_directory.is_absolute()
+            or not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+        ):
+            raise GitTransportError("GIT_OBJECT_DIRECTORY_INVALID")
+        return object_directory
+
+    @staticmethod
+    def _write_private_file(path: Path, payload: str) -> None:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            encoded = payload.encode()
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("private Git file write did not advance")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _prepare_helper_root(self) -> None:
         try:
