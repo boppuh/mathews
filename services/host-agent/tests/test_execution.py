@@ -717,3 +717,14 @@ def test_termination_kills_descendants_that_ignore_term(tmp_path: Path) -> None:
         text=True,
     ).stdout.strip()
     assert not observed or observed.startswith("Z")
+
+
+def test_termination_helper_reaps_the_group_leader() -> None:
+    process = subprocess.Popen(
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+        start_new_session=True,
+    )
+
+    ConfiguredOperationRunner._terminate_and_reap(process)
+
+    assert process.poll() is not None

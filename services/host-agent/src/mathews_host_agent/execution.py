@@ -771,17 +771,16 @@ class ConfiguredOperationRunner:
                         if effect_yielded is not None:
                             effect_yielded()
                     except Exception:
-                        self._terminate(process)
+                        self._terminate_and_reap(process)
                         raise
                     marked_effect = True
                 if self._shutdown.is_set():
-                    self._terminate(process)
+                    self._terminate_and_reap(process)
                     raise ConfiguredExecutionError("HOST_SHUTTING_DOWN")
                 try:
                     returncode = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
-                    self._terminate(process)
-                    process.wait(timeout=2)
+                    self._terminate_and_reap(process)
                     raise ConfiguredExecutionError(
                         "SIMULATOR_PREPARATION_FAILED"
                     ) from None
@@ -815,6 +814,18 @@ class ConfiguredOperationRunner:
             os.killpg(process_group_id, signal.SIGKILL)
         except (PermissionError, ProcessLookupError):
             return
+
+    @staticmethod
+    def _terminate_and_reap(process: subprocess.Popen[bytes]) -> None:
+        ConfiguredOperationRunner._terminate(process)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2)
 
     def _collect_configured_artifacts(
         self,
