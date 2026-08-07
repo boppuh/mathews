@@ -2,6 +2,7 @@ import os
 import secrets
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,8 @@ def _fake_git(
                 "    exit 0",
                 "    ;;",
                 "  *ls-remote*)",
+                "    password=$(\"$GIT_ASKPASS\" \"Password for GitHub\") || exit 4",
+                f"    [ \"$password\" = {shlex.quote(token)} ] || exit 6",
                 f"    if [ -f {shlex.quote(str(state_path))} ]; then",
                 f"      printf '{reported_sha}\\trefs/heads/mathews/test\\n'",
                 "      exit 0",
@@ -189,6 +192,70 @@ def test_isolated_transport_does_not_inherit_repository_local_configuration(
     assert result.stdout.strip() == expected_sha
     assert "attacker.invalid" not in isolated_config
     assert "followTags" not in isolated_config
+    assert list(helper_root.iterdir()) == []
+
+
+def test_push_supports_a_python_interpreter_path_with_spaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_sha = "a" * 40
+    token = secrets.token_urlsafe(32)
+    binary_directory, _log_path = _fake_git(
+        tmp_path,
+        expected_sha=expected_sha,
+        token=token,
+    )
+    monkeypatch.setenv("PATH", f"{binary_directory}:/usr/bin:/bin")
+    interpreter_directory = tmp_path / "python environment"
+    interpreter_directory.mkdir()
+    interpreter = interpreter_directory / "python executable"
+    interpreter.symlink_to(Path(sys.executable))
+    monkeypatch.setattr("mathews_host_agent.git_transport.sys.executable", str(interpreter))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    helper_root = (tmp_path / "helpers").resolve()
+
+    observation = GitCredentialPushTransport(helper_root).push(
+        workspace_path=workspace,
+        remote_url="https://github.com/boppuh/mathews.git",
+        branch_name="mathews/test",
+        expected_sha=expected_sha,
+        credential=SecretValue(token),
+    )
+
+    assert observation.after_sha == expected_sha
+    assert list(helper_root.iterdir()) == []
+
+
+def test_push_rejects_workspace_object_alternates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_sha = "a" * 40
+    token = secrets.token_urlsafe(32)
+    binary_directory, _log_path = _fake_git(
+        tmp_path,
+        expected_sha=expected_sha,
+        token=token,
+    )
+    monkeypatch.setenv("PATH", f"{binary_directory}:/usr/bin:/bin")
+    alternates = tmp_path / "objects" / "info" / "alternates"
+    alternates.parent.mkdir()
+    alternates.write_text("/untrusted/shared/objects\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    helper_root = (tmp_path / "helpers").resolve()
+
+    with pytest.raises(GitTransportError, match="GIT_OBJECT_ALTERNATES_PROHIBITED"):
+        GitCredentialPushTransport(helper_root).push(
+            workspace_path=workspace,
+            remote_url="https://github.com/boppuh/mathews.git",
+            branch_name="mathews/test",
+            expected_sha=expected_sha,
+            credential=SecretValue(token),
+        )
+
     assert list(helper_root.iterdir()) == []
 
 

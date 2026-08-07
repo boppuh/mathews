@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -21,7 +22,8 @@ _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _TOKEN = re.compile(r"[^\s\x00]{1,8192}\Z")
 _BRANCH_NAME = re.compile(r"[0-9A-Za-z][0-9A-Za-z._/-]{0,250}\Z")
 _MAX_OUTPUT_BYTES = 64 * 1024
-_TIMEOUT_SECONDS = 60
+_NETWORK_TIMEOUT_SECONDS = 8
+_LOCAL_TIMEOUT_SECONDS = 3
 _ASKPASS_SOURCE = """\
 import os
 import sys
@@ -31,9 +33,8 @@ if prompt.startswith("username"):
     sys.stdout.write("x-access-token\\n")
 elif prompt.startswith("password"):
     descriptor = int(os.environ["MATHEWS_GIT_CREDENTIAL_FD"])
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    with os.fdopen(os.dup(descriptor), encoding="utf-8") as credential:
-        sys.stdout.write(credential.read() + "\\n")
+    credential = os.pread(descriptor, 8193, 0)
+    os.write(sys.stdout.fileno(), credential + b"\\n")
 else:
     raise SystemExit(2)
 """
@@ -256,7 +257,7 @@ class GitCredentialPushTransport:
                 env=environment,
                 pass_fds=(credential_fd,),
                 text=True,
-                timeout=_TIMEOUT_SECONDS,
+                timeout=_NETWORK_TIMEOUT_SECONDS,
             )
         except (OSError, subprocess.TimeoutExpired):
             raise GitTransportError("GIT_TRANSPORT_UNAVAILABLE") from None
@@ -335,7 +336,7 @@ class GitCredentialPushTransport:
                 capture_output=True,
                 env=environment,
                 text=True,
-                timeout=_TIMEOUT_SECONDS,
+                timeout=_LOCAL_TIMEOUT_SECONDS,
             )
         except (OSError, subprocess.TimeoutExpired):
             raise GitTransportError("GIT_OBJECT_DIRECTORY_INVALID") from None
@@ -352,6 +353,12 @@ class GitCredentialPushTransport:
             or directory_stat.st_uid != os.geteuid()
         ):
             raise GitTransportError("GIT_OBJECT_DIRECTORY_INVALID")
+        alternates_path = object_directory / "info" / "alternates"
+        try:
+            if alternates_path.exists() and alternates_path.read_bytes().strip():
+                raise GitTransportError("GIT_OBJECT_ALTERNATES_PROHIBITED")
+        except OSError:
+            raise GitTransportError("GIT_OBJECT_DIRECTORY_INVALID") from None
         return object_directory
 
     @staticmethod
@@ -419,8 +426,8 @@ class GitCredentialPushTransport:
         executable = Path(sys.executable)
         if (
             not executable.is_absolute()
-            or any(character.isspace() for character in str(executable))
-            or "\n" in str(executable)
+            or any(character in "\x00\r\n" for character in str(executable))
+            or not executable.is_file()
         ):
             raise GitTransportError("GIT_CREDENTIAL_HELPER_UNAVAILABLE")
         descriptor, raw_path = tempfile.mkstemp(
@@ -432,7 +439,11 @@ class GitCredentialPushTransport:
         path = Path(raw_path)
         try:
             os.fchmod(descriptor, 0o700)
-            payload = f"#!{executable}\n{_ASKPASS_SOURCE}".encode()
+            payload = (
+                "#!/bin/sh\n"
+                f"exec {shlex.quote(str(executable))} -c "
+                f"{shlex.quote(_ASKPASS_SOURCE)} \"$@\"\n"
+            ).encode()
             offset = 0
             while offset < len(payload):
                 written = os.write(descriptor, payload[offset:])

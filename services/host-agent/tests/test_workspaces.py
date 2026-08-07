@@ -440,6 +440,37 @@ def test_candidate_commit_uses_configured_identity_and_returns_exact_clean_state
     }
 
 
+def test_candidate_commit_preserves_repository_info_excludes(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    (repository / ".git" / "info" / "exclude").write_text("ignored.txt\n")
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+    (workspace / "ignored.txt").write_text("local-only\n")
+
+    committed = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=base,
+        message="Preserve local excludes",
+    )
+    candidate_head = cast(str, committed["head_sha"])
+
+    assert committed["changed_paths"] == ["feature.txt"]
+    assert "ignored.txt" not in _git(
+        workspace,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        candidate_head,
+    ).splitlines()
+
+
 def test_candidate_commit_rejects_head_drift_and_prohibited_paths(
     tmp_path: Path,
 ) -> None:
@@ -502,13 +533,9 @@ def test_candidate_commit_rejects_unconfigured_head_identity(
     foreign_head = _git(workspace, "rev-parse", "HEAD")
     (workspace / "feature.txt").write_text("candidate\n")
 
+    assert foreign_head != _base
     with pytest.raises(WorkspaceLifecycleError, match="COMMIT_IDENTITY_MISMATCH"):
-        lifecycle.commit_candidate(
-            authority,
-            configuration,
-            expected_head_sha=foreign_head,
-            message="Add candidate feature",
-        )
+        lifecycle.inspect_git(authority, configuration)
 
 
 def test_candidate_commit_revalidates_paths_after_staging(
@@ -591,7 +618,33 @@ def test_candidate_commit_never_executes_repository_clean_filters(
     assert not marker.exists()
 
 
-def test_candidate_commit_reports_the_paths_actually_staged(
+def test_candidate_commit_rejects_repository_object_alternates(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    alternates = repository / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(exist_ok=True)
+    alternates.write_text("/untrusted/shared/objects\n")
+    (workspace / "feature.txt").write_text("candidate\n")
+
+    with pytest.raises(
+        WorkspaceLifecycleError,
+        match="GIT_OBJECT_ALTERNATES_PROHIBITED",
+    ):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            message="Reject alternate object store",
+        )
+
+
+def test_candidate_commit_rejects_an_unlisted_concurrent_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -625,14 +678,13 @@ def test_candidate_commit_reports_the_paths_actually_staged(
 
     monkeypatch.setattr(lifecycle, "_run_isolated_git", inject_allowed_path)
 
-    committed = lifecycle.commit_candidate(
-        authority,
-        configuration,
-        expected_head_sha=base,
-        message="Exact staged evidence",
-    )
-
-    assert committed["changed_paths"] == ["feature.txt", "late.txt"]
+    with pytest.raises(WorkspaceLifecycleError, match="CANDIDATE_COMMIT_INVALID"):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            message="Exact staged evidence",
+        )
 
 
 def test_git_runner_rejects_restricted_environment_overrides(
@@ -750,7 +802,7 @@ def test_candidate_push_requires_durable_host_commit_proof(
     assert transport.calls == []
 
 
-def test_candidate_push_revalidates_the_complete_host_candidate_history(
+def test_host_candidate_must_be_the_only_child_of_the_frozen_base(
     tmp_path: Path,
 ) -> None:
     repository, _base = _repository(tmp_path)
@@ -766,25 +818,16 @@ def test_candidate_push_revalidates_the_complete_host_candidate_history(
         "Writer-created prohibited parent",
     )
     (workspace / "feature.txt").write_text("candidate\n")
-    committed = lifecycle.commit_candidate(
-        authority,
-        configuration,
-        expected_head_sha=writer_head,
-        message="Host candidate",
-    )
-    candidate_head = cast(str, committed["head_sha"])
-    transport = _PushTransport()
-
-    with pytest.raises(WorkspaceLifecycleError, match="PROHIBITED_PATH_CHANGED"):
-        lifecycle.push_candidate(
+    with pytest.raises(
+        WorkspaceLifecycleError,
+        match="CANDIDATE_PARENT_NOT_FROZEN_BASE",
+    ):
+        lifecycle.commit_candidate(
             authority,
             configuration,
-            expected_head_sha=candidate_head,
-            credential=SecretValue("transport-secret"),
-            transport=cast(GitPushTransport, transport),
+            expected_head_sha=writer_head,
+            message="Host candidate",
         )
-
-    assert transport.calls == []
 
 
 def test_candidate_push_rejects_dirty_state_and_remote_rebinding(

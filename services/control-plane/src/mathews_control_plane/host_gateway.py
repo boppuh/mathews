@@ -31,6 +31,7 @@ from mathews_control_plane.settings import AutomationConfiguration
 
 _FRAME_HEADER = struct.Struct("!I")
 _DEFAULT_OPERATION_RESPONSE_TIMEOUTS = {
+    "git.push": 30.0,
     "repository.preflight": 30.0,
 }
 

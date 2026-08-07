@@ -125,7 +125,9 @@ cannot keep the LaunchAgent process alive indefinitely; its reserved operation
 remains `RUNNING` in the journal and is therefore reconciled as ambiguous after
 restart. Control-plane connection deadlines are separate from response
 deadlines, and repository preflight receives a bounded 30-second response
-budget for its sequential probes.
+budget for its sequential probes. Controlled push transport uses one bounded
+local object-store probe plus at most three eight-second network operations;
+`git.push` therefore receives its own 30-second response budget.
 
 An interrupted task operation remains `AMBIGUOUS`; the control plane may inspect
 it with `operation.reconcile` but must not rerun a possible mutation. The

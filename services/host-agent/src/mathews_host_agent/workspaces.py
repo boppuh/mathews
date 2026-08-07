@@ -237,6 +237,8 @@ class GitWorkspaceLifecycle:
             before = self._git_boundary_state(ownership, configuration)
             if before["head_sha"] != expected_head_sha:
                 raise WorkspaceLifecycleError("HEAD_MISMATCH")
+            if expected_head_sha != ownership.base_sha:
+                raise WorkspaceLifecycleError("CANDIDATE_PARENT_NOT_FROZEN_BASE")
             changed_paths = self._changed_paths(ownership)
             if not changed_paths:
                 raise WorkspaceLifecycleError("NOTHING_TO_COMMIT")
@@ -252,9 +254,14 @@ class GitWorkspaceLifecycle:
                 ownership,
                 expected_head_sha=expected_head_sha,
                 message=message,
+                changed_paths=changed_paths,
                 identity_environment=identity_environment,
             )
             self._assert_paths_allowed(staged_paths, configuration)
+            current_changed_paths = self._changed_paths(ownership)
+            self._assert_paths_allowed(current_changed_paths, configuration)
+            if current_changed_paths != changed_paths:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
             self._run_git(
                 workspace_path,
                 "update-ref",
@@ -277,6 +284,21 @@ class GitWorkspaceLifecycle:
                 or not isinstance(parents, list)
                 or parents != [expected_head_sha]
             ):
+                if after["head_sha"] == candidate_head_sha:
+                    self._run_git(
+                        workspace_path,
+                        "update-ref",
+                        "HEAD",
+                        expected_head_sha,
+                        candidate_head_sha,
+                        failure_code="GIT_COMMIT_FAILED",
+                    )
+                    self._run_git(
+                        workspace_path,
+                        "read-tree",
+                        expected_head_sha,
+                        failure_code="GIT_COMMIT_FAILED",
+                    )
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
             if after["head_sha"] != candidate_head_sha:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
@@ -308,6 +330,8 @@ class GitWorkspaceLifecycle:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_REQUIRED")
             if ownership.candidate_head_sha != expected_head_sha:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_NOT_HOST_OWNED")
+            if state["parent_shas"] != [ownership.base_sha]:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
             if not state["clean"]:
                 raise WorkspaceLifecycleError("WORKSPACE_NOT_CLEAN")
             self._assert_paths_allowed(
@@ -606,6 +630,7 @@ class GitWorkspaceLifecycle:
         *,
         expected_head_sha: str,
         message: str,
+        changed_paths: tuple[str, ...],
         identity_environment: Mapping[str, str],
     ) -> tuple[str, tuple[str, ...]]:
         workspace_path = Path(ownership.workspace_path)
@@ -631,8 +656,8 @@ class GitWorkspaceLifecycle:
                     object_directory,
                     "add",
                     "--all",
-                    "--",
-                    ":/",
+                    f"--pathspec-from-file={self._write_pathspec(git_directory, changed_paths)}",
+                    "--pathspec-file-nul",
                     failure_code="GIT_STAGE_FAILED",
                 )
                 staged_output = self._run_isolated_git(
@@ -701,7 +726,22 @@ class GitWorkspaceLifecycle:
             or directory_stat.st_uid != os.geteuid()
         ):
             raise WorkspaceLifecycleError("GIT_STAGE_FAILED")
+        alternates_path = object_directory / "info" / "alternates"
+        try:
+            if alternates_path.exists() and alternates_path.read_bytes().strip():
+                raise WorkspaceLifecycleError("GIT_OBJECT_ALTERNATES_PROHIBITED")
+        except OSError:
+            raise WorkspaceLifecycleError("GIT_STAGE_FAILED") from None
         return object_directory
+
+    def _write_pathspec(
+        self,
+        git_directory: Path,
+        changed_paths: tuple[str, ...],
+    ) -> Path:
+        path = git_directory / "candidate-paths"
+        self._write_private_file(path, "\0".join(changed_paths) + "\0")
+        return path
 
     def _write_isolated_git_config(
         self,
@@ -801,6 +841,7 @@ class GitWorkspaceLifecycle:
             "log",
             "--format=",
             "--name-only",
+            "-m",
             "--no-renames",
             "-z",
             f"{ownership.base_sha}..HEAD",
