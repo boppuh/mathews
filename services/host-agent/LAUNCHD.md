@@ -23,6 +23,10 @@ rewrite, follow-tag, and push-recursion settings are not trusted. No force, tag,
 merge, or release operation is available. Candidate staging also uses a
 sanitized Git directory, and repositories that configure external Git clean,
 process, or smudge filters are rejected before workspace inspection or commit.
+Repository-backed commands force filesystem monitoring off so a local
+`core.fsmonitor` executable cannot run with host-agent privileges. Candidate
+ownership is persisted before the task ref advances, making an interrupted
+commit either retryable from the frozen base or pushable from its recorded SHA.
 
 ## Prerequisites
 
@@ -117,7 +121,9 @@ progress. Lease renewal may proceed between effects. Once an effect attempt
 starts, any later handler, result-validation, or journal-finalization failure
 leaves the operation `RUNNING` and reports `AMBIGUOUS`; it is never durably
 misreported as a clean failure. Read-only operations do not require the
-mutation guard.
+mutation guard. Controlled push validates its local preconditions before that
+ambiguity boundary and does not hold the lifecycle-wide lock while waiting on
+the network, so unrelated workspaces remain available.
 
 On SIGTERM, the server stops accepting connections, closes active transports,
 and gives handlers a bounded grace period. A handler that does not cooperate

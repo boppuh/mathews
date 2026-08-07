@@ -102,6 +102,7 @@ def test_push_uses_anonymous_fd_askpass_and_is_remote_head_idempotent(
     workspace.mkdir()
     helper_root = (tmp_path / "helpers").resolve()
     transport = GitCredentialPushTransport(helper_root)
+    mutation_starts: list[str] = []
 
     first = transport.push(
         workspace_path=workspace,
@@ -109,6 +110,7 @@ def test_push_uses_anonymous_fd_askpass_and_is_remote_head_idempotent(
         branch_name="mathews/test",
         expected_sha=expected_sha,
         credential=SecretValue(token),
+        before_mutation=lambda: mutation_starts.append("first"),
     )
     second = transport.push(
         workspace_path=workspace,
@@ -116,6 +118,7 @@ def test_push_uses_anonymous_fd_askpass_and_is_remote_head_idempotent(
         branch_name="mathews/test",
         expected_sha=expected_sha,
         credential=SecretValue(token),
+        before_mutation=lambda: mutation_starts.append("second"),
     )
 
     assert first.before_sha is None
@@ -124,6 +127,7 @@ def test_push_uses_anonymous_fd_askpass_and_is_remote_head_idempotent(
     assert second.before_sha == expected_sha
     assert second.after_sha == expected_sha
     assert second.pushed is False
+    assert mutation_starts == ["first"]
     logged = log_path.read_text()
     assert logged.count("push --porcelain --no-verify") == 1
     assert "refs/heads/candidate:refs/heads/mathews/test" in logged

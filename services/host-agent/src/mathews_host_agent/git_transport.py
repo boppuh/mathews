@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +70,7 @@ class GitPushTransport(Protocol):
         branch_name: str,
         expected_sha: str,
         credential: SecretValue,
+        before_mutation: Callable[[], None] | None = None,
     ) -> GitPushObservation: ...
 
 
@@ -89,6 +90,7 @@ class GitCredentialPushTransport:
         branch_name: str,
         expected_sha: str,
         credential: SecretValue,
+        before_mutation: Callable[[], None] | None = None,
     ) -> GitPushObservation:
         if _GIT_OBJECT.fullmatch(expected_sha) is None:
             raise GitTransportError("INVALID_EXPECTED_HEAD")
@@ -125,6 +127,8 @@ class GitCredentialPushTransport:
                             after_sha=before_sha,
                             pushed=False,
                         )
+                    if before_mutation is not None:
+                        before_mutation()
                     result = self._run_authenticated_git(
                         isolated,
                         remote_url,

@@ -1,7 +1,9 @@
 import os
 import shlex
 import subprocess
-from collections.abc import Mapping
+import threading
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
@@ -394,10 +396,13 @@ class _PushTransport:
         branch_name: str,
         expected_sha: str,
         credential: SecretValue,
+        before_mutation: Callable[[], None] | None = None,
     ) -> GitPushObservation:
         assert credential.reveal() == "transport-secret"
         self.calls.append((str(workspace_path), remote_url, branch_name))
         before = self.remote_sha
+        if before != expected_sha and before_mutation is not None:
+            before_mutation()
         self.remote_sha = expected_sha
         return GitPushObservation(
             before_sha=before,
@@ -618,6 +623,32 @@ def test_candidate_commit_never_executes_repository_clean_filters(
     assert not marker.exists()
 
 
+def test_repository_commands_never_execute_a_local_filesystem_monitor(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    marker = tmp_path / "fsmonitor-executed"
+    monitor = tmp_path / "fsmonitor"
+    monitor.write_text(
+        "#!/bin/sh\n"
+        f"touch {shlex.quote(str(marker))}\n"
+        "printf '1\\n'\n"
+    )
+    monitor.chmod(0o700)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    _git(repository, "config", "core.fsmonitor", str(monitor))
+    (workspace / "feature.txt").write_text("candidate\n")
+
+    inspected = lifecycle.inspect_git(authority, configuration)
+
+    assert inspected["head_sha"] == _base
+    assert not marker.exists()
+
+
 def test_candidate_commit_rejects_repository_object_alternates(
     tmp_path: Path,
 ) -> None:
@@ -743,6 +774,115 @@ def test_candidate_push_is_exact_non_force_idempotent_and_credential_free(
     assert "transport-secret" not in repr(first)
     assert configuration.git.push_credential is not None
     assert configuration.git.push_credential.uri not in repr(first)
+
+
+def test_candidate_push_does_not_block_an_unrelated_workspace(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    configuration = _configuration(repository)
+    pushing_authority = _authority()
+    unrelated_authority = _authority()
+    created = lifecycle.create(pushing_authority, configuration)
+    lifecycle.create(unrelated_authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+    committed = lifecycle.commit_candidate(
+        pushing_authority,
+        configuration,
+        expected_head_sha=base,
+        message="Add candidate feature",
+    )
+    candidate_sha = cast(str, committed["head_sha"])
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingTransport:
+        def push(
+            self,
+            *,
+            workspace_path: Path,
+            remote_url: str,
+            branch_name: str,
+            expected_sha: str,
+            credential: SecretValue,
+            before_mutation: Callable[[], None] | None = None,
+        ) -> GitPushObservation:
+            del workspace_path, remote_url, branch_name, credential
+            if before_mutation is not None:
+                before_mutation()
+            entered.set()
+            assert release.wait(timeout=2)
+            return GitPushObservation(None, expected_sha, True)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        push_future = executor.submit(
+            lifecycle.push_candidate,
+            pushing_authority,
+            configuration,
+            expected_head_sha=candidate_sha,
+            credential=SecretValue("transport-secret"),
+            transport=cast(GitPushTransport, BlockingTransport()),
+        )
+        assert entered.wait(timeout=2)
+        inspect_future = executor.submit(
+            lifecycle.inspect_git,
+            unrelated_authority,
+            configuration,
+        )
+        unrelated_state = inspect_future.result(timeout=0.5)
+        release.set()
+        pushed = push_future.result(timeout=2)
+
+    assert unrelated_state["head_sha"] == base
+    assert pushed["remote_head_after"] == candidate_sha
+
+
+def test_candidate_commit_is_pushable_after_post_ref_process_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+    original_boundary_state = lifecycle._git_boundary_state
+    boundary_calls = 0
+
+    def interrupt_after_ref(
+        ownership: WorkspaceOwnership,
+        received_configuration: RepositoryConfiguration,
+    ) -> dict[str, object]:
+        nonlocal boundary_calls
+        boundary_calls += 1
+        if boundary_calls == 2:
+            raise WorkspaceLifecycleError("SIMULATED_PROCESS_EXIT")
+        return original_boundary_state(ownership, received_configuration)
+
+    monkeypatch.setattr(lifecycle, "_git_boundary_state", interrupt_after_ref)
+    with pytest.raises(WorkspaceLifecycleError, match="SIMULATED_PROCESS_EXIT"):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            message="Durable candidate",
+        )
+    monkeypatch.setattr(lifecycle, "_git_boundary_state", original_boundary_state)
+    candidate_sha = _git(workspace, "rev-parse", "HEAD")
+
+    pushed = lifecycle.push_candidate(
+        authority,
+        configuration,
+        expected_head_sha=candidate_sha,
+        credential=SecretValue("transport-secret"),
+        transport=cast(GitPushTransport, _PushTransport()),
+    )
+
+    assert pushed["remote_head_after"] == candidate_sha
 
 
 def test_candidate_push_rejects_the_frozen_base(

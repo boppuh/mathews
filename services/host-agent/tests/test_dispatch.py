@@ -28,6 +28,7 @@ from mathews_host_agent.dispatch import (
     HostOperationContext,
     HostOperationDefinition,
     HostOperationRegistry,
+    HostOperationRejected,
     HostRequestDispatcher,
     default_operation_registry,
 )
@@ -406,6 +407,63 @@ def test_failure_after_an_effect_attempt_remains_ambiguous(
     assert first.code == "OPERATION_AMBIGUOUS"
     assert retry.status is HostResponseStatus.AMBIGUOUS
     assert retry.code == "OPERATION_AMBIGUOUS"
+
+
+def test_staged_effect_precondition_rejection_is_not_ambiguous(
+    tmp_path: Path,
+) -> None:
+    def handler(
+        context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        def reject_before_mutation(_mark_effect_attempted: Callable[[], None]) -> None:
+            raise HostOperationRejected("HEAD_MISMATCH")
+
+        context.perform_staged_authorized_effect(reject_before_mutation)
+        return {}
+
+    dispatcher, authenticator = _dispatcher(
+        tmp_path,
+        handler,
+        mutates_host=True,
+    )
+    request = _request(idempotency_key="staged-precondition")
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(request))
+    )
+
+    assert response.status is HostResponseStatus.REJECTED
+    assert response.code == "HEAD_MISMATCH"
+
+
+def test_staged_effect_failure_after_mutation_start_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    def handler(
+        context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        def fail_after_start(mark_effect_attempted: Callable[[], None]) -> None:
+            mark_effect_attempted()
+            raise HostOperationRejected("GIT_PUSH_REJECTED")
+
+        context.perform_staged_authorized_effect(fail_after_start)
+        return {}
+
+    dispatcher, authenticator = _dispatcher(
+        tmp_path,
+        handler,
+        mutates_host=True,
+    )
+    request = _request(idempotency_key="staged-mutation")
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(request))
+    )
+
+    assert response.status is HostResponseStatus.AMBIGUOUS
+    assert response.code == "OPERATION_AMBIGUOUS"
 
 
 def test_finish_failure_remains_ambiguous_without_an_effect(
@@ -958,11 +1016,14 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
             expected_head_sha: str,
             credential: SecretValue,
             transport: object,
+            effect_started: Callable[[], None] | None = None,
         ) -> dict[str, object]:
             assert expected_head_sha == "b" * 40
             assert str(credential) == "[REDACTED]"
             assert isinstance(transport, GitCredentialPushTransport)
             calls.append("push")
+            assert effect_started is not None
+            effect_started()
             return {
                 "head_sha": expected_head_sha,
                 "remote_head_after": expected_head_sha,

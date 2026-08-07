@@ -9,7 +9,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from threading import RLock
@@ -262,18 +262,24 @@ class GitWorkspaceLifecycle:
             self._assert_paths_allowed(current_changed_paths, configuration)
             if current_changed_paths != changed_paths:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            manifest_path = self._manifest_path(authority.task_id)
+            candidate_ownership = replace(
+                ownership,
+                candidate_head_sha=candidate_head_sha,
+            )
+            self._write_ownership(manifest_path, candidate_ownership)
+            self._run_git(
+                workspace_path,
+                "read-tree",
+                candidate_head_sha,
+                failure_code="GIT_COMMIT_FAILED",
+            )
             self._run_git(
                 workspace_path,
                 "update-ref",
                 "HEAD",
                 candidate_head_sha,
                 expected_head_sha,
-                failure_code="GIT_COMMIT_FAILED",
-            )
-            self._run_git(
-                workspace_path,
-                "read-tree",
-                candidate_head_sha,
                 failure_code="GIT_COMMIT_FAILED",
             )
             after = self._git_boundary_state(ownership, configuration)
@@ -299,13 +305,10 @@ class GitWorkspaceLifecycle:
                         expected_head_sha,
                         failure_code="GIT_COMMIT_FAILED",
                     )
+                    self._write_ownership(manifest_path, ownership)
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
             if after["head_sha"] != candidate_head_sha:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
-            self._write_ownership(
-                self._manifest_path(authority.task_id),
-                replace(ownership, candidate_head_sha=candidate_head_sha),
-            )
             return {
                 **after,
                 "committed": True,
@@ -320,6 +323,7 @@ class GitWorkspaceLifecycle:
         expected_head_sha: str,
         credential: SecretValue,
         transport: GitPushTransport,
+        effect_started: Callable[[], None] | None = None,
     ) -> dict[str, object]:
         with self._lock:
             ownership = self._active_ownership(authority, configuration)
@@ -339,17 +343,22 @@ class GitWorkspaceLifecycle:
                 configuration,
             )
             remote_url = self._push_remote_url(ownership, configuration)
-            try:
-                observation = transport.push(
-                    workspace_path=Path(ownership.workspace_path),
-                    remote_url=remote_url,
-                    branch_name=ownership.branch_name,
-                    expected_sha=expected_head_sha,
-                    credential=credential,
-                )
-            except GitTransportError as error:
-                raise WorkspaceLifecycleError(error.code) from None
-            after = self._git_boundary_state(ownership, configuration)
+        try:
+            observation = transport.push(
+                workspace_path=Path(ownership.workspace_path),
+                remote_url=remote_url,
+                branch_name=ownership.branch_name,
+                expected_sha=expected_head_sha,
+                credential=credential,
+                before_mutation=effect_started,
+            )
+        except GitTransportError as error:
+            raise WorkspaceLifecycleError(error.code) from None
+        with self._lock:
+            current_ownership = self._active_ownership(authority, configuration)
+            if current_ownership != ownership:
+                raise WorkspaceLifecycleError("LOCAL_HEAD_CHANGED_DURING_PUSH")
+            after = self._git_boundary_state(current_ownership, configuration)
             if after["head_sha"] != expected_head_sha or not after["clean"]:
                 raise WorkspaceLifecycleError("LOCAL_HEAD_CHANGED_DURING_PUSH")
             return {
@@ -1277,6 +1286,8 @@ class GitWorkspaceLifecycle:
                     "git",
                     "-c",
                     "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
                     "-C",
                     str(repository_root),
                     *arguments,

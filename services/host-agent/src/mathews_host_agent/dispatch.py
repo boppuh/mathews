@@ -140,6 +140,25 @@ class HostOperationContext:
         self._authorized_effects += 1
         return result
 
+    def perform_staged_authorized_effect(
+        self,
+        effect: Callable[[Callable[[], None]], EffectResult],
+    ) -> EffectResult:
+        """Validate under the fence and mark ambiguity only at mutation start."""
+
+        if self._task_guard is None:
+            raise HostOperationRejected("AUTHORITY_NOT_ALLOWED")
+        with self._task_guard:
+            self._journal.assert_authorized(self.request)
+
+            def mark_effect_attempted() -> None:
+                self._effect_attempted = True
+
+            result = effect(mark_effect_attempted)
+            self._journal.assert_authorized(self.request)
+        self._authorized_effects += 1
+        return result
+
     def operation_status(
         self,
         *,
@@ -525,13 +544,14 @@ def default_operation_registry(
             raise HostOperationRejected("GIT_PUSH_CREDENTIAL_REQUIRED")
         credential = credential_provider.get(credential_reference)
         try:
-            result = context.perform_authorized_effect(
-                lambda: workspace_lifecycle.push_candidate(
+            result = context.perform_staged_authorized_effect(
+                lambda effect_started: workspace_lifecycle.push_candidate(
                     authority,
                     configuration,
                     expected_head_sha=cast(str, arguments["expected_head_sha"]),
                     credential=credential,
                     transport=push_transport,
+                    effect_started=effect_started,
                 )
             )
         except WorkspaceLifecycleError as error:
