@@ -20,6 +20,7 @@ from mathews_control_plane.briefing import (
     RiskLevel,
     StructuredBriefDraft,
     VerificationMethod,
+    _BriefTransitionGates,
 )
 from mathews_control_plane.briefing import (
     TestPlanStep as BriefTestPlanStep,
@@ -39,12 +40,14 @@ from mathews_control_plane.domain_models import (
     BriefDecisionDisposition,
     EvidenceRecord,
     PolicyVersion,
+    RepositoryConfiguration,
     Task,
     TaskEvent,
     TaskEventEvidenceReference,
     TaskState,
 )
 from mathews_control_plane.evidence import load_evidence
+from mathews_control_plane.task_state_machine import TaskTransitionKind
 from pydantic import ValidationError
 from sqlalchemy import Engine, func, select
 
@@ -74,6 +77,7 @@ def _create_task_and_policy(
     harness: BriefingHarness,
     *,
     policy_version: int = 1,
+    repository_prohibited_paths: tuple[str, ...] | None = None,
 ) -> UUID:
     with harness.factory.begin() as session:
         task = create_task_record(
@@ -88,6 +92,26 @@ def _create_task_and_policy(
             actor_id="local-user",
         )
         task.state = TaskState.BRIEFING
+        if repository_prohibited_paths is not None:
+            configuration = RepositoryConfiguration(
+                repository_key=task.repository,
+                version=1,
+                predecessor_id=None,
+                repository_settings={},
+                git_settings={},
+                xcode_settings={},
+                operations=[],
+                e2e_assertions=[],
+                artifact_settings={},
+                prohibited_paths=list(repository_prohibited_paths),
+                secret_references=[],
+                owner_id=task.owner_id,
+                actor_id="local-user",
+                root_correlation_id=task.root_correlation_id,
+            )
+            session.add(configuration)
+            session.flush()
+            task.repository_configuration_id = configuration.id
         session.add(
             PolicyVersion(
                 lineage_key="mvp",
@@ -109,6 +133,13 @@ def _create_task_and_policy(
         )
         session.flush()
         return task.id
+
+
+def _source_request_id(harness: BriefingHarness, task_id: UUID) -> UUID:
+    with harness.factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        return UUID(task.raw_request.removeprefix("evidence://"))
 
 
 def _draft(
@@ -194,11 +225,13 @@ def test_complete_low_risk_brief_auto_accepts_once_with_evidence(
     first = _service(briefing_harness).create(
         task_id,
         brief_id=brief_id,
+        source_request_evidence_id=_source_request_id(briefing_harness, task_id),
         draft=_draft(),
     )
     replay = _service(briefing_harness).create(
         task_id,
         brief_id=brief_id,
+        source_request_evidence_id=_source_request_id(briefing_harness, task_id),
         draft=_draft(),
     )
 
@@ -250,6 +283,7 @@ def test_complete_low_risk_brief_auto_accepts_once_with_evidence(
             _draft(path=".github/workflows/ci.yml"),
             "SENSITIVE_PATH:.github/workflows/ci.yml",
         ),
+        (_draft(path=".github"), "SENSITIVE_PATH:.github"),
         (_draft(operation_id="deploy"), "OPERATION_NOT_PREALLOWED:deploy"),
         (
             _draft(operation_risk=RiskLevel.MEDIUM),
@@ -268,6 +302,7 @@ def test_nontrivial_brief_waits_for_exact_human_approval(
     result = _service(briefing_harness).create(
         task_id,
         brief_id=uuid4(),
+        source_request_evidence_id=_source_request_id(briefing_harness, task_id),
         draft=draft,
     )
 
@@ -292,6 +327,7 @@ def test_revision_creates_a_new_version_and_returns_to_policy_routing(
     original = service.create(
         task_id,
         brief_id=uuid4(),
+        source_request_evidence_id=_source_request_id(briefing_harness, task_id),
         draft=_draft(ambiguity_flags=("UNCLEAR_SCOPE",)),
     )
     assert original.approval_request_id is not None
@@ -310,6 +346,7 @@ def test_revision_creates_a_new_version_and_returns_to_policy_routing(
     revised = service.create(
         task_id,
         brief_id=uuid4(),
+        source_request_evidence_id=_source_request_id(briefing_harness, task_id),
         draft=_draft(),
     )
 
@@ -323,6 +360,94 @@ def test_revision_creates_a_new_version_and_returns_to_policy_routing(
             .select_from(BriefApprovalDecision)
             .where(BriefApprovalDecision.task_id == task_id)
         ) == 2
+
+
+def test_repository_prohibited_path_requires_human_approval(
+    briefing_harness: BriefingHarness,
+) -> None:
+    task_id = _create_task_and_policy(
+        briefing_harness,
+        repository_prohibited_paths=(".env",),
+    )
+
+    result = _service(briefing_harness).create(
+        task_id,
+        brief_id=uuid4(),
+        source_request_evidence_id=_source_request_id(briefing_harness, task_id),
+        draft=_draft(path=".env"),
+    )
+
+    assert result.disposition is BriefDecisionDisposition.HUMAN_APPROVAL_REQUIRED
+    with briefing_harness.factory() as session:
+        decision = session.get(BriefApprovalDecision, result.decision_id)
+        assert decision is not None
+        assert "SENSITIVE_PATH:.env" in decision.ambiguity_flags
+
+
+def test_stale_request_evidence_cannot_create_a_brief(
+    briefing_harness: BriefingHarness,
+) -> None:
+    task_id = _create_task_and_policy(briefing_harness)
+    stale_source_id = _source_request_id(briefing_harness, task_id)
+    with briefing_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.raw_request = f"evidence://{uuid4()}"
+
+    with pytest.raises(BriefingConflictError, match="no longer current"):
+        _service(briefing_harness).create(
+            task_id,
+            brief_id=uuid4(),
+            source_request_evidence_id=stale_source_id,
+            draft=_draft(),
+        )
+
+    with briefing_harness.factory() as session:
+        assert session.scalar(select(func.count()).select_from(Brief)) == 0
+
+
+def test_auto_accept_gate_requires_every_exact_brief_binding(
+    briefing_harness: BriefingHarness,
+) -> None:
+    task_id = _create_task_and_policy(briefing_harness)
+    source_id = _source_request_id(briefing_harness, task_id)
+    brief_id = uuid4()
+    decision_id = uuid4()
+    with briefing_harness.factory() as session:
+        task = session.get(Task, task_id)
+        policy = session.scalar(select(PolicyVersion))
+        assert task is not None and policy is not None
+        task.accepted_brief_id = brief_id
+        task.brief_approval_decision_id = decision_id
+        exact = _BriefTransitionGates(
+            expected_policy_version_id=policy.id,
+            expected_brief_id=brief_id,
+            expected_decision_id=decision_id,
+            expected_source_request_evidence_id=source_id,
+            expected_repository_configuration_id=None,
+        )
+        stale = _BriefTransitionGates(
+            expected_policy_version_id=policy.id,
+            expected_brief_id=brief_id,
+            expected_decision_id=uuid4(),
+            expected_source_request_evidence_id=source_id,
+            expected_repository_configuration_id=None,
+        )
+
+        assert exact.evaluate(
+            session,
+            task,
+            TaskTransitionKind.AUTO_ACCEPT_BRIEF,
+            policy=policy,
+            now=_NOW,
+        ).brief_policy_bypass_authorized
+        assert not stale.evaluate(
+            session,
+            task,
+            TaskTransitionKind.AUTO_ACCEPT_BRIEF,
+            policy=policy,
+            now=_NOW,
+        ).brief_policy_bypass_authorized
 
 
 def test_routing_failure_cannot_be_bypassed_with_a_different_brief(
@@ -341,6 +466,10 @@ def test_routing_failure_cannot_be_bypassed_with_a_different_brief(
         _service(briefing_harness).create(
             task_id,
             brief_id=stranded_brief_id,
+            source_request_evidence_id=_source_request_id(
+                briefing_harness,
+                task_id,
+            ),
             draft=_draft(ambiguity_flags=("UNCLEAR_SCOPE",)),
         )
 
@@ -351,6 +480,10 @@ def test_routing_failure_cannot_be_bypassed_with_a_different_brief(
         _service(briefing_harness).create(
             task_id,
             brief_id=uuid4(),
+            source_request_evidence_id=_source_request_id(
+                briefing_harness,
+                task_id,
+            ),
             draft=_draft(),
         )
 
@@ -382,6 +515,7 @@ def test_invalid_policy_configuration_fails_closed_to_human_approval(
     result = _service(briefing_harness).create(
         task_id,
         brief_id=uuid4(),
+        source_request_evidence_id=_source_request_id(briefing_harness, task_id),
         draft=_draft(),
     )
 
@@ -427,6 +561,7 @@ def test_exact_brief_cannot_approve_under_a_different_active_policy(
     result = _service(briefing_harness).create(
         task_id,
         brief_id=uuid4(),
+        source_request_evidence_id=_source_request_id(briefing_harness, task_id),
         draft=_draft(ambiguity_flags=("UNCLEAR_SCOPE",)),
     )
     assert result.approval_request_id is not None

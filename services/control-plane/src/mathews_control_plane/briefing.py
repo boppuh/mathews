@@ -26,6 +26,7 @@ from mathews_control_plane.domain_models import (
     BriefDecisionDisposition,
     EvidenceRecord,
     PolicyVersion,
+    RepositoryConfiguration,
     Task,
     TaskEvent,
     TaskEventEvidenceReference,
@@ -291,6 +292,10 @@ class BriefingResult:
 @dataclass(frozen=True, slots=True)
 class _BriefTransitionGates(TaskTransitionGateEvaluator):
     expected_policy_version_id: UUID
+    expected_brief_id: UUID
+    expected_decision_id: UUID
+    expected_source_request_evidence_id: UUID
+    expected_repository_configuration_id: UUID | None
 
     def evaluate(
         self,
@@ -301,10 +306,16 @@ class _BriefTransitionGates(TaskTransitionGateEvaluator):
         policy: PolicyVersion,
         now: datetime,
     ) -> TaskTransitionGuards:
-        del session, task, kind, now
+        del session, kind, now
         return TaskTransitionGuards(
             brief_policy_bypass_authorized=(
                 policy.id == self.expected_policy_version_id
+                and task.accepted_brief_id == self.expected_brief_id
+                and task.brief_approval_decision_id == self.expected_decision_id
+                and task.raw_request
+                == f"evidence://{self.expected_source_request_evidence_id}"
+                and task.repository_configuration_id
+                == self.expected_repository_configuration_id
             )
         )
 
@@ -332,6 +343,7 @@ class BriefingService:
         task_id: UUID,
         *,
         brief_id: UUID,
+        source_request_evidence_id: UUID,
         draft: StructuredBriefDraft,
     ) -> BriefingResult:
         draft.validate_bindings()
@@ -339,6 +351,7 @@ class BriefingService:
         stored = self._store_version(
             task_id,
             brief_id=brief_id,
+            source_request_evidence_id=source_request_evidence_id,
             draft=draft,
             now=now,
         )
@@ -346,7 +359,17 @@ class BriefingService:
             transition = TaskTransitionService(
                 self._factory,
                 self._artifact_store,
-                gate_evaluator=_BriefTransitionGates(stored.policy.id),
+                gate_evaluator=_BriefTransitionGates(
+                    expected_policy_version_id=stored.policy.id,
+                    expected_brief_id=stored.brief.id,
+                    expected_decision_id=stored.decision.id,
+                    expected_source_request_evidence_id=(
+                        stored.source_request_evidence_id
+                    ),
+                    expected_repository_configuration_id=(
+                        stored.repository_configuration_id
+                    ),
+                ),
                 active_policy_lineage=self._active_policy_lineage,
                 principal_id=self._principal_id,
                 clock=lambda: now,
@@ -385,6 +408,7 @@ class BriefingService:
         task_id: UUID,
         *,
         brief_id: UUID,
+        source_request_evidence_id: UUID,
         draft: StructuredBriefDraft,
         now: datetime,
     ) -> _StoredBrief:
@@ -397,9 +421,19 @@ class BriefingService:
                 raise BriefingNotFoundError("task is unavailable")
             existing = session.get(Brief, brief_id)
             if existing is not None:
-                return _replayed_stored_brief(session, task, existing, draft)
+                return _replayed_stored_brief(
+                    session,
+                    task,
+                    existing,
+                    source_request_evidence_id=source_request_evidence_id,
+                    draft=draft,
+                )
             if TaskState(task.state) is not TaskState.BRIEFING:
                 raise BriefingConflictError("task is not in briefing")
+            if _request_evidence_id(task) != source_request_evidence_id:
+                raise BriefingConflictError(
+                    "brief source request evidence is no longer current"
+                )
             _require_revision_boundary(session, task)
 
             policy = _active_policy(
@@ -408,7 +442,19 @@ class BriefingService:
                 lineage_key=self._active_policy_lineage,
                 now=now,
             )
-            evaluation = _evaluate_policy(draft, policy)
+            repository_configuration = _bound_repository_configuration(
+                session,
+                task,
+            )
+            repository_paths, repository_configuration_valid = (
+                _repository_policy_paths(repository_configuration)
+            )
+            evaluation = _evaluate_policy(
+                draft,
+                policy,
+                repository_prohibited_paths=repository_paths,
+                repository_configuration_valid=repository_configuration_valid,
+            )
             predecessor = session.scalar(
                 select(Brief)
                 .where(Brief.task_id == task.id)
@@ -452,7 +498,6 @@ class BriefingService:
             )
             session.add(decision)
             session.flush()
-            source_request_evidence_id = _request_evidence_id(task)
             captured = capture_evidence(
                 session,
                 self._artifact_store,
@@ -465,6 +510,11 @@ class BriefingService:
                         None if brief.predecessor_id is None else str(brief.predecessor_id)
                     ),
                     "source_request_evidence_id": str(source_request_evidence_id),
+                    "repository_configuration_id": (
+                        None
+                        if repository_configuration is None
+                        else str(repository_configuration.id)
+                    ),
                     "brief": draft.model_dump(mode="json"),
                     "policy_version_id": str(policy.id),
                     "disposition": evaluation.disposition.value,
@@ -495,6 +545,12 @@ class BriefingService:
                     "decision_id": str(decision.id),
                     "disposition": decision.disposition.value,
                     "policy_version_id": str(policy.id),
+                    "source_request_evidence_id": str(source_request_evidence_id),
+                    "repository_configuration_id": (
+                        None
+                        if repository_configuration is None
+                        else str(repository_configuration.id)
+                    ),
                 },
                 occurred_at=now,
                 owner_id=task.owner_id,
@@ -530,6 +586,12 @@ class BriefingService:
                 policy=policy,
                 evidence=captured.record,
                 evaluation=evaluation,
+                source_request_evidence_id=source_request_evidence_id,
+                repository_configuration_id=(
+                    None
+                    if repository_configuration is None
+                    else repository_configuration.id
+                ),
                 replayed=False,
             )
 
@@ -542,6 +604,8 @@ class _StoredBrief:
     policy: PolicyVersion
     evidence: EvidenceRecord
     evaluation: BriefPolicyEvaluation
+    source_request_evidence_id: UUID
+    repository_configuration_id: UUID | None
     replayed: bool
 
 
@@ -579,6 +643,8 @@ def _replayed_stored_brief(
     session: Session,
     task: Task,
     brief: Brief,
+    *,
+    source_request_evidence_id: UUID,
     draft: StructuredBriefDraft,
 ) -> _StoredBrief:
     if brief.task_id != task.id or not _brief_matches(brief, draft):
@@ -596,12 +662,47 @@ def _replayed_stored_brief(
             EvidenceRecord.causation_id == brief.id,
         )
     )
-    if decision is None or evidence is None or decision.policy_version_id is None:
+    event = session.scalar(
+        select(TaskEvent).where(
+            TaskEvent.task_id == task.id,
+            TaskEvent.event_type == BRIEF_EVENT_TYPE,
+            TaskEvent.causation_id == brief.id,
+        )
+    )
+    if (
+        decision is None
+        or evidence is None
+        or event is None
+        or decision.policy_version_id is None
+    ):
         raise BriefingConflictError("stored brief is incomplete")
+    stored_source_id = _payload_uuid(event.payload, "source_request_evidence_id")
+    stored_repository_configuration_id = _payload_optional_uuid(
+        event.payload,
+        "repository_configuration_id",
+    )
+    if (
+        stored_source_id != source_request_evidence_id
+        or evidence.parent_correlation_id != source_request_evidence_id
+    ):
+        raise BriefingConflictError("brief id conflicts with source request evidence")
     policy = session.get(PolicyVersion, decision.policy_version_id)
     if policy is None:
         raise BriefingConflictError("stored brief policy is unavailable")
-    evaluation = _evaluate_policy(draft, policy)
+    repository_configuration = _repository_configuration(
+        session,
+        task,
+        stored_repository_configuration_id,
+    )
+    repository_paths, repository_configuration_valid = _repository_policy_paths(
+        repository_configuration
+    )
+    evaluation = _evaluate_policy(
+        draft,
+        policy,
+        repository_prohibited_paths=repository_paths,
+        repository_configuration_valid=repository_configuration_valid,
+    )
     if (
         evaluation.disposition is not BriefDecisionDisposition(decision.disposition)
         or tuple(decision.ambiguity_flags) != evaluation.flags
@@ -616,6 +717,8 @@ def _replayed_stored_brief(
         policy=policy,
         evidence=evidence,
         evaluation=evaluation,
+        source_request_evidence_id=stored_source_id,
+        repository_configuration_id=stored_repository_configuration_id,
         replayed=True,
     )
 
@@ -623,10 +726,15 @@ def _replayed_stored_brief(
 def _evaluate_policy(
     draft: StructuredBriefDraft,
     policy: PolicyVersion,
+    *,
+    repository_prohibited_paths: tuple[str, ...],
+    repository_configuration_valid: bool,
 ) -> BriefPolicyEvaluation:
     flags = list(draft.ambiguity_flags)
     if draft.scope.scope_expansion:
         flags.append("SCOPE_EXPANSION")
+    if not repository_configuration_valid:
+        flags.append("REPOSITORY_CONFIGURATION_INVALID")
     raw = policy.workflow_thresholds.get("brief_approval_policy")
     expected_fields = {
         "schema_version",
@@ -655,9 +763,13 @@ def _evaluate_policy(
         )
         if not preallowed or parsed_sensitive is None or parsed_hours is None:
             flags.append("POLICY_CONFIGURATION_INVALID")
-    sensitive = (*_BUILT_IN_SENSITIVE_PATHS, *configured_sensitive)
+    sensitive = (
+        *_BUILT_IN_SENSITIVE_PATHS,
+        *configured_sensitive,
+        *repository_prohibited_paths,
+    )
     for path in draft.scope.included_paths:
-        if any(_path_is_within(path, prefix) for prefix in sensitive):
+        if any(_path_scopes_overlap(path, prefix) for prefix in sensitive):
             flags.append(f"SENSITIVE_PATH:{path}")
     for operation in draft.scope.operations:
         if operation.operation_id not in preallowed:
@@ -721,6 +833,48 @@ def _request_evidence_id(task: Task) -> UUID:
         return UUID(task.raw_request.removeprefix(prefix))
     except ValueError:
         raise BriefingConflictError("task request evidence is unavailable") from None
+
+
+def _bound_repository_configuration(
+    session: Session,
+    task: Task,
+) -> RepositoryConfiguration | None:
+    return _repository_configuration(
+        session,
+        task,
+        task.repository_configuration_id,
+    )
+
+
+def _repository_configuration(
+    session: Session,
+    task: Task,
+    configuration_id: UUID | None,
+) -> RepositoryConfiguration | None:
+    if configuration_id is None:
+        return None
+    configuration = session.scalar(
+        select(RepositoryConfiguration)
+        .where(
+            RepositoryConfiguration.id == configuration_id,
+            RepositoryConfiguration.repository_key == task.repository,
+        )
+        .with_for_update()
+    )
+    if configuration is None:
+        raise BriefingConflictError("bound repository configuration is unavailable")
+    return configuration
+
+
+def _repository_policy_paths(
+    configuration: RepositoryConfiguration | None,
+) -> tuple[tuple[str, ...], bool]:
+    if configuration is None:
+        return (), True
+    parsed = _policy_paths(configuration.prohibited_paths)
+    if parsed is None:
+        return (), False
+    return parsed, True
 
 
 def _require_revision_boundary(session: Session, task: Task) -> None:
@@ -793,8 +947,30 @@ def _approval_hours(value: object) -> int | None:
     return value
 
 
-def _path_is_within(path: str, prefix: str) -> bool:
-    return path == prefix or path.startswith(f"{prefix}/")
+def _path_scopes_overlap(path: str, sensitive_path: str) -> bool:
+    return (
+        path == sensitive_path
+        or path.startswith(f"{sensitive_path}/")
+        or sensitive_path.startswith(f"{path}/")
+    )
+
+
+def _payload_uuid(payload: Mapping[str, object], field: str) -> UUID:
+    value = payload.get(field)
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        raise BriefingConflictError("stored brief event is invalid") from None
+
+
+def _payload_optional_uuid(
+    payload: Mapping[str, object],
+    field: str,
+) -> UUID | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    return _payload_uuid(payload, field)
 
 
 def _next_event_sequence(session: Session, task_id: UUID) -> int:
