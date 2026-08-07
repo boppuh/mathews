@@ -28,6 +28,17 @@ Repository-backed commands force filesystem monitoring off so a local
 ownership is persisted before the task ref advances, making an interrupted
 commit either retryable from the frozen base or pushable from its recorded SHA.
 
+Configured build and test execution is exposed only as `validation.run`. The
+caller selects a versioned operation ID and supplies the exact candidate SHA
+and ValidationContract version; it cannot supply command text. The host runs
+the configured `xcodebuild` argv without a shell, applies the configured
+timeout, and stores stdout, stderr, and configured artifact files in a private
+content-addressed directory. A timed-out process retains its partial output but
+always reports a non-passing cancellation status.
+The control-plane gateway reserves a 3,610-second response budget for this
+operation, covering the configuration's 3,600-second maximum plus bounded
+result capture.
+
 ## Prerequisites
 
 1. Create the runtime directory with mode `0700`:

@@ -386,6 +386,32 @@ class GitWorkspaceLifecycle:
                 "pushed": observation.pushed,
             }
 
+    def execution_context(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+        *,
+        expected_head_sha: str,
+    ) -> dict[str, object]:
+        """Return a clean exact-candidate boundary for configured execution."""
+
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            state = self._git_boundary_state(ownership, configuration)
+            if state["head_sha"] != expected_head_sha:
+                raise WorkspaceLifecycleError("HEAD_MISMATCH")
+            if ownership.candidate_head_sha != expected_head_sha:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_NOT_HOST_OWNED")
+            if state["parent_shas"] != [ownership.base_sha]:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            if not state["clean"]:
+                raise WorkspaceLifecycleError("WORKSPACE_NOT_CLEAN")
+            self._assert_paths_allowed(
+                self._candidate_history_paths(ownership),
+                configuration,
+            )
+            return {**state, "workspace_path": ownership.workspace_path}
+
     def cleanup(
         self,
         authority: TaskLeaseHostAuthority,

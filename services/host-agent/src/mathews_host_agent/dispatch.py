@@ -36,6 +36,11 @@ from mathews_configuration.host_protocol import (
 )
 
 from mathews_host_agent import __version__
+from mathews_host_agent.execution import (
+    ConfiguredExecutionError,
+    ConfiguredOperationRunner,
+    HostArtifactStore,
+)
 from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import (
     HostJournalError,
@@ -418,6 +423,7 @@ def default_operation_registry(
     workspaces: GitWorkspaceLifecycle | None = None,
     git_credentials: SecretProvider | None = None,
     git_push_transport: GitCredentialPushTransport | None = None,
+    configured_execution: ConfiguredOperationRunner | None = None,
 ) -> HostOperationRegistry:
     runner = preflight or RepositoryPreflightRunner()
     workspace_lifecycle = workspaces or GitWorkspaceLifecycle(
@@ -426,6 +432,16 @@ def default_operation_registry(
     credential_provider = git_credentials or KeychainSecretProvider()
     push_transport = git_push_transport or GitCredentialPushTransport(
         Path.home() / "Library" / "Application Support" / "Mathews" / "git-helpers"
+    )
+    execution_runner = configured_execution or ConfiguredOperationRunner(
+        workspace_lifecycle,
+        HostArtifactStore(
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "Mathews"
+            / "validation-artifacts"
+        ),
     )
 
     def health(
@@ -558,6 +574,30 @@ def default_operation_registry(
             raise HostOperationRejected(error.code) from None
         return cast(dict[str, JsonValue], result)
 
+    def validation_run(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = context.perform_staged_authorized_effect(
+                lambda effect_started: execution_runner.run(
+                    authority,
+                    configuration,
+                    operation_id=cast(str, arguments["operation_id"]),
+                    expected_head_sha=cast(str, arguments["expected_head_sha"]),
+                    validation_contract_version=cast(
+                        int,
+                        arguments["validation_contract_version"],
+                    ),
+                    effect_started=effect_started,
+                )
+            )
+        except ConfiguredExecutionError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
     def lease_probe(
         context: HostOperationContext,
         _arguments: dict[str, JsonValue],
@@ -634,6 +674,12 @@ def default_operation_registry(
                 authority=HostAuthorityKind.TASK_LEASE,
                 validate=_validate_empty,
                 handle=lease_probe,
+            ),
+            "validation.run": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_validation_run,
+                handle=validation_run,
+                mutates_host=True,
             ),
             "workspace.cleanup": HostOperationDefinition(
                 authority=HostAuthorityKind.TASK_LEASE,
@@ -729,6 +775,31 @@ def _validate_git_push(
         raise HostOperationRejected("INVALID_ARGUMENTS")
     _validate_configuration_field(arguments)
     _git_object_argument(arguments["expected_head_sha"])
+    return arguments
+
+
+def _validate_validation_run(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {
+        "configuration",
+        "expected_head_sha",
+        "operation_id",
+        "validation_contract_version",
+    }:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    _validate_configuration_field(arguments)
+    _git_object_argument(arguments["expected_head_sha"])
+    operation_id = arguments["operation_id"]
+    contract_version = arguments["validation_contract_version"]
+    if (
+        not isinstance(operation_id, str)
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,79}", operation_id) is None
+        or isinstance(contract_version, bool)
+        or not isinstance(contract_version, int)
+        or not 0 < contract_version <= 2_147_483_647
+    ):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
     return arguments
 
 

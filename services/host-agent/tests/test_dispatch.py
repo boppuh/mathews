@@ -32,6 +32,7 @@ from mathews_host_agent.dispatch import (
     HostRequestDispatcher,
     default_operation_registry,
 )
+from mathews_host_agent.execution import ConfiguredOperationRunner
 from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import (
     HostJournalError,
@@ -701,6 +702,7 @@ def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
         "operation.reconcile",
         "repository.preflight",
         "task.lease_probe",
+        "validation.run",
         "workspace.cleanup",
         "workspace.create",
         "workspace.inspect",
@@ -1030,6 +1032,29 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
                 "pushed": True,
             }
 
+    class FakeExecution:
+        def run(
+            self,
+            _authority: TaskLeaseHostAuthority,
+            _configuration: object,
+            *,
+            operation_id: str,
+            expected_head_sha: str,
+            validation_contract_version: int,
+            effect_started: Callable[[], None] | None = None,
+        ) -> dict[str, object]:
+            assert operation_id == "build"
+            assert expected_head_sha == "b" * 40
+            assert validation_contract_version == 4
+            assert effect_started is not None
+            effect_started()
+            calls.append("validation")
+            return {
+                "operation_id": operation_id,
+                "head_sha": expected_head_sha,
+                "passed": True,
+            }
+
     monkeypatch.setattr(
         dispatch_module,
         "RepositoryConfiguration",
@@ -1047,6 +1072,10 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
             git_credentials=cast(SecretProvider, FakeCredentials()),
             git_push_transport=GitCredentialPushTransport(
                 (tmp_path / "git-helpers").resolve()
+            ),
+            configured_execution=cast(
+                ConfiguredOperationRunner,
+                FakeExecution(),
             ),
         ),
         host_id="host-1",
@@ -1079,6 +1108,17 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
                 "expected_head_sha": "b" * 40,
             },
         ),
+        _request(
+            name="validation.run",
+            authority=authority,
+            idempotency_key="validation-run",
+            arguments={
+                "configuration": {"typed": "configuration"},
+                "operation_id": "build",
+                "expected_head_sha": "b" * 40,
+                "validation_contract_version": 4,
+            },
+        ),
     )
 
     responses = tuple(
@@ -1091,9 +1131,10 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
     assert all(response.status is HostResponseStatus.OK for response in responses)
     assert responses[1].execution_fencing_token == 1
     assert responses[2].execution_fencing_token == 1
+    assert responses[3].execution_fencing_token == 1
     assert "never-persist-this" not in repr(responses)
     assert push_reference.uri not in repr(responses)
-    assert calls == ["inspect", "commit", "credential", "push"]
+    assert calls == ["inspect", "commit", "credential", "push", "validation"]
 
 
 def test_git_push_rejects_legacy_configuration_without_a_credential(

@@ -378,6 +378,7 @@ def test_default_host_deadlines_cover_bounded_push_and_preflight_operations(
     assert gateway._operation_response_timeouts == {
         "git.push": 30.0,
         "repository.preflight": 30.0,
+        "validation.run": 3_610.0,
     }
 
 

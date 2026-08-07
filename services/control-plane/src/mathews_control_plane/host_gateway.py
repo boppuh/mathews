@@ -33,6 +33,7 @@ _FRAME_HEADER = struct.Struct("!I")
 _DEFAULT_OPERATION_RESPONSE_TIMEOUTS = {
     "git.push": 30.0,
     "repository.preflight": 30.0,
+    "validation.run": 3_610.0,
 }
 
 
@@ -255,7 +256,7 @@ def _remaining(deadline: float) -> float:
 
 
 def _validate_timeout(value: float) -> None:
-    if not isfinite(value) or value <= 0 or value > 30:
+    if not isfinite(value) or value <= 0 or value > 3_610:
         raise HostGatewayError("INVALID_TIMEOUT")
 
 

@@ -22,6 +22,7 @@ from mathews_configuration.host_protocol import (
 
 from mathews_host_agent import __version__
 from mathews_host_agent.dispatch import HostRequestDispatcher, default_operation_registry
+from mathews_host_agent.execution import ConfiguredOperationRunner, HostArtifactStore
 from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import HostJournalError, HostOperationJournal
 from mathews_host_agent.launchd import (
@@ -73,16 +74,23 @@ def run(settings: HostAgentSettings) -> None:
         key_id=settings.authentication_key_id,
     )
     journal = HostOperationJournal(settings.journal_path)
+    workspace_lifecycle = GitWorkspaceLifecycle(
+        settings.journal_path.parent / "workspaces"
+    )
     dispatcher = HostRequestDispatcher(
         authenticator=authenticator,
         journal=journal,
         registry=default_operation_registry(
-            workspaces=GitWorkspaceLifecycle(
-                settings.journal_path.parent / "workspaces"
-            ),
+            workspaces=workspace_lifecycle,
             git_credentials=secret_provider,
             git_push_transport=GitCredentialPushTransport(
                 settings.journal_path.parent / "git-helpers"
+            ),
+            configured_execution=ConfiguredOperationRunner(
+                workspace_lifecycle,
+                HostArtifactStore(
+                    settings.journal_path.parent / "validation-artifacts"
+                ),
             ),
         ),
         host_id=settings.host_id,
