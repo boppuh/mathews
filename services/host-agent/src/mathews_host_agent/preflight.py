@@ -89,6 +89,7 @@ _PROHIBITED_OPERATION_ARGUMENTS = frozenset(
 _READ_ONLY_COMMAND_PREFIXES = (
     ("git", "rev-parse", "--show-toplevel"),
     ("git", "remote", "get-url", "--"),
+    ("git", "remote", "get-url", "--push", "--"),
     ("xcrun", "simctl", "list", "-j"),
 )
 
@@ -388,19 +389,38 @@ class RepositoryPreflightRunner:
             and remote_name is not None
             and _GIT_NAME_PATTERN.fullmatch(remote_name) is not None
         ):
-            result = self._query(
+            fetch_result = self._query(
                 ("git", "remote", "get-url", "--", remote_name),
                 root,
             )
-            actual_remote = _single_line(result.stdout) if result is not None else None
-            actual_identity = (
-                _remote_identity(actual_remote) if actual_remote is not None else None
+            push_result = self._query(
+                ("git", "remote", "get-url", "--push", "--", remote_name),
+                root,
+            )
+            fetch_remote = (
+                _single_line(fetch_result.stdout)
+                if fetch_result is not None
+                else None
+            )
+            push_remote = (
+                _single_line(push_result.stdout)
+                if push_result is not None
+                else None
+            )
+            fetch_identity = (
+                _remote_identity(fetch_remote) if fetch_remote is not None else None
+            )
+            push_identity = (
+                _remote_identity(push_remote) if push_remote is not None else None
             )
             expected_identity = f"github.com/{configuration.repository_key.removesuffix('.git')}"
             remote_valid = (
-                result is not None
-                and result.returncode == 0
-                and actual_identity == expected_identity
+                fetch_result is not None
+                and fetch_result.returncode == 0
+                and push_result is not None
+                and push_result.returncode == 0
+                and fetch_identity == expected_identity
+                and push_identity == expected_identity
             )
         checks.append(
             _check(

@@ -1,4 +1,5 @@
 import os
+import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -521,10 +522,12 @@ def test_candidate_commit_revalidates_paths_after_staging(
     created = lifecycle.create(authority, configuration)
     workspace = Path(cast(str, created["workspace_path"]))
     (workspace / "feature.txt").write_text("candidate\n")
-    original_run_git = lifecycle._run_git
+    original_run_git = lifecycle._run_isolated_git
 
     def inject_prohibited_path(
-        repository_root: Path,
+        git_directory: Path,
+        workspace_path: Path,
+        object_directory: Path,
         *arguments: str,
         failure_code: str,
         extra_environment: Mapping[str, str] | None = None,
@@ -532,13 +535,15 @@ def test_candidate_commit_revalidates_paths_after_staging(
         if arguments[:2] == ("add", "--all"):
             (workspace / ".ENV").write_text("SECRET=value\n")
         return original_run_git(
-            repository_root,
+            git_directory,
+            workspace_path,
+            object_directory,
             *arguments,
             failure_code=failure_code,
             extra_environment=extra_environment,
         )
 
-    monkeypatch.setattr(lifecycle, "_run_git", inject_prohibited_path)
+    monkeypatch.setattr(lifecycle, "_run_isolated_git", inject_prohibited_path)
 
     with pytest.raises(WorkspaceLifecycleError, match="PROHIBITED_PATH_CHANGED"):
         lifecycle.commit_candidate(
@@ -549,6 +554,85 @@ def test_candidate_commit_revalidates_paths_after_staging(
         )
 
     assert _git(workspace, "rev-parse", "HEAD") == base
+
+
+def test_candidate_commit_never_executes_repository_clean_filters(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    marker = tmp_path / "filter-executed"
+    clean_filter = tmp_path / "clean-filter"
+    clean_filter.write_text(
+        "#!/bin/sh\n"
+        f"touch {shlex.quote(str(marker))}\n"
+        "cat\n"
+    )
+    clean_filter.chmod(0o700)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    _git(repository, "config", "filter.evil.clean", str(clean_filter))
+    (workspace / ".gitattributes").write_text("*.txt filter=evil\n")
+    (workspace / "feature.txt").write_text("candidate\n")
+
+    with pytest.raises(
+        WorkspaceLifecycleError,
+        match="GIT_FILTER_CONFIGURATION_PROHIBITED",
+    ):
+        lifecycle.commit_candidate(
+            authority,
+            configuration,
+            expected_head_sha=base,
+            message="Add filtered candidate",
+        )
+
+    assert not marker.exists()
+
+
+def test_candidate_commit_reports_the_paths_actually_staged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("candidate\n")
+    original_run_git = lifecycle._run_isolated_git
+
+    def inject_allowed_path(
+        git_directory: Path,
+        workspace_path: Path,
+        object_directory: Path,
+        *arguments: str,
+        failure_code: str,
+        extra_environment: Mapping[str, str] | None = None,
+    ) -> str:
+        if arguments[:2] == ("add", "--all"):
+            (workspace / "late.txt").write_text("late\n")
+        return original_run_git(
+            git_directory,
+            workspace_path,
+            object_directory,
+            *arguments,
+            failure_code=failure_code,
+            extra_environment=extra_environment,
+        )
+
+    monkeypatch.setattr(lifecycle, "_run_isolated_git", inject_allowed_path)
+
+    committed = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=base,
+        message="Exact staged evidence",
+    )
+
+    assert committed["changed_paths"] == ["feature.txt", "late.txt"]
 
 
 def test_git_runner_rejects_restricted_environment_overrides(

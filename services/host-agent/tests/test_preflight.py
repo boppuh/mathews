@@ -714,6 +714,7 @@ def test_preflight_resolves_exact_local_base_without_mutating_repository(
     expected_requests = {
         ("git", "rev-parse", "--show-toplevel"),
         ("git", "remote", "get-url", "--", "origin"),
+        ("git", "remote", "get-url", "--push", "--", "origin"),
         (
             "git",
             "rev-parse",
@@ -1287,6 +1288,30 @@ def test_preflight_rejects_noncanonical_or_credential_bearing_remote_transport(
 ) -> None:
     root, _sha = _repository_fixture(tmp_path)
     _run_setup_git(root, "remote", "set-url", "origin", remote_url)
+
+    report = RepositoryPreflightRunner(
+        commands=GitAndSimulatorProbe(_simulator_payload())
+    ).run(_configuration(root), attempt_id=uuid4())
+
+    assert next(
+        check
+        for check in report.checks
+        if check.code is PreflightCheckCode.GIT_REMOTE
+    ).status is PreflightStatus.BLOCKED
+
+
+def test_preflight_rejects_a_distinct_noncanonical_push_remote(
+    tmp_path: Path,
+) -> None:
+    root, _sha = _repository_fixture(tmp_path)
+    _run_setup_git(
+        root,
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "ssh://git@github.com/boppuh/mathews.git",
+    )
 
     report = RepositoryPreflightRunner(
         commands=GitAndSimulatorProbe(_simulator_payload())

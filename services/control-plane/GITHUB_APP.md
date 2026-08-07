@@ -90,6 +90,8 @@ anonymous file descriptor plus an ephemeral credential helper; it never becomes
 an agent tool argument or host result. The transport reads objects through a
 temporary sanitized Git directory, binds pushes to the host's durable candidate
 record, and ignores repository-local transport and follow-tag configuration.
+Host commit staging uses the same configuration isolation and rejects external
+Git filter drivers before they can execute.
 Draft-PR and observation calls remain inside the GitHub adapter. For the current
 repository, the operator creates a
 generic-password Keychain item with service `com.boppuh.mathews.git` and account

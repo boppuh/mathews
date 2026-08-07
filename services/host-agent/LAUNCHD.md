@@ -20,7 +20,9 @@ descriptor and ephemeral askpass helper, and sends only the durably recorded
 host-created candidate to the exact task branch. The authenticated transport
 uses a temporary, sanitized Git directory so repository-local proxy, CA, URL
 rewrite, follow-tag, and push-recursion settings are not trusted. No force, tag,
-merge, or release operation is available.
+merge, or release operation is available. Candidate staging also uses a
+sanitized Git directory, and repositories that configure external Git clean,
+process, or smudge filters are rejected before workspace inspection or commit.
 
 ## Prerequisites
 

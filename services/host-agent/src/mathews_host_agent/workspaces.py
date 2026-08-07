@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -147,6 +148,7 @@ class GitWorkspaceLifecycle:
         configuration: RepositoryConfiguration,
     ) -> dict[str, object]:
         repository_root = self._repository_root(configuration)
+        self._assert_no_external_filters(repository_root)
         self._prepare_root()
         branch_name = configuration.git.task_branch_template.format(
             task_id=str(authority.task_id)
@@ -240,38 +242,32 @@ class GitWorkspaceLifecycle:
                 raise WorkspaceLifecycleError("NOTHING_TO_COMMIT")
             self._assert_paths_allowed(changed_paths, configuration)
             workspace_path = Path(ownership.workspace_path)
-            self._run_git(
-                workspace_path,
-                "add",
-                "--all",
-                "--",
-                ":/",
-                failure_code="GIT_STAGE_FAILED",
-            )
-            staged_paths = self._staged_paths(ownership)
-            self._assert_paths_allowed(staged_paths, configuration)
-            if self._quiet_git_clean(
-                workspace_path,
-                "diff",
-                "--cached",
-                "--quiet",
-            ):
-                raise WorkspaceLifecycleError("NOTHING_TO_COMMIT")
             identity_environment = {
                 "GIT_AUTHOR_NAME": configuration.git.author.name,
                 "GIT_AUTHOR_EMAIL": configuration.git.author.email,
                 "GIT_COMMITTER_NAME": configuration.git.committer.name,
                 "GIT_COMMITTER_EMAIL": configuration.git.committer.email,
             }
+            candidate_head_sha, staged_paths = self._create_isolated_commit(
+                ownership,
+                expected_head_sha=expected_head_sha,
+                message=message,
+                identity_environment=identity_environment,
+            )
+            self._assert_paths_allowed(staged_paths, configuration)
             self._run_git(
                 workspace_path,
-                "commit",
-                "--no-gpg-sign",
-                "--no-verify",
-                "-m",
-                message,
+                "update-ref",
+                "HEAD",
+                candidate_head_sha,
+                expected_head_sha,
                 failure_code="GIT_COMMIT_FAILED",
-                extra_environment=identity_environment,
+            )
+            self._run_git(
+                workspace_path,
+                "read-tree",
+                candidate_head_sha,
+                failure_code="GIT_COMMIT_FAILED",
             )
             after = self._git_boundary_state(ownership, configuration)
             parents = after["parent_shas"]
@@ -282,8 +278,8 @@ class GitWorkspaceLifecycle:
                 or parents != [expected_head_sha]
             ):
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
-            candidate_head_sha = after["head_sha"]
-            assert isinstance(candidate_head_sha, str)
+            if after["head_sha"] != candidate_head_sha:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
             self._write_ownership(
                 self._manifest_path(authority.task_id),
                 replace(ownership, candidate_head_sha=candidate_head_sha),
@@ -291,7 +287,7 @@ class GitWorkspaceLifecycle:
             return {
                 **after,
                 "committed": True,
-                "changed_paths": list(changed_paths),
+                "changed_paths": list(staged_paths),
             }
 
     def push_candidate(
@@ -490,6 +486,7 @@ class GitWorkspaceLifecycle:
         configuration: RepositoryConfiguration,
     ) -> WorkspaceOwnership:
         repository_root = self._repository_root(configuration)
+        self._assert_no_external_filters(repository_root)
         if not self._root.exists():
             raise WorkspaceLifecycleError("WORKSPACE_NOT_FOUND")
         self._validate_root()
@@ -515,6 +512,19 @@ class GitWorkspaceLifecycle:
                 else "WORKSPACE_INCOMPLETE"
             )
         return ownership
+
+    def _assert_no_external_filters(self, repository_root: Path) -> None:
+        result = self._run_git_result(
+            repository_root,
+            "config",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|process|smudge)$",
+        )
+        if result.returncode == 0:
+            raise WorkspaceLifecycleError("GIT_FILTER_CONFIGURATION_PROHIBITED")
+        if result.returncode != 1:
+            raise WorkspaceLifecycleError("GIT_FILTER_CONFIGURATION_UNAVAILABLE")
 
     def _git_boundary_state(
         self,
@@ -590,17 +600,197 @@ class GitWorkspaceLifecycle:
             paths.update(path for path in output.split("\0") if path)
         return tuple(sorted(paths))
 
-    def _staged_paths(self, ownership: WorkspaceOwnership) -> tuple[str, ...]:
-        output = self._run_git(
-            Path(ownership.workspace_path),
-            "diff",
-            "--cached",
-            "--name-only",
-            "--no-renames",
-            "-z",
-            failure_code="GIT_STATUS_UNAVAILABLE",
+    def _create_isolated_commit(
+        self,
+        ownership: WorkspaceOwnership,
+        *,
+        expected_head_sha: str,
+        message: str,
+        identity_environment: Mapping[str, str],
+    ) -> tuple[str, tuple[str, ...]]:
+        workspace_path = Path(ownership.workspace_path)
+        object_directory = self._git_object_directory(workspace_path)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="commit-",
+                dir=self._root,
+            ) as raw_directory:
+                git_directory = Path(raw_directory)
+                self._write_isolated_git_config(git_directory, expected_head_sha)
+                self._run_isolated_git(
+                    git_directory,
+                    workspace_path,
+                    object_directory,
+                    "read-tree",
+                    expected_head_sha,
+                    failure_code="GIT_STAGE_FAILED",
+                )
+                self._run_isolated_git(
+                    git_directory,
+                    workspace_path,
+                    object_directory,
+                    "add",
+                    "--all",
+                    "--",
+                    ":/",
+                    failure_code="GIT_STAGE_FAILED",
+                )
+                staged_output = self._run_isolated_git(
+                    git_directory,
+                    workspace_path,
+                    object_directory,
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    failure_code="GIT_STATUS_UNAVAILABLE",
+                )
+                staged_paths = tuple(
+                    sorted(path for path in staged_output.split("\0") if path)
+                )
+                if not staged_paths:
+                    raise WorkspaceLifecycleError("NOTHING_TO_COMMIT")
+                tree_sha = self._validated_git_object(
+                    self._run_isolated_git(
+                        git_directory,
+                        workspace_path,
+                        object_directory,
+                        "write-tree",
+                        failure_code="GIT_COMMIT_FAILED",
+                    )
+                )
+                candidate_head_sha = self._validated_git_object(
+                    self._run_isolated_git(
+                        git_directory,
+                        workspace_path,
+                        object_directory,
+                        "commit-tree",
+                        tree_sha,
+                        "-p",
+                        expected_head_sha,
+                        "-m",
+                        message,
+                        failure_code="GIT_COMMIT_FAILED",
+                        extra_environment=identity_environment,
+                    )
+                )
+                return candidate_head_sha, staged_paths
+        except WorkspaceLifecycleError:
+            raise
+        except OSError:
+            raise WorkspaceLifecycleError("GIT_STAGE_FAILED") from None
+
+    def _git_object_directory(self, workspace_path: Path) -> Path:
+        raw_path = self._run_git(
+            workspace_path,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+            failure_code="GIT_STAGE_FAILED",
         )
-        return tuple(sorted(path for path in output.split("\0") if path))
+        try:
+            object_directory = Path(raw_path).resolve(strict=True)
+            directory_stat = object_directory.lstat()
+        except OSError:
+            raise WorkspaceLifecycleError("GIT_STAGE_FAILED") from None
+        if (
+            not object_directory.is_absolute()
+            or not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+        ):
+            raise WorkspaceLifecycleError("GIT_STAGE_FAILED")
+        return object_directory
+
+    def _write_isolated_git_config(
+        self,
+        git_directory: Path,
+        expected_head_sha: str,
+    ) -> None:
+        (git_directory / "refs" / "heads").mkdir(mode=0o700, parents=True)
+        object_format = "sha256" if len(expected_head_sha) == 64 else "sha1"
+        repository_version = "1" if object_format == "sha256" else "0"
+        config = (
+            "[core]\n"
+            f"\trepositoryformatversion = {repository_version}\n"
+            "\tbare = false\n"
+        )
+        if object_format == "sha256":
+            config += "[extensions]\n\tobjectformat = sha256\n"
+        self._write_private_file(git_directory / "config", config)
+        self._write_private_file(git_directory / "HEAD", f"{expected_head_sha}\n")
+
+    def _run_isolated_git(
+        self,
+        git_directory: Path,
+        workspace_path: Path,
+        object_directory: Path,
+        *arguments: str,
+        failure_code: str,
+        extra_environment: Mapping[str, str] | None = None,
+    ) -> str:
+        environment = {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_OBJECT_DIRECTORY": str(object_directory),
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }
+        if extra_environment is not None:
+            if set(environment) & set(extra_environment):
+                raise WorkspaceLifecycleError("GIT_ENVIRONMENT_OVERRIDE")
+            environment.update(extra_environment)
+        try:
+            result = subprocess.run(
+                (
+                    "git",
+                    f"--git-dir={git_directory}",
+                    f"--work-tree={workspace_path}",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                    *arguments,
+                ),
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=True,
+                timeout=_GIT_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise WorkspaceLifecycleError("GIT_UNAVAILABLE") from None
+        if (
+            len(result.stdout.encode()) > _MAX_GIT_OUTPUT_BYTES
+            or len(result.stderr.encode()) > _MAX_GIT_OUTPUT_BYTES
+        ):
+            raise WorkspaceLifecycleError("GIT_OUTPUT_TOO_LARGE")
+        if result.returncode != 0:
+            raise WorkspaceLifecycleError(failure_code)
+        return result.stdout.rstrip("\n")
+
+    @staticmethod
+    def _write_private_file(path: Path, payload: str) -> None:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            encoded = payload.encode()
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("private Git file write did not advance")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _candidate_history_paths(
         self,

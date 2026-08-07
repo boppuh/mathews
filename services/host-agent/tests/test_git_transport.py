@@ -1,4 +1,5 @@
 import os
+import secrets
 import shlex
 import subprocess
 from pathlib import Path
@@ -87,7 +88,7 @@ def test_push_uses_anonymous_fd_askpass_and_is_remote_head_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected_sha = "a" * 40
-    token = "ephemeral-push-token"
+    token = secrets.token_urlsafe(32)
     binary_directory, log_path = _fake_git(
         tmp_path,
         expected_sha=expected_sha,
@@ -224,7 +225,7 @@ def test_push_failure_paths_remove_ephemeral_helper(
     expected_error: str,
 ) -> None:
     expected_sha = "a" * 40
-    token = "ephemeral-push-token"
+    token = secrets.token_urlsafe(32)
     binary_directory, _log_path = _fake_git(
         tmp_path,
         expected_sha=expected_sha,
@@ -286,7 +287,7 @@ def test_transport_rejects_unsafe_inputs_before_creating_helper_material(
             remote_url=remote_url,
             branch_name=branch_name,
             expected_sha=expected_sha,
-            credential=SecretValue("ephemeral-push-token"),
+            credential=SecretValue(secrets.token_urlsafe(32)),
         )
 
     assert not helper_root.exists()
