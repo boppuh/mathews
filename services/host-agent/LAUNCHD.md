@@ -12,6 +12,22 @@ configuration and removes only a path with the exact task/configuration
 ownership record. Cancellation cleanup also requires a canonical cancellation
 identifier.
 
+Controlled Git operations are limited to `git.inspect`, `git.commit`, and
+`git.push`. Commit identity is read from the signed versioned repository
+configuration. Push resolves the configuration's opaque Keychain reference only
+inside the host process, supplies the value to Git through an anonymous file
+descriptor and ephemeral askpass helper, and sends only the durably recorded
+host-created candidate to the exact task branch. The authenticated transport
+uses a temporary, sanitized Git directory so repository-local proxy, CA, URL
+rewrite, follow-tag, and push-recursion settings are not trusted. No force, tag,
+merge, or release operation is available. Candidate staging also uses a
+sanitized Git directory, and repositories that configure external Git clean,
+process, or smudge filters are rejected before workspace inspection or commit.
+Repository-backed commands force filesystem monitoring off so a local
+`core.fsmonitor` executable cannot run with host-agent privileges. Candidate
+ownership is persisted before the task ref advances, making an interrupted
+commit either retryable from the frozen base or pushable from its recorded SHA.
+
 ## Prerequisites
 
 1. Create the runtime directory with mode `0700`:
@@ -28,7 +44,20 @@ identifier.
    as the same user in the unlocked login session. The production roadmap adds
    signed host identity and stronger credential isolation.
 
-3. Configure the control plane with the same opaque reference and socket path:
+3. Create a second, distinct generic-password item for the repository's
+   `git_settings.push_credential` reference. For this repository, use service
+   `com.boppuh.mathews.git` and account `mathews-push`, and store a fine-grained
+   token selected for only the configured repository with repository Contents
+   read/write permission and no unrelated permissions. Include the opaque
+   reference in the repository configuration's `secret_references`. Do not
+   reuse the host HMAC, GitHub App, webhook, or E2E account credential.
+
+4. Configure the repository's effective fetch and push remote as credential-free
+   HTTPS, for example `https://github.com/boppuh/mathews.git`. SSH/SCP remotes,
+   embedded credentials, queries, and fragments fail preflight. Re-point an
+   existing SSH remote before deployment.
+
+5. Configure the control plane with the host HMAC reference and socket path:
 
    ```dotenv
    MATHEWS_HOST_AUTH_KEY_REF=keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1
@@ -92,7 +121,9 @@ progress. Lease renewal may proceed between effects. Once an effect attempt
 starts, any later handler, result-validation, or journal-finalization failure
 leaves the operation `RUNNING` and reports `AMBIGUOUS`; it is never durably
 misreported as a clean failure. Read-only operations do not require the
-mutation guard.
+mutation guard. Controlled push validates its local preconditions before that
+ambiguity boundary and does not hold the lifecycle-wide lock while waiting on
+the network, so unrelated workspaces remain available.
 
 On SIGTERM, the server stops accepting connections, closes active transports,
 and gives handlers a bounded grace period. A handler that does not cooperate
@@ -100,7 +131,9 @@ cannot keep the LaunchAgent process alive indefinitely; its reserved operation
 remains `RUNNING` in the journal and is therefore reconciled as ambiguous after
 restart. Control-plane connection deadlines are separate from response
 deadlines, and repository preflight receives a bounded 30-second response
-budget for its sequential probes.
+budget for its sequential probes. Controlled push transport uses one bounded
+local object-store probe plus at most three eight-second network operations;
+`git.push` therefore receives its own 30-second response budget.
 
 An interrupted task operation remains `AMBIGUOUS`; the control plane may inspect
 it with `operation.reconcile` but must not rerun a possible mutation. The

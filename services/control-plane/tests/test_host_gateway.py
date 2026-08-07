@@ -363,6 +363,24 @@ def test_preflight_response_has_an_operation_aware_deadline(
     assert response.replayed is True
 
 
+def test_default_host_deadlines_cover_bounded_push_and_preflight_operations(
+    tmp_path: Path,
+) -> None:
+    gateway = LocalHostGateway(
+        tmp_path / "host.sock",
+        authenticator=HostMessageAuthenticator(
+            SecretValue("a" * 32),
+            key_id="control-plane-v1",
+            clock_ms=lambda: NOW_MS,
+        ),
+    )
+
+    assert gateway._operation_response_timeouts == {
+        "git.push": 30.0,
+        "repository.preflight": 30.0,
+    }
+
+
 def test_complete_response_does_not_require_peer_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

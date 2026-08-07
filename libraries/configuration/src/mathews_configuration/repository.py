@@ -279,43 +279,70 @@ class GitSettings:
     default_base_ref: str
     task_branch_template: str
     remote_name: str
+    push_credential: SecretReference | None
     author: GitIdentity
     committer: GitIdentity
 
     def __post_init__(self) -> None:
+        if self.push_credential is not None and not isinstance(
+            self.push_credential, SecretReference
+        ):
+            raise RepositoryConfigurationError(
+                "Git push credential must use an opaque secret reference"
+            )
         if _REMOTE_PATTERN.fullmatch(self.remote_name) is None:
             raise RepositoryConfigurationError("Git remote name is invalid")
         _base_ref(self.default_base_ref, self.remote_name)
         _branch_template(self.task_branch_template)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "default_base_ref": self.default_base_ref,
             "task_branch_template": self.task_branch_template,
             "remote_name": self.remote_name,
             "author": self.author.to_dict(),
             "committer": self.committer.to_dict(),
         }
+        if self.push_credential is not None:
+            result["push_credential"] = self.push_credential.uri
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> Self:
-        fields = _exact_mapping(
-            value,
-            {
-                "default_base_ref",
-                "task_branch_template",
-                "remote_name",
-                "author",
-                "committer",
-            },
-            "Git settings",
-        )
+        if not isinstance(value, Mapping):
+            raise RepositoryConfigurationError("Git settings must be an object")
+        required_fields = {
+            "default_base_ref",
+            "task_branch_template",
+            "remote_name",
+            "author",
+            "committer",
+        }
+        actual_fields = set(value)
+        allowed_fields = {
+            frozenset(required_fields),
+            frozenset(required_fields | {"push_credential"}),
+        }
+        if actual_fields not in allowed_fields:
+            raise RepositoryConfigurationError("Git settings fields are invalid")
+        fields = cast(Mapping[str, object], value)
+        has_push_credential = "push_credential" in fields
         return cls(
             default_base_ref=_string(fields["default_base_ref"], "default base ref"),
             task_branch_template=_string(
                 fields["task_branch_template"], "task branch template"
             ),
             remote_name=_string(fields["remote_name"], "Git remote name"),
+            push_credential=(
+                None
+                if not has_push_credential
+                else SecretReference.parse(
+                    _string(
+                        fields["push_credential"],
+                        "Git push credential reference",
+                    )
+                )
+            ),
             author=GitIdentity.from_dict(fields["author"]),
             committer=GitIdentity.from_dict(fields["committer"]),
         )
@@ -1285,11 +1312,22 @@ class RepositoryConfiguration:
         reference_uris = [reference.uri for reference in self.secret_references]
         if len(set(reference_uris)) != len(reference_uris):
             raise RepositoryConfigurationError("secret references must be unique")
+        if (
+            self.git.push_credential is not None
+            and self.git.push_credential.uri not in reference_uris
+        ):
+            raise RepositoryConfigurationError(
+                "Git push credential must be listed in opaque secret references"
+            )
         flow = e2e_operations[0].e2e_flow
         assert flow is not None
         if flow.test_account.uri not in reference_uris:
             raise RepositoryConfigurationError(
                 "E2E test account must be listed in opaque secret references"
+            )
+        if self.git.push_credential == flow.test_account:
+            raise RepositoryConfigurationError(
+                "Git push credential must be distinct from the E2E test account"
             )
         self._validate_e2e_assertion_bindings(flow)
 

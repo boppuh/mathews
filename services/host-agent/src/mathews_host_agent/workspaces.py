@@ -8,15 +8,24 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import RLock
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
-from mathews_configuration import RepositoryConfiguration, TaskLeaseHostAuthority
+from mathews_configuration import (
+    RepositoryConfiguration,
+    SecretValue,
+    TaskLeaseHostAuthority,
+)
+
+from mathews_host_agent.git_transport import GitPushTransport, GitTransportError
 
 _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_MANIFEST_VERSION = 1
+_MANIFEST_VERSION = 2
 _MAX_GIT_OUTPUT_BYTES = 64 * 1024
 _GIT_TIMEOUT_SECONDS = 30
 
@@ -41,6 +50,7 @@ class WorkspaceOwnership:
     branch_name: str
     base_sha: str
     state: str
+    candidate_head_sha: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -55,11 +65,12 @@ class WorkspaceOwnership:
             "branch_name": self.branch_name,
             "base_sha": self.base_sha,
             "state": self.state,
+            "candidate_head_sha": self.candidate_head_sha,
         }
 
     @classmethod
     def from_dict(cls, value: object) -> WorkspaceOwnership:
-        if not isinstance(value, dict) or set(value) != {
+        common_fields = {
             "version",
             "task_id",
             "job_id",
@@ -71,16 +82,31 @@ class WorkspaceOwnership:
             "branch_name",
             "base_sha",
             "state",
-        }:
+        }
+        if not isinstance(value, dict):
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
-        if value["version"] != _MANIFEST_VERSION:
+        version = value.get("version")
+        expected_fields = (
+            common_fields
+            if version == 1
+            else common_fields | {"candidate_head_sha"}
+            if version == _MANIFEST_VERSION
+            else set()
+        )
+        if not expected_fields or set(value) != expected_fields:
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
         string_fields = {
             name: value[name]
             for name in value
-            if name != "version"
+            if name not in {"version", "candidate_head_sha"}
         }
         if any(not isinstance(item, str) for item in string_fields.values()):
+            raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
+        candidate_head_sha = value.get("candidate_head_sha")
+        if candidate_head_sha is not None and (
+            not isinstance(candidate_head_sha, str)
+            or _GIT_OBJECT.fullmatch(candidate_head_sha) is None
+        ):
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
         try:
             task_id = UUID(string_fields["task_id"])
@@ -96,7 +122,7 @@ class WorkspaceOwnership:
             or string_fields["state"] not in {"CREATING", "ACTIVE", "CLEANED"}
         ):
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
-        return cls(**string_fields)
+        return cls(**string_fields, candidate_head_sha=candidate_head_sha)
 
 
 class GitWorkspaceLifecycle:
@@ -122,6 +148,7 @@ class GitWorkspaceLifecycle:
         configuration: RepositoryConfiguration,
     ) -> dict[str, object]:
         repository_root = self._repository_root(configuration)
+        self._assert_no_external_filters(repository_root)
         self._prepare_root()
         branch_name = configuration.git.task_branch_template.format(
             task_id=str(authority.task_id)
@@ -185,32 +212,179 @@ class GitWorkspaceLifecycle:
         authority: TaskLeaseHostAuthority,
         configuration: RepositoryConfiguration,
     ) -> dict[str, object]:
-        repository_root = self._repository_root(configuration)
-        if not self._root.exists():
-            raise WorkspaceLifecycleError("WORKSPACE_NOT_FOUND")
-        self._validate_root()
-        workspace_path = self._workspace_path(authority.task_id)
-        branch_name = configuration.git.task_branch_template.format(
-            task_id=str(authority.task_id)
-        )
-        ownership = self._read_ownership(self._manifest_path(authority.task_id))
-        if ownership is None:
-            raise WorkspaceLifecycleError("WORKSPACE_NOT_FOUND")
-        self._assert_owned(
-            ownership,
-            authority=authority,
-            configuration=configuration,
-            repository_root=repository_root,
-            workspace_path=workspace_path,
-            branch_name=branch_name,
-        )
-        if ownership.state != "ACTIVE":
-            raise WorkspaceLifecycleError(
-                "WORKSPACE_ALREADY_CLEANED"
-                if ownership.state == "CLEANED"
-                else "WORKSPACE_INCOMPLETE"
-            )
+        ownership = self._active_ownership(authority, configuration)
         return self._repository_state(ownership)
+
+    def inspect_git(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+    ) -> dict[str, object]:
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            return self._git_boundary_state(ownership, configuration)
+
+    def commit_candidate(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+        *,
+        expected_head_sha: str,
+        message: str,
+    ) -> dict[str, object]:
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            before = self._git_boundary_state(ownership, configuration)
+            if before["head_sha"] != expected_head_sha:
+                raise WorkspaceLifecycleError("HEAD_MISMATCH")
+            if expected_head_sha != ownership.base_sha:
+                raise WorkspaceLifecycleError("CANDIDATE_PARENT_NOT_FROZEN_BASE")
+            changed_paths = self._changed_paths(ownership)
+            if not changed_paths:
+                raise WorkspaceLifecycleError("NOTHING_TO_COMMIT")
+            self._assert_paths_allowed(changed_paths, configuration)
+            workspace_path = Path(ownership.workspace_path)
+            identity_environment = {
+                "GIT_AUTHOR_NAME": configuration.git.author.name,
+                "GIT_AUTHOR_EMAIL": configuration.git.author.email,
+                "GIT_COMMITTER_NAME": configuration.git.committer.name,
+                "GIT_COMMITTER_EMAIL": configuration.git.committer.email,
+            }
+            candidate_head_sha, staged_paths = self._create_isolated_commit(
+                ownership,
+                expected_head_sha=expected_head_sha,
+                message=message,
+                changed_paths=changed_paths,
+                identity_environment=identity_environment,
+            )
+            self._assert_paths_allowed(staged_paths, configuration)
+            current_changed_paths = self._changed_paths(ownership)
+            self._assert_paths_allowed(current_changed_paths, configuration)
+            if current_changed_paths != changed_paths:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            manifest_path = self._manifest_path(authority.task_id)
+            candidate_ownership = replace(
+                ownership,
+                candidate_head_sha=candidate_head_sha,
+            )
+            self._write_ownership(manifest_path, candidate_ownership)
+            try:
+                self._run_git(
+                    workspace_path,
+                    "read-tree",
+                    candidate_head_sha,
+                    failure_code="GIT_COMMIT_FAILED",
+                )
+                self._run_git(
+                    workspace_path,
+                    "update-ref",
+                    "HEAD",
+                    candidate_head_sha,
+                    expected_head_sha,
+                    failure_code="GIT_COMMIT_FAILED",
+                )
+            except WorkspaceLifecycleError:
+                current_head_sha = self._git_object(
+                    workspace_path,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                    failure_code="GIT_COMMIT_FAILED",
+                )
+                if current_head_sha == expected_head_sha:
+                    self._run_git(
+                        workspace_path,
+                        "read-tree",
+                        expected_head_sha,
+                        failure_code="GIT_COMMIT_FAILED",
+                    )
+                    self._write_ownership(manifest_path, ownership)
+                raise
+            after = self._git_boundary_state(ownership, configuration)
+            parents = after["parent_shas"]
+            if (
+                not after["clean"]
+                or after["head_sha"] == expected_head_sha
+                or not isinstance(parents, list)
+                or parents != [expected_head_sha]
+            ):
+                if after["head_sha"] == candidate_head_sha:
+                    self._run_git(
+                        workspace_path,
+                        "update-ref",
+                        "HEAD",
+                        expected_head_sha,
+                        candidate_head_sha,
+                        failure_code="GIT_COMMIT_FAILED",
+                    )
+                    self._run_git(
+                        workspace_path,
+                        "read-tree",
+                        expected_head_sha,
+                        failure_code="GIT_COMMIT_FAILED",
+                    )
+                    self._write_ownership(manifest_path, ownership)
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            if after["head_sha"] != candidate_head_sha:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            return {
+                **after,
+                "committed": True,
+                "changed_paths": list(staged_paths),
+            }
+
+    def push_candidate(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+        *,
+        expected_head_sha: str,
+        credential: SecretValue,
+        transport: GitPushTransport,
+        effect_started: Callable[[], None] | None = None,
+    ) -> dict[str, object]:
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            state = self._git_boundary_state(ownership, configuration)
+            if state["head_sha"] != expected_head_sha:
+                raise WorkspaceLifecycleError("HEAD_MISMATCH")
+            if expected_head_sha == ownership.base_sha:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_REQUIRED")
+            if ownership.candidate_head_sha != expected_head_sha:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_NOT_HOST_OWNED")
+            if state["parent_shas"] != [ownership.base_sha]:
+                raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            if not state["clean"]:
+                raise WorkspaceLifecycleError("WORKSPACE_NOT_CLEAN")
+            self._assert_paths_allowed(
+                self._candidate_history_paths(ownership),
+                configuration,
+            )
+            remote_url = self._push_remote_url(ownership, configuration)
+        try:
+            observation = transport.push(
+                workspace_path=Path(ownership.workspace_path),
+                remote_url=remote_url,
+                branch_name=ownership.branch_name,
+                expected_sha=expected_head_sha,
+                credential=credential,
+                before_mutation=effect_started,
+            )
+        except GitTransportError as error:
+            raise WorkspaceLifecycleError(error.code) from None
+        with self._lock:
+            current_ownership = self._active_ownership(authority, configuration)
+            if current_ownership != ownership:
+                raise WorkspaceLifecycleError("LOCAL_HEAD_CHANGED_DURING_PUSH")
+            after = self._git_boundary_state(current_ownership, configuration)
+            if after["head_sha"] != expected_head_sha or not after["clean"]:
+                raise WorkspaceLifecycleError("LOCAL_HEAD_CHANGED_DURING_PUSH")
+            return {
+                **after,
+                "remote_head_before": observation.before_sha,
+                "remote_head_after": observation.after_sha,
+                "pushed": observation.pushed,
+            }
 
     def cleanup(
         self,
@@ -357,6 +531,411 @@ class GitWorkspaceLifecycle:
         self._write_ownership(manifest_path, active)
         return state
 
+    def _active_ownership(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+    ) -> WorkspaceOwnership:
+        repository_root = self._repository_root(configuration)
+        self._assert_no_external_filters(repository_root)
+        if not self._root.exists():
+            raise WorkspaceLifecycleError("WORKSPACE_NOT_FOUND")
+        self._validate_root()
+        workspace_path = self._workspace_path(authority.task_id)
+        branch_name = configuration.git.task_branch_template.format(
+            task_id=str(authority.task_id)
+        )
+        ownership = self._read_ownership(self._manifest_path(authority.task_id))
+        if ownership is None:
+            raise WorkspaceLifecycleError("WORKSPACE_NOT_FOUND")
+        self._assert_owned(
+            ownership,
+            authority=authority,
+            configuration=configuration,
+            repository_root=repository_root,
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+        )
+        if ownership.state != "ACTIVE":
+            raise WorkspaceLifecycleError(
+                "WORKSPACE_ALREADY_CLEANED"
+                if ownership.state == "CLEANED"
+                else "WORKSPACE_INCOMPLETE"
+            )
+        return ownership
+
+    def _assert_no_external_filters(self, repository_root: Path) -> None:
+        result = self._run_git_result(
+            repository_root,
+            "config",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|process|smudge)$",
+        )
+        if result.returncode == 0:
+            raise WorkspaceLifecycleError("GIT_FILTER_CONFIGURATION_PROHIBITED")
+        if result.returncode != 1:
+            raise WorkspaceLifecycleError("GIT_FILTER_CONFIGURATION_UNAVAILABLE")
+
+    def _git_boundary_state(
+        self,
+        ownership: WorkspaceOwnership,
+        configuration: RepositoryConfiguration,
+    ) -> dict[str, object]:
+        state = self._repository_state(ownership)
+        ancestry = self._run_git_result(
+            Path(ownership.workspace_path),
+            "merge-base",
+            "--is-ancestor",
+            ownership.base_sha,
+            "HEAD",
+        )
+        if ancestry.returncode == 1:
+            raise WorkspaceLifecycleError("BASE_NOT_ANCESTOR")
+        if ancestry.returncode != 0:
+            raise WorkspaceLifecycleError("COMMIT_ANCESTRY_UNAVAILABLE")
+        # Validate the effective push remote at every Git boundary.
+        self._push_remote_url(ownership, configuration)
+        metadata = self._run_git(
+            Path(ownership.workspace_path),
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%cn%x00%ce%x00%P",
+            "HEAD",
+            failure_code="COMMIT_METADATA_UNAVAILABLE",
+        ).split("\0")
+        if len(metadata) != 5:
+            raise WorkspaceLifecycleError("COMMIT_METADATA_INVALID")
+        author_name, author_email, committer_name, committer_email, parents = metadata
+        actual_identity = (
+            author_name,
+            author_email,
+            committer_name,
+            committer_email,
+        )
+        expected_identity = (
+            configuration.git.author.name,
+            configuration.git.author.email,
+            configuration.git.committer.name,
+            configuration.git.committer.email,
+        )
+        if state["head_sha"] != ownership.base_sha and actual_identity != expected_identity:
+            raise WorkspaceLifecycleError("COMMIT_IDENTITY_MISMATCH")
+        parent_shas = [] if not parents else parents.split(" ")
+        if any(_GIT_OBJECT.fullmatch(parent) is None for parent in parent_shas):
+            raise WorkspaceLifecycleError("COMMIT_METADATA_INVALID")
+        return {
+            **state,
+            "remote_name": configuration.git.remote_name,
+            "author_name": author_name,
+            "author_email": author_email,
+            "committer_name": committer_name,
+            "committer_email": committer_email,
+            "parent_shas": parent_shas,
+        }
+
+    def _changed_paths(self, ownership: WorkspaceOwnership) -> tuple[str, ...]:
+        workspace_path = Path(ownership.workspace_path)
+        commands = (
+            ("diff", "--name-only", "--no-renames", "-z"),
+            ("diff", "--cached", "--name-only", "--no-renames", "-z"),
+            ("ls-files", "--others", "--exclude-standard", "-z"),
+        )
+        paths: set[str] = set()
+        for command in commands:
+            output = self._run_git(
+                workspace_path,
+                *command,
+                failure_code="GIT_STATUS_UNAVAILABLE",
+            )
+            paths.update(path for path in output.split("\0") if path)
+        return tuple(sorted(paths))
+
+    def _create_isolated_commit(
+        self,
+        ownership: WorkspaceOwnership,
+        *,
+        expected_head_sha: str,
+        message: str,
+        changed_paths: tuple[str, ...],
+        identity_environment: Mapping[str, str],
+    ) -> tuple[str, tuple[str, ...]]:
+        workspace_path = Path(ownership.workspace_path)
+        object_directory = self._git_object_directory(workspace_path)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="commit-",
+                dir=self._root,
+            ) as raw_directory:
+                git_directory = Path(raw_directory)
+                self._write_isolated_git_config(git_directory, expected_head_sha)
+                self._run_isolated_git(
+                    git_directory,
+                    workspace_path,
+                    object_directory,
+                    "read-tree",
+                    expected_head_sha,
+                    failure_code="GIT_STAGE_FAILED",
+                )
+                self._run_isolated_git(
+                    git_directory,
+                    workspace_path,
+                    object_directory,
+                    "add",
+                    "--all",
+                    f"--pathspec-from-file={self._write_pathspec(git_directory, changed_paths)}",
+                    "--pathspec-file-nul",
+                    failure_code="GIT_STAGE_FAILED",
+                )
+                staged_output = self._run_isolated_git(
+                    git_directory,
+                    workspace_path,
+                    object_directory,
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    failure_code="GIT_STATUS_UNAVAILABLE",
+                )
+                staged_paths = tuple(
+                    sorted(path for path in staged_output.split("\0") if path)
+                )
+                if not staged_paths:
+                    raise WorkspaceLifecycleError("NOTHING_TO_COMMIT")
+                tree_sha = self._validated_git_object(
+                    self._run_isolated_git(
+                        git_directory,
+                        workspace_path,
+                        object_directory,
+                        "write-tree",
+                        failure_code="GIT_COMMIT_FAILED",
+                    )
+                )
+                candidate_head_sha = self._validated_git_object(
+                    self._run_isolated_git(
+                        git_directory,
+                        workspace_path,
+                        object_directory,
+                        "commit-tree",
+                        tree_sha,
+                        "-p",
+                        expected_head_sha,
+                        "-m",
+                        message,
+                        failure_code="GIT_COMMIT_FAILED",
+                        extra_environment=identity_environment,
+                    )
+                )
+                return candidate_head_sha, staged_paths
+        except WorkspaceLifecycleError:
+            raise
+        except OSError:
+            raise WorkspaceLifecycleError("GIT_STAGE_FAILED") from None
+
+    def _git_object_directory(self, workspace_path: Path) -> Path:
+        raw_path = self._run_git(
+            workspace_path,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+            failure_code="GIT_STAGE_FAILED",
+        )
+        try:
+            object_directory = Path(raw_path).resolve(strict=True)
+            directory_stat = object_directory.lstat()
+        except OSError:
+            raise WorkspaceLifecycleError("GIT_STAGE_FAILED") from None
+        if (
+            not object_directory.is_absolute()
+            or not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+        ):
+            raise WorkspaceLifecycleError("GIT_STAGE_FAILED")
+        alternates_path = object_directory / "info" / "alternates"
+        try:
+            if alternates_path.exists() and alternates_path.read_bytes().strip():
+                raise WorkspaceLifecycleError("GIT_OBJECT_ALTERNATES_PROHIBITED")
+        except OSError:
+            raise WorkspaceLifecycleError("GIT_STAGE_FAILED") from None
+        return object_directory
+
+    def _write_pathspec(
+        self,
+        git_directory: Path,
+        changed_paths: tuple[str, ...],
+    ) -> Path:
+        path = git_directory / "candidate-paths"
+        self._write_private_file(path, "\0".join(changed_paths) + "\0")
+        return path
+
+    def _write_isolated_git_config(
+        self,
+        git_directory: Path,
+        expected_head_sha: str,
+    ) -> None:
+        (git_directory / "refs" / "heads").mkdir(mode=0o700, parents=True)
+        object_format = "sha256" if len(expected_head_sha) == 64 else "sha1"
+        repository_version = "1" if object_format == "sha256" else "0"
+        config = (
+            "[core]\n"
+            f"\trepositoryformatversion = {repository_version}\n"
+            "\tbare = false\n"
+        )
+        if object_format == "sha256":
+            config += "[extensions]\n\tobjectformat = sha256\n"
+        self._write_private_file(git_directory / "config", config)
+        self._write_private_file(git_directory / "HEAD", f"{expected_head_sha}\n")
+
+    def _run_isolated_git(
+        self,
+        git_directory: Path,
+        workspace_path: Path,
+        object_directory: Path,
+        *arguments: str,
+        failure_code: str,
+        extra_environment: Mapping[str, str] | None = None,
+    ) -> str:
+        environment = {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_OBJECT_DIRECTORY": str(object_directory),
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }
+        if extra_environment is not None:
+            if set(environment) & set(extra_environment):
+                raise WorkspaceLifecycleError("GIT_ENVIRONMENT_OVERRIDE")
+            environment.update(extra_environment)
+        try:
+            result = subprocess.run(
+                (
+                    "git",
+                    f"--git-dir={git_directory}",
+                    f"--work-tree={workspace_path}",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                    *arguments,
+                ),
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=True,
+                timeout=_GIT_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise WorkspaceLifecycleError("GIT_UNAVAILABLE") from None
+        if (
+            len(result.stdout.encode()) > _MAX_GIT_OUTPUT_BYTES
+            or len(result.stderr.encode()) > _MAX_GIT_OUTPUT_BYTES
+        ):
+            raise WorkspaceLifecycleError("GIT_OUTPUT_TOO_LARGE")
+        if result.returncode != 0:
+            raise WorkspaceLifecycleError(failure_code)
+        return result.stdout.rstrip("\n")
+
+    @staticmethod
+    def _write_private_file(path: Path, payload: str) -> None:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            encoded = payload.encode()
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("private Git file write did not advance")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _candidate_history_paths(
+        self,
+        ownership: WorkspaceOwnership,
+    ) -> tuple[str, ...]:
+        output = self._run_git(
+            Path(ownership.workspace_path),
+            "log",
+            "--format=",
+            "--name-only",
+            "-m",
+            "--no-renames",
+            "-z",
+            f"{ownership.base_sha}..HEAD",
+            "--",
+            failure_code="GIT_STATUS_UNAVAILABLE",
+        )
+        return tuple(sorted({path for path in output.split("\0") if path}))
+
+    @staticmethod
+    def _assert_paths_allowed(
+        changed_paths: tuple[str, ...],
+        configuration: RepositoryConfiguration,
+    ) -> None:
+        prohibited = tuple(
+            PurePosixPath(path.casefold())
+            for path in configuration.prohibited_paths
+        )
+        for raw_path in changed_paths:
+            path = PurePosixPath(raw_path)
+            folded_path = PurePosixPath(raw_path.casefold())
+            if (
+                not raw_path
+                or path.is_absolute()
+                or ".." in path.parts
+                or "\\" in raw_path
+                or len(raw_path) > 4096
+                or any(ord(character) < 32 for character in raw_path)
+                or any(
+                    denied == folded_path or denied in folded_path.parents
+                    for denied in prohibited
+                )
+            ):
+                raise WorkspaceLifecycleError("PROHIBITED_PATH_CHANGED")
+
+    def _push_remote_url(
+        self,
+        ownership: WorkspaceOwnership,
+        configuration: RepositoryConfiguration,
+    ) -> str:
+        remote_url = self._run_git(
+            Path(ownership.workspace_path),
+            "remote",
+            "get-url",
+            "--push",
+            "--",
+            configuration.git.remote_name,
+            failure_code="GIT_REMOTE_UNAVAILABLE",
+        )
+        parsed = urlsplit(remote_url)
+        expected_path = f"/{configuration.repository_key}"
+        try:
+            port = parsed.port
+        except ValueError:
+            raise WorkspaceLifecycleError("GIT_REMOTE_BINDING_MISMATCH") from None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "github.com"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in {None, 443}
+            or parsed.path.removesuffix(".git") != expected_path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise WorkspaceLifecycleError("GIT_REMOTE_BINDING_MISMATCH")
+        return remote_url
+
     def _repository_state(self, ownership: WorkspaceOwnership) -> dict[str, object]:
         workspace_path = Path(ownership.workspace_path)
         if not workspace_path.is_dir() or workspace_path.is_symlink():
@@ -398,13 +977,25 @@ class GitWorkspaceLifecycle:
             "HEAD^{tree}",
             failure_code="WORKSPACE_UNAVAILABLE",
         )
-        status = self._run_git(
+        untracked = self._run_git(
             workspace_path,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
             failure_code="WORKSPACE_UNAVAILABLE",
         )
+        index_clean = self._quiet_git_clean(
+            workspace_path,
+            "diff",
+            "--cached",
+            "--quiet",
+        )
+        worktree_clean = self._quiet_git_clean(
+            workspace_path,
+            "diff",
+            "--quiet",
+        ) and not untracked
         return {
             "task_id": ownership.task_id,
             "repository_key": ownership.repository_key,
@@ -413,8 +1004,20 @@ class GitWorkspaceLifecycle:
             "base_sha": ownership.base_sha,
             "head_sha": head_sha,
             "tree_sha": tree_sha,
-            "clean": not status,
+            "index_clean": index_clean,
+            "worktree_clean": worktree_clean,
+            "clean": index_clean and worktree_clean,
         }
+
+    def _quiet_git_clean(
+        self,
+        repository_root: Path,
+        *arguments: str,
+    ) -> bool:
+        result = self._run_git_result(repository_root, *arguments)
+        if result.returncode not in {0, 1}:
+            raise WorkspaceLifecycleError("GIT_STATUS_UNAVAILABLE")
+        return result.returncode == 0
 
     def _repository_root(self, configuration: RepositoryConfiguration) -> Path:
         configured = Path(configuration.repository.root)
@@ -668,8 +1271,13 @@ class GitWorkspaceLifecycle:
         repository_root: Path,
         *arguments: str,
         failure_code: str,
+        extra_environment: Mapping[str, str] | None = None,
     ) -> str:
-        result = self._run_git_result(repository_root, *arguments)
+        result = self._run_git_result(
+            repository_root,
+            *arguments,
+            extra_environment=extra_environment,
+        )
         if result.returncode != 0:
             raise WorkspaceLifecycleError(failure_code)
         return result.stdout
@@ -678,6 +1286,7 @@ class GitWorkspaceLifecycle:
     def _run_git_result(
         repository_root: Path,
         *arguments: str,
+        extra_environment: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = {
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -685,12 +1294,18 @@ class GitWorkspaceLifecycle:
             "LC_ALL": "C",
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         }
+        if extra_environment is not None:
+            if set(environment) & set(extra_environment):
+                raise WorkspaceLifecycleError("GIT_ENVIRONMENT_OVERRIDE")
+            environment.update(extra_environment)
         try:
             result = subprocess.run(
                 (
                     "git",
                     "-c",
                     "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
                     "-C",
                     str(repository_root),
                     *arguments,

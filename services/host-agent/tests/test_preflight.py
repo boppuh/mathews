@@ -417,6 +417,9 @@ def _configuration(root: Path) -> RepositoryConfiguration:
     test_account = SecretReference.parse(
         "keychain://com.boppuh.mathews.test/account"
     )
+    push_credential = SecretReference.parse(
+        "keychain://com.boppuh.mathews.git/mathews-push"
+    )
     e2e_flow = E2EFlow(
         flow_id="primary",
         version=1,
@@ -473,6 +476,7 @@ def _configuration(root: Path) -> RepositoryConfiguration:
             default_base_ref="main",
             task_branch_template="mathews/{task_id}",
             remote_name="origin",
+            push_credential=push_credential,
             author=GitIdentity("Mathews", "mathews@example.invalid"),
             committer=GitIdentity("Mathews", "mathews@example.invalid"),
         ),
@@ -626,7 +630,7 @@ def _configuration(root: Path) -> RepositoryConfiguration:
             "Fixtures/primary.json",
             "Fixtures/primary-account.json",
         ),
-        secret_references=(test_account,),
+        secret_references=(test_account, push_credential),
     )
 
 
@@ -710,6 +714,7 @@ def test_preflight_resolves_exact_local_base_without_mutating_repository(
     expected_requests = {
         ("git", "rev-parse", "--show-toplevel"),
         ("git", "remote", "get-url", "--", "origin"),
+        ("git", "remote", "get-url", "--push", "--", "origin"),
         (
             "git",
             "rev-parse",
@@ -1270,6 +1275,8 @@ def test_preflight_fails_closed_when_simulator_availability_is_omitted(
     "remote_url",
     (
         "git://github.com/boppuh/mathews.git",
+        "git@github.com:boppuh/mathews.git",
+        "ssh://git@github.com/boppuh/mathews.git",
         "ssh://git@github.com:2222/boppuh/mathews.git",
         "https://credential@github.com/boppuh/mathews.git",
         "https://[invalid/path",
@@ -1281,6 +1288,30 @@ def test_preflight_rejects_noncanonical_or_credential_bearing_remote_transport(
 ) -> None:
     root, _sha = _repository_fixture(tmp_path)
     _run_setup_git(root, "remote", "set-url", "origin", remote_url)
+
+    report = RepositoryPreflightRunner(
+        commands=GitAndSimulatorProbe(_simulator_payload())
+    ).run(_configuration(root), attempt_id=uuid4())
+
+    assert next(
+        check
+        for check in report.checks
+        if check.code is PreflightCheckCode.GIT_REMOTE
+    ).status is PreflightStatus.BLOCKED
+
+
+def test_preflight_rejects_a_distinct_noncanonical_push_remote(
+    tmp_path: Path,
+) -> None:
+    root, _sha = _repository_fixture(tmp_path)
+    _run_setup_git(
+        root,
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "ssh://git@github.com/boppuh/mathews.git",
+    )
 
     report = RepositoryPreflightRunner(
         commands=GitAndSimulatorProbe(_simulator_payload())

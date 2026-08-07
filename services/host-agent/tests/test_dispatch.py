@@ -18,6 +18,8 @@ from mathews_configuration import (
     HostResponseStatus,
     JsonValue,
     RepositoryHostAuthority,
+    SecretProvider,
+    SecretReference,
     SecretValue,
     SystemHostAuthority,
     TaskLeaseHostAuthority,
@@ -26,9 +28,11 @@ from mathews_host_agent.dispatch import (
     HostOperationContext,
     HostOperationDefinition,
     HostOperationRegistry,
+    HostOperationRejected,
     HostRequestDispatcher,
     default_operation_registry,
 )
+from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import (
     HostJournalError,
     HostOperationJournal,
@@ -405,6 +409,63 @@ def test_failure_after_an_effect_attempt_remains_ambiguous(
     assert retry.code == "OPERATION_AMBIGUOUS"
 
 
+def test_staged_effect_precondition_rejection_is_not_ambiguous(
+    tmp_path: Path,
+) -> None:
+    def handler(
+        context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        def reject_before_mutation(_mark_effect_attempted: Callable[[], None]) -> None:
+            raise HostOperationRejected("HEAD_MISMATCH")
+
+        context.perform_staged_authorized_effect(reject_before_mutation)
+        return {}
+
+    dispatcher, authenticator = _dispatcher(
+        tmp_path,
+        handler,
+        mutates_host=True,
+    )
+    request = _request(idempotency_key="staged-precondition")
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(request))
+    )
+
+    assert response.status is HostResponseStatus.REJECTED
+    assert response.code == "HEAD_MISMATCH"
+
+
+def test_staged_effect_failure_after_mutation_start_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    def handler(
+        context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        def fail_after_start(mark_effect_attempted: Callable[[], None]) -> None:
+            mark_effect_attempted()
+            raise HostOperationRejected("GIT_PUSH_REJECTED")
+
+        context.perform_staged_authorized_effect(fail_after_start)
+        return {}
+
+    dispatcher, authenticator = _dispatcher(
+        tmp_path,
+        handler,
+        mutates_host=True,
+    )
+    request = _request(idempotency_key="staged-mutation")
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(request))
+    )
+
+    assert response.status is HostResponseStatus.AMBIGUOUS
+    assert response.code == "OPERATION_AMBIGUOUS"
+
+
 def test_finish_failure_remains_ambiguous_without_an_effect(
     tmp_path: Path,
 ) -> None:
@@ -633,6 +694,9 @@ def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
     registry = default_operation_registry()
 
     assert registry.capabilities == (
+        "git.commit",
+        "git.inspect",
+        "git.push",
         "host.health",
         "operation.reconcile",
         "repository.preflight",
@@ -888,6 +952,267 @@ def test_workspace_operations_are_configuration_bound_fenced_and_typed(
         ("inspect", authority.task_id),
         ("cleanup", authority.task_id),
     ]
+
+
+def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    push_reference = SecretReference.parse("keychain://mathews/git-push")
+    calls: list[str] = []
+
+    class FakeGit:
+        push_credential = push_reference
+
+    class FakeConfiguration:
+        repository_key = "boppuh/mathews"
+        digest = "sha256:" + "1" * 64
+        git = FakeGit()
+
+    class FakeConfigurationFactory:
+        @staticmethod
+        def from_dict(
+            received_configuration_id: UUID,
+            value: object,
+        ) -> FakeConfiguration:
+            assert received_configuration_id == configuration_id
+            assert value == {"typed": "configuration"}
+            return FakeConfiguration()
+
+    class FakeCredentials:
+        def get(self, reference: SecretReference) -> SecretValue:
+            assert reference == push_reference
+            calls.append("credential")
+            return SecretValue("never-persist-this")
+
+    class FakeWorkspaces:
+        def inspect_git(
+            self,
+            _authority: TaskLeaseHostAuthority,
+            _configuration: object,
+        ) -> dict[str, object]:
+            calls.append("inspect")
+            return {"head_sha": "a" * 40, "clean": True}
+
+        def commit_candidate(
+            self,
+            _authority: TaskLeaseHostAuthority,
+            _configuration: object,
+            *,
+            expected_head_sha: str,
+            message: str,
+        ) -> dict[str, object]:
+            assert expected_head_sha == "a" * 40
+            assert message == "Candidate commit"
+            calls.append("commit")
+            return {"head_sha": "b" * 40, "clean": True, "committed": True}
+
+        def push_candidate(
+            self,
+            _authority: TaskLeaseHostAuthority,
+            _configuration: object,
+            *,
+            expected_head_sha: str,
+            credential: SecretValue,
+            transport: object,
+            effect_started: Callable[[], None] | None = None,
+        ) -> dict[str, object]:
+            assert expected_head_sha == "b" * 40
+            assert str(credential) == "[REDACTED]"
+            assert isinstance(transport, GitCredentialPushTransport)
+            calls.append("push")
+            assert effect_started is not None
+            effect_started()
+            return {
+                "head_sha": expected_head_sha,
+                "remote_head_after": expected_head_sha,
+                "pushed": True,
+            }
+
+    monkeypatch.setattr(
+        dispatch_module,
+        "RepositoryConfiguration",
+        FakeConfigurationFactory,
+    )
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=default_operation_registry(
+            workspaces=cast(GitWorkspaceLifecycle, FakeWorkspaces()),
+            git_credentials=cast(SecretProvider, FakeCredentials()),
+            git_push_transport=GitCredentialPushTransport(
+                (tmp_path / "git-helpers").resolve()
+            ),
+        ),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+    authority = _task_authority()
+    requests = (
+        _request(
+            name="git.inspect",
+            authority=authority,
+            idempotency_key="git-inspect",
+            arguments={"configuration": {"typed": "configuration"}},
+        ),
+        _request(
+            name="git.commit",
+            authority=authority,
+            idempotency_key="git-commit",
+            arguments={
+                "configuration": {"typed": "configuration"},
+                "expected_head_sha": "a" * 40,
+                "message": "Candidate commit",
+            },
+        ),
+        _request(
+            name="git.push",
+            authority=authority,
+            idempotency_key="git-push",
+            arguments={
+                "configuration": {"typed": "configuration"},
+                "expected_head_sha": "b" * 40,
+            },
+        ),
+    )
+
+    responses = tuple(
+        authenticator.verify_response(
+            dispatcher.dispatch(authenticator.sign_request(request))
+        )
+        for request in requests
+    )
+
+    assert all(response.status is HostResponseStatus.OK for response in responses)
+    assert responses[1].execution_fencing_token == 1
+    assert responses[2].execution_fencing_token == 1
+    assert "never-persist-this" not in repr(responses)
+    assert push_reference.uri not in repr(responses)
+    assert calls == ["inspect", "commit", "credential", "push"]
+
+
+def test_git_push_rejects_legacy_configuration_without_a_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LegacyGit:
+        push_credential = None
+
+    class LegacyConfiguration:
+        repository_key = "boppuh/mathews"
+        digest = "sha256:" + "1" * 64
+        git = LegacyGit()
+
+    class LegacyConfigurationFactory:
+        @staticmethod
+        def from_dict(
+            _configuration_id: UUID,
+            _value: object,
+        ) -> LegacyConfiguration:
+            return LegacyConfiguration()
+
+    monkeypatch.setattr(
+        dispatch_module,
+        "RepositoryConfiguration",
+        LegacyConfigurationFactory,
+    )
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=default_operation_registry(),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(
+            authenticator.sign_request(
+                _request(
+                    name="git.push",
+                    authority=_task_authority(),
+                    idempotency_key="legacy-git-push",
+                    arguments={
+                        "configuration": {"legacy": True},
+                        "expected_head_sha": "a" * 40,
+                    },
+                )
+            )
+        )
+    )
+
+    assert response.status is HostResponseStatus.REJECTED
+    assert response.code == "GIT_PUSH_CREDENTIAL_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    (
+        (
+            "git.commit",
+            {
+                "configuration": {},
+                "expected_head_sha": "a" * 40,
+                "message": "line one\nline two",
+            },
+        ),
+        (
+            "git.commit",
+            {
+                "configuration": {},
+                "expected_head_sha": "not-a-sha",
+                "message": "Candidate commit",
+            },
+        ),
+        (
+            "git.push",
+            {
+                "configuration": {},
+                "expected_head_sha": "a" * 40,
+                "force": True,
+            },
+        ),
+    ),
+)
+def test_controlled_git_operations_reject_unbounded_or_force_arguments(
+    tmp_path: Path,
+    name: str,
+    arguments: dict[str, JsonValue],
+) -> None:
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=default_operation_registry(),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(
+            authenticator.sign_request(
+                _request(
+                    name=name,
+                    idempotency_key=f"invalid-{name}",
+                    arguments=arguments,
+                )
+            )
+        )
+    )
+
+    assert response.status is HostResponseStatus.REJECTED
+    assert response.code == "INVALID_ARGUMENTS"
 
 
 @pytest.mark.parametrize(

@@ -196,6 +196,7 @@ def _repository_configuration_arguments(
             "default_base_ref": "refs/remotes/origin/main",
             "task_branch_template": "mathews/{task_id}",
             "remote_name": "origin",
+            "push_credential": "keychain://mathews/git-push",
             "author": {"name": "Mathews", "email": "mathews@example.test"},
             "committer": {"name": "Mathews", "email": "mathews@example.test"},
         },
@@ -281,7 +282,7 @@ def _repository_configuration_arguments(
             "Fixtures/primary.json",
             "Fixtures/primary-account.json",
         ],
-        "secret_references": [test_account],
+        "secret_references": [test_account, "keychain://mathews/git-push"],
     }
 
 
