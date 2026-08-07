@@ -217,7 +217,7 @@ def test_artifact_store_reuses_verified_content_and_rejects_corruption(
         store.put_file(source, role="STDOUT", source_path=None)
 
 
-def test_authorization_loss_terminates_work_and_retains_partial_output(
+def test_authorization_error_terminates_work_retains_output_and_is_not_relabelled(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -242,23 +242,23 @@ def test_authorization_loss_terminates_work_and_retains_partial_output(
     )
     store_root = (tmp_path / "store").resolve()
 
-    result = ConfiguredOperationRunner(
-        cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
-        HostArtifactStore(store_root),
-    ).run(
-        _authority(),
-        configuration,
-        operation_id="build",
-        expected_head_sha="a" * 40,
-        validation_contract_version=1,
-        assert_authorized=lambda: (_ for _ in ()).throw(RuntimeError("fenced")),
-    )
+    with pytest.raises(RuntimeError, match="journal unavailable"):
+        ConfiguredOperationRunner(
+            cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
+            HostArtifactStore(store_root),
+        ).run(
+            _authority(),
+            configuration,
+            operation_id="build",
+            expected_head_sha="a" * 40,
+            validation_contract_version=1,
+            assert_authorized=lambda: (_ for _ in ()).throw(
+                RuntimeError("journal unavailable")
+            ),
+        )
 
-    references = cast(list[dict[str, object]], result["artifacts"])
-    stdout = next(reference for reference in references if reference["role"] == "STDOUT")
-    assert result["passed"] is False
-    assert result["cancellation_status"] == "AUTHORIZATION_LOST"
-    assert _artifact_bytes(store_root, stdout["address"]) == b"partial\n"
+    partial_address = hashlib.sha256(b"partial\n").hexdigest()
+    assert (store_root / partial_address).read_bytes() == b"partial\n"
 
 
 def test_execution_rejects_unknown_operation_before_starting_effect(

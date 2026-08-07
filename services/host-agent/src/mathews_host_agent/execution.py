@@ -202,7 +202,7 @@ class ConfiguredOperationRunner:
             stderr_path = output_root / "stderr"
             if effect_started is not None:
                 effect_started()
-            returncode, timed_out, output_limited, authorization_lost = self._execute(
+            returncode, timed_out, output_limited, authorization_error = self._execute(
                 workspace,
                 operation.argv,
                 operation.timeout_seconds,
@@ -216,6 +216,8 @@ class ConfiguredOperationRunner:
                 self._artifacts.put_file(stdout_path, role="STDOUT", source_path=None),
                 self._artifacts.put_file(stderr_path, role="STDERR", source_path=None),
             ]
+            if authorization_error is not None:
+                raise authorization_error
             references.extend(
                 self._collect_configured_artifacts(
                     workspace,
@@ -239,8 +241,6 @@ class ConfiguredOperationRunner:
         cancellation_status = (
             "TIMED_OUT"
             if timed_out
-            else "AUTHORIZATION_LOST"
-            if authorization_lost
             else "TERMINATED"
             if returncode < 0
             else "NOT_REQUESTED"
@@ -281,7 +281,7 @@ class ConfiguredOperationRunner:
         *,
         effect_yielded: Callable[[], None] | None,
         assert_authorized: Callable[[], None] | None,
-    ) -> tuple[int, bool, bool, bool]:
+    ) -> tuple[int, bool, bool, Exception | None]:
         isolated_home = stdout_path.parent / "home"
         isolated_temporary = stdout_path.parent / "tmp"
         isolated_home.mkdir(mode=0o700)
@@ -313,7 +313,7 @@ class ConfiguredOperationRunner:
                 authorization_deadline = time.monotonic() + 1
                 timed_out = False
                 output_limited = False
-                authorization_lost = False
+                authorization_error: Exception | None = None
                 while process.poll() is None:
                     now = time.monotonic()
                     timed_out = now >= deadline
@@ -327,8 +327,8 @@ class ConfiguredOperationRunner:
                     if assert_authorized is not None and now >= authorization_deadline:
                         try:
                             assert_authorized()
-                        except Exception:
-                            authorization_lost = True
+                        except Exception as error:
+                            authorization_error = error
                             ConfiguredOperationRunner._terminate(process)
                             break
                         authorization_deadline = now + 1
@@ -338,7 +338,7 @@ class ConfiguredOperationRunner:
                     for path in (stdout_path, stderr_path):
                         with path.open("r+b") as capture:
                             capture.truncate(_MAX_CAPTURE_BYTES)
-                return returncode, timed_out, output_limited, authorization_lost
+                return returncode, timed_out, output_limited, authorization_error
         except (OSError, subprocess.SubprocessError):
             raise ConfiguredExecutionError("CONFIGURED_OPERATION_FAILED") from None
 
