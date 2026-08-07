@@ -33,6 +33,7 @@ _FRAME_HEADER = struct.Struct("!I")
 _DEFAULT_OPERATION_RESPONSE_TIMEOUTS = {
     "git.push": 30.0,
     "repository.preflight": 30.0,
+    "validation.run": 3_720.0,
 }
 
 
@@ -74,7 +75,10 @@ class LocalHostGateway:
                 )
             except HostProtocolError:
                 raise HostGatewayError("INVALID_TIMEOUT") from None
-            _validate_timeout(timeout)
+            _validate_timeout(
+                timeout,
+                maximum=(3_720 if operation_name == "validation.run" else 30),
+            )
         self._socket_path = socket_path
         self._authenticator = authenticator
         self._connection_timeout_seconds = connection_timeout_seconds
@@ -254,8 +258,8 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
-def _validate_timeout(value: float) -> None:
-    if not isfinite(value) or value <= 0 or value > 30:
+def _validate_timeout(value: float, *, maximum: float = 30) -> None:
+    if not isfinite(value) or value <= 0 or value > maximum:
         raise HostGatewayError("INVALID_TIMEOUT")
 
 

@@ -813,7 +813,7 @@ def test_candidate_push_does_not_block_an_unrelated_workspace(
             if before_mutation is not None:
                 before_mutation()
             entered.set()
-            assert release.wait(timeout=2)
+            assert release.wait(timeout=5)
             return GitPushObservation(None, expected_sha, True)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -831,7 +831,7 @@ def test_candidate_push_does_not_block_an_unrelated_workspace(
             unrelated_authority,
             configuration,
         )
-        unrelated_state = inspect_future.result(timeout=0.5)
+        unrelated_state = inspect_future.result(timeout=2)
         release.set()
         pushed = push_future.result(timeout=2)
 

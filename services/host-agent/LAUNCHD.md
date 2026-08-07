@@ -28,6 +28,33 @@ Repository-backed commands force filesystem monitoring off so a local
 ownership is persisted before the task ref advances, making an interrupted
 commit either retryable from the frozen base or pushable from its recorded SHA.
 
+Configured build and test execution is exposed only as `validation.run`. The
+caller selects a versioned operation ID and supplies the exact candidate SHA
+and ValidationContract version; it cannot supply command text. The host runs
+the configured `xcodebuild` argv without a shell, applies the configured
+timeout, and stores stdout, stderr, and configured artifact files in a private
+task-scoped content-addressed directory. The authenticated `artifact.read`
+operation transfers those bytes to the control plane in chunks of at most 256
+KiB and cannot read another task's artifacts. A timed-out process retains its
+partial output but always reports a non-passing cancellation status.
+The control-plane gateway reserves a 3,720-second response budget for this
+operation, covering the configuration's 3,600-second maximum plus bounded
+result capture. At most six configured operations run concurrently, reserving
+two of the server's eight workers for lease renewal and bounded control
+requests. The execution yields the task guard after its first host mutation and
+rechecks the durable fence every second, allowing the same lease to renew while
+terminating work that expires or is superseded. Authorization loss produces an
+ambiguous response containing the immutable partial-output references rather
+than discarding the recovery evidence.
+
+Before a `SIMULATOR_E2E` operation, the host resolves the configured runtime and
+device type to a concrete available simulator, rehashes the pinned harness,
+fixture, and account-recipe files, verifies the exact harness source set, and
+applies shutdown, erase, boot, and blocking boot-status steps. The opaque test
+account is resolved only inside the host boundary and exposed to the pinned
+XCTest through a mode-`0600` temporary file; the configured `xcodebuild test`
+then builds and installs the candidate before running that test.
+
 ## Prerequisites
 
 1. Create the runtime directory with mode `0700`:
@@ -125,9 +152,10 @@ mutation guard. Controlled push validates its local preconditions before that
 ambiguity boundary and does not hold the lifecycle-wide lock while waiting on
 the network, so unrelated workspaces remain available.
 
-On SIGTERM, the server stops accepting connections, closes active transports,
-and gives handlers a bounded grace period. A handler that does not cooperate
-cannot keep the LaunchAgent process alive indefinitely; its reserved operation
+On SIGTERM, the runner rejects new validation work and sends TERM followed by
+KILL to every still-owned validation process group, including surviving
+descendants. The server stops accepting connections, closes active transports,
+and gives handlers a bounded grace period. An interrupted reserved operation
 remains `RUNNING` in the journal and is therefore reconciled as ambiguous after
 restart. Control-plane connection deadlines are separate from response
 deadlines, and repository preflight receives a bounded 30-second response

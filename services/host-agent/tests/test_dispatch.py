@@ -32,6 +32,7 @@ from mathews_host_agent.dispatch import (
     HostRequestDispatcher,
     default_operation_registry,
 )
+from mathews_host_agent.execution import ConfiguredOperationRunner, HostArtifactStore
 from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import (
     HostJournalError,
@@ -466,6 +467,84 @@ def test_staged_effect_failure_after_mutation_start_is_ambiguous(
     assert response.code == "OPERATION_AMBIGUOUS"
 
 
+def test_renewable_effect_yields_guard_for_same_lease_renewal(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def long_operation(
+        context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        def effect(
+            mark_effect_attempted: Callable[[], None],
+            yield_guard: Callable[[], None],
+            assert_authorized: Callable[[], None],
+        ) -> None:
+            mark_effect_attempted()
+            yield_guard()
+            entered.set()
+            assert release.wait(timeout=2)
+            assert_authorized()
+
+        context.perform_renewable_authorized_effect(effect)
+        return {"completed": True}
+
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=HostOperationRegistry(
+            {
+                "test.execute": HostOperationDefinition(
+                    authority=HostAuthorityKind.TASK_LEASE,
+                    validate=_empty,
+                    handle=long_operation,
+                    mutates_host=True,
+                ),
+                "test.renew": HostOperationDefinition(
+                    authority=HostAuthorityKind.TASK_LEASE,
+                    validate=_empty,
+                    handle=lambda _context, _arguments: {"renewed": True},
+                ),
+            }
+        ),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+    authority = _task_authority()
+    operation = _request(authority=authority, idempotency_key="long-operation")
+    renewal = _request(
+        name="test.renew",
+        authority=replace(
+            authority,
+            lease_expires_at_ms=authority.lease_expires_at_ms + 60_000,
+        ),
+        idempotency_key="renew-during-operation",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        operation_future = executor.submit(
+            dispatcher.dispatch,
+            authenticator.sign_request(operation),
+        )
+        assert entered.wait(timeout=2)
+        renewal_response = authenticator.verify_response(
+            dispatcher.dispatch(authenticator.sign_request(renewal))
+        )
+        release.set()
+        operation_response = authenticator.verify_response(
+            operation_future.result(timeout=2)
+        )
+
+    assert renewal_response.status is HostResponseStatus.OK
+    assert operation_response.status is HostResponseStatus.OK
+
+
 def test_finish_failure_remains_ambiguous_without_an_effect(
     tmp_path: Path,
 ) -> None:
@@ -690,10 +769,166 @@ def test_handler_crossing_lease_expiry_cannot_commit(tmp_path: Path) -> None:
     assert retry.code == "OPERATION_AMBIGUOUS"
 
 
+def test_renewable_effect_returns_recovery_evidence_when_authority_is_lost(
+    tmp_path: Path,
+) -> None:
+    clock = [NOW_MS]
+    authenticator = HostMessageAuthenticator(
+        SecretValue("a" * 32),
+        key_id="control-plane-v1",
+        clock_ms=lambda: clock[0],
+    )
+    journal = HostOperationJournal(
+        _runtime_directory(tmp_path) / "journal.sqlite3",
+        clock_ms=lambda: clock[0],
+    )
+
+    def validation(
+        context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        def run(
+            effect_started: Callable[[], None],
+            effect_yielded: Callable[[], None],
+            _assert_authorized: Callable[[], None],
+        ) -> dict[str, JsonValue]:
+            effect_started()
+            effect_yielded()
+            clock[0] = NOW_MS + 20
+            return {
+                "passed": False,
+                "cancellation_status": "AUTHORIZATION_LOST",
+                "artifacts": [
+                    {
+                        "address": "sha256:" + "a" * 64,
+                        "size_bytes": 7,
+                        "role": "STDOUT",
+                        "source_path": None,
+                    }
+                ],
+            }
+
+        return context.perform_renewable_authorized_effect(run)
+
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=journal,
+        registry=HostOperationRegistry(
+            {
+                "test.execute": HostOperationDefinition(
+                    authority=HostAuthorityKind.TASK_LEASE,
+                    validate=_empty,
+                    handle=validation,
+                    mutates_host=True,
+                )
+            }
+        ),
+        host_id="host-1",
+        clock_ms=lambda: clock[0],
+    )
+    request = _request(
+        authority=_task_authority(lease_expires_at_ms=NOW_MS + 10)
+    )
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(authenticator.sign_request(request))
+    )
+
+    assert response.status is HostResponseStatus.AMBIGUOUS
+    assert response.code == "OPERATION_AMBIGUOUS"
+    assert response.result["cancellation_status"] == "AUTHORIZATION_LOST"
+    assert response.result["artifacts"] == [
+        {
+            "address": "sha256:" + "a" * 64,
+            "size_bytes": 7,
+            "role": "STDOUT",
+            "source_path": None,
+        }
+    ]
+
+
+def test_artifact_read_is_authenticated_bounded_and_task_scoped(
+    tmp_path: Path,
+) -> None:
+    authority = _task_authority()
+    source = tmp_path / "artifact"
+    source.write_bytes(b"immutable-evidence")
+    artifact_store = HostArtifactStore((tmp_path / "artifacts").resolve())
+    reference = artifact_store.put_file(
+        source,
+        task_id=authority.task_id,
+        role="STDOUT",
+        source_path=None,
+    )
+
+    class FakeExecution:
+        @property
+        def artifact_store(self) -> HostArtifactStore:
+            return artifact_store
+
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=default_operation_registry(
+            configured_execution=cast(
+                ConfiguredOperationRunner,
+                FakeExecution(),
+            )
+        ),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+    arguments: dict[str, JsonValue] = {
+        "address": reference.address,
+        "offset": 0,
+        "length": 9,
+    }
+
+    response = authenticator.verify_response(
+        dispatcher.dispatch(
+            authenticator.sign_request(
+                _request(
+                    name="artifact.read",
+                    authority=authority,
+                    arguments=arguments,
+                )
+            )
+        )
+    )
+    foreign = authenticator.verify_response(
+        dispatcher.dispatch(
+            authenticator.sign_request(
+                _request(
+                    name="artifact.read",
+                    authority=replace(
+                        authority,
+                        task_id=uuid4(),
+                        job_id=uuid4(),
+                        lease_id=uuid4(),
+                    ),
+                    idempotency_key="foreign-artifact",
+                    arguments=arguments,
+                )
+            )
+        )
+    )
+
+    assert response.status is HostResponseStatus.OK
+    assert response.result["data_base64"] == "aW1tdXRhYmxl"
+    assert response.result["eof"] is False
+    assert foreign.status is HostResponseStatus.REJECTED
+    assert foreign.code == "ARTIFACT_UNAVAILABLE"
+
+
 def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
     registry = default_operation_registry()
 
     assert registry.capabilities == (
+        "artifact.read",
         "git.commit",
         "git.inspect",
         "git.push",
@@ -701,6 +936,7 @@ def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
         "operation.reconcile",
         "repository.preflight",
         "task.lease_probe",
+        "validation.run",
         "workspace.cleanup",
         "workspace.create",
         "workspace.inspect",
@@ -1030,6 +1266,35 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
                 "pushed": True,
             }
 
+    class FakeExecution:
+        def run(
+            self,
+            _authority: TaskLeaseHostAuthority,
+            _configuration: object,
+            *,
+            operation_id: str,
+            expected_head_sha: str,
+            validation_contract_version: int,
+            effect_started: Callable[[], None] | None = None,
+            effect_yielded: Callable[[], None] | None = None,
+            assert_authorized: Callable[[], None] | None = None,
+        ) -> dict[str, object]:
+            assert operation_id == "build"
+            assert expected_head_sha == "b" * 40
+            assert validation_contract_version == 4
+            assert effect_started is not None
+            assert effect_yielded is not None
+            assert assert_authorized is not None
+            effect_started()
+            effect_yielded()
+            assert_authorized()
+            calls.append("validation")
+            return {
+                "operation_id": operation_id,
+                "head_sha": expected_head_sha,
+                "passed": True,
+            }
+
     monkeypatch.setattr(
         dispatch_module,
         "RepositoryConfiguration",
@@ -1047,6 +1312,10 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
             git_credentials=cast(SecretProvider, FakeCredentials()),
             git_push_transport=GitCredentialPushTransport(
                 (tmp_path / "git-helpers").resolve()
+            ),
+            configured_execution=cast(
+                ConfiguredOperationRunner,
+                FakeExecution(),
             ),
         ),
         host_id="host-1",
@@ -1079,6 +1348,17 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
                 "expected_head_sha": "b" * 40,
             },
         ),
+        _request(
+            name="validation.run",
+            authority=authority,
+            idempotency_key="validation-run",
+            arguments={
+                "configuration": {"typed": "configuration"},
+                "operation_id": "build",
+                "expected_head_sha": "b" * 40,
+                "validation_contract_version": 4,
+            },
+        ),
     )
 
     responses = tuple(
@@ -1091,9 +1371,10 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
     assert all(response.status is HostResponseStatus.OK for response in responses)
     assert responses[1].execution_fencing_token == 1
     assert responses[2].execution_fencing_token == 1
+    assert responses[3].execution_fencing_token == 1
     assert "never-persist-this" not in repr(responses)
     assert push_reference.uri not in repr(responses)
-    assert calls == ["inspect", "commit", "credential", "push"]
+    assert calls == ["inspect", "commit", "credential", "push", "validation"]
 
 
 def test_git_push_rejects_legacy_configuration_without_a_credential(

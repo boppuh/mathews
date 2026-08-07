@@ -22,11 +22,12 @@ complete here unless its backlog definition of done is satisfied on `main`.
   cockpit shell, `2.3` durable live task events,
   plus `3.1` validated repository configuration and read-only preflight, `3.2`
   authenticated macOS host agent, `3.3` task-owned Git workspace lifecycle,
+  `3.4` controlled Git branch, commit, and push operations,
   `5.1` deterministic simulator-flow
   contracts, and `6.1` least-privilege GitHub App authentication.
-- Remaining: 22 of 40 MVP tasks.
-- Active next wave: Wave 4, user control and orchestration.
-- Next completion target: `3.4`.
+- Remaining: 21 of 40 MVP tasks.
+- Active next wave: Wave 5, controlled execution adapters.
+- Next completion target: `3.5`.
 
 ## Operating model
 

@@ -22,6 +22,7 @@ from mathews_configuration.host_protocol import (
 
 from mathews_host_agent import __version__
 from mathews_host_agent.dispatch import HostRequestDispatcher, default_operation_registry
+from mathews_host_agent.execution import ConfiguredOperationRunner, HostArtifactStore
 from mathews_host_agent.git_transport import GitCredentialPushTransport
 from mathews_host_agent.journal import HostJournalError, HostOperationJournal
 from mathews_host_agent.launchd import (
@@ -73,38 +74,51 @@ def run(settings: HostAgentSettings) -> None:
         key_id=settings.authentication_key_id,
     )
     journal = HostOperationJournal(settings.journal_path)
+    workspace_lifecycle = GitWorkspaceLifecycle(
+        settings.journal_path.parent / "workspaces"
+    )
+    stopped = threading.Event()
+    execution_runner = ConfiguredOperationRunner(
+        workspace_lifecycle,
+        HostArtifactStore(
+            settings.journal_path.parent / "validation-artifacts"
+        ),
+        secrets=secret_provider,
+    )
     dispatcher = HostRequestDispatcher(
         authenticator=authenticator,
         journal=journal,
         registry=default_operation_registry(
-            workspaces=GitWorkspaceLifecycle(
-                settings.journal_path.parent / "workspaces"
-            ),
+            workspaces=workspace_lifecycle,
             git_credentials=secret_provider,
             git_push_transport=GitCredentialPushTransport(
                 settings.journal_path.parent / "git-helpers"
             ),
+            configured_execution=execution_runner,
         ),
         host_id=settings.host_id,
     )
     server = HostSocketServer(dispatcher=dispatcher)
-    stopped = threading.Event()
 
     def request_stop(_signal_number: int, _frame: object) -> None:
         stopped.set()
+        execution_runner.request_shutdown()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
-    if settings.launchd_socket:
-        with closing(activated_listener(settings.socket_path)) as listener:
+    try:
+        if settings.launchd_socket:
+            with closing(activated_listener(settings.socket_path)) as listener:
+                logger.info("host agent ready", extra=probe())
+                server.serve_forever(listener, should_stop=stopped.is_set)
+            return
+
+        with LocalSocketBinding(settings.socket_path) as listener:
             logger.info("host agent ready", extra=probe())
             server.serve_forever(listener, should_stop=stopped.is_set)
-        return
-
-    with LocalSocketBinding(settings.socket_path) as listener:
-        logger.info("host agent ready", extra=probe())
-        server.serve_forever(listener, should_stop=stopped.is_set)
+    finally:
+        execution_runner.request_shutdown()
 
 
 def _environment_or_default(name: str, default: str) -> str:
