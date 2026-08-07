@@ -23,11 +23,13 @@ complete here unless its backlog definition of done is satisfied on `main`.
   plus `3.1` validated repository configuration and read-only preflight, `3.2`
   authenticated macOS host agent, `3.3` task-owned Git workspace lifecycle,
   `3.4` controlled Git branch, commit, and push operations,
+  `3.5` build, test, and artifact capture,
+  `4.1` structured task briefing,
   `5.1` deterministic simulator-flow
   contracts, and `6.1` least-privilege GitHub App authentication.
-- Remaining: 21 of 40 MVP tasks.
-- Active next wave: Wave 5, controlled execution adapters.
-- Next completion target: `3.5`.
+- Remaining: 19 of 40 MVP tasks.
+- Active next wave: Wave 4 agent lane and Wave 5 controlled execution adapters.
+- Next completion target: `4.2`.
 
 ## Operating model
 

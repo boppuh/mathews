@@ -7,7 +7,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -300,6 +300,7 @@ class _TransitionGates(TaskTransitionGateEvaluator):
     exact_brief_human_approval: bool = False
     brief_revision_request_id: UUID | None = None
     resume_decision_id: UUID | None = None
+    expected_policy_version_id: UUID | None = None
 
     def evaluate(
         self,
@@ -310,7 +311,12 @@ class _TransitionGates(TaskTransitionGateEvaluator):
         policy: PolicyVersion,
         now: datetime,
     ) -> TaskTransitionGuards:
-        del session, task, kind, policy, now
+        del session, task, kind, now
+        if (
+            self.expected_policy_version_id is not None
+            and policy.id != self.expected_policy_version_id
+        ):
+            return TaskTransitionGuards()
         return TaskTransitionGuards(
             brief_approval_required=self.brief_approval_required,
             exact_brief_human_approval=self.exact_brief_human_approval,
@@ -996,6 +1002,21 @@ class ApprovalService:
                     request_type=request_type,
                     subject_id=normalized_subject_id,
                 )
+                expected_policy_version_id: UUID | None = None
+                if request_type is ApprovalRequestType.BRIEF:
+                    exact_decision = session.scalar(
+                        select(BriefApprovalDecision).where(
+                            BriefApprovalDecision.id
+                            == task.brief_approval_decision_id
+                        )
+                    )
+                    if exact_decision is None:
+                        raise ApprovalNotFoundError(
+                            "exact brief approval subject is unavailable"
+                        )
+                    expected_policy_version_id = (
+                        exact_decision.policy_version_id
+                    )
                 request = ApprovalRequest(
                     id=request_id,
                     task_id=task.id,
@@ -1050,7 +1071,10 @@ class ApprovalService:
                     gate_evaluator=_TransitionGates(
                         brief_approval_required=(
                             request_type is ApprovalRequestType.BRIEF
-                        )
+                        ),
+                        expected_policy_version_id=(
+                            expected_policy_version_id
+                        ),
                     ),
                     active_policy_lineage=self._active_policy_lineage,
                     occurred_at=now,
@@ -1217,6 +1241,26 @@ class ApprovalService:
                     effective_decision,
                     decision_id=decision_id,
                 )
+                if (
+                    request_type is ApprovalRequestType.BRIEF
+                    and effective_decision is ApprovalDecision.APPROVE
+                ):
+                    exact_decision = session.scalar(
+                        select(BriefApprovalDecision).where(
+                            BriefApprovalDecision.id
+                            == task.brief_approval_decision_id
+                        )
+                    )
+                    if exact_decision is None:
+                        raise ApprovalNotFoundError(
+                            "exact brief approval subject is unavailable"
+                        )
+                    gates = replace(
+                        gates,
+                        expected_policy_version_id=(
+                            exact_decision.policy_version_id
+                        ),
+                    )
                 if effective_decision in _PRECONDITIONED_DECISIONS:
                     if (
                         not _durable_preconditions_are_current(
