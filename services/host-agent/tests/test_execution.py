@@ -116,6 +116,7 @@ def test_configured_operation_returns_exact_evidence_and_immutable_artifacts(
     workspaces = _Workspaces(workspace)
     store_root = (tmp_path / "store").resolve()
     mutation_starts: list[str] = []
+    yielded: list[str] = []
 
     result = ConfiguredOperationRunner(
         cast(GitWorkspaceLifecycle, workspaces),
@@ -127,6 +128,7 @@ def test_configured_operation_returns_exact_evidence_and_immutable_artifacts(
         expected_head_sha="a" * 40,
         validation_contract_version=3,
         effect_started=lambda: mutation_starts.append("started"),
+        effect_yielded=lambda: yielded.append("yielded"),
     )
 
     references = cast(list[dict[str, object]], result["artifacts"])
@@ -139,6 +141,7 @@ def test_configured_operation_returns_exact_evidence_and_immutable_artifacts(
     assert result["validation_contract_version"] == 3
     assert result["fencing_token"] == 9
     assert mutation_starts == ["started"]
+    assert yielded == ["yielded"]
     assert workspaces.calls == 2
     assert artifact_directory.joinpath("result.txt").read_text() == "result"
     assert {reference["role"] for reference in references} == {
@@ -212,6 +215,50 @@ def test_artifact_store_reuses_verified_content_and_rejects_corruption(
     destination.write_bytes(b"corrupt")
     with pytest.raises(ConfiguredExecutionError, match="ARTIFACT_CORRUPT"):
         store.put_file(source, role="STDOUT", source_path=None)
+
+
+def test_authorization_loss_terminates_work_and_retains_partial_output(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    configuration = cast(
+        RepositoryConfiguration,
+        _Configuration(
+            operations=(
+                _Operation(
+                    "build",
+                    _Kind.BUILD,
+                    (
+                        sys.executable,
+                        "-c",
+                        "import time; print('partial', flush=True); time.sleep(10)",
+                    ),
+                    5,
+                ),
+            ),
+            artifacts=_Artifacts(("artifacts",)),
+        ),
+    )
+    store_root = (tmp_path / "store").resolve()
+
+    result = ConfiguredOperationRunner(
+        cast(GitWorkspaceLifecycle, _Workspaces(workspace)),
+        HostArtifactStore(store_root),
+    ).run(
+        _authority(),
+        configuration,
+        operation_id="build",
+        expected_head_sha="a" * 40,
+        validation_contract_version=1,
+        assert_authorized=lambda: (_ for _ in ()).throw(RuntimeError("fenced")),
+    )
+
+    references = cast(list[dict[str, object]], result["artifacts"])
+    stdout = next(reference for reference in references if reference["role"] == "STDOUT")
+    assert result["passed"] is False
+    assert result["cancellation_status"] == "AUTHORIZATION_LOST"
+    assert _artifact_bytes(store_root, stdout["address"]) == b"partial\n"
 
 
 def test_execution_rejects_unknown_operation_before_starting_effect(

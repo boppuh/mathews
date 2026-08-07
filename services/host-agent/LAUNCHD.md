@@ -35,9 +35,11 @@ the configured `xcodebuild` argv without a shell, applies the configured
 timeout, and stores stdout, stderr, and configured artifact files in a private
 content-addressed directory. A timed-out process retains its partial output but
 always reports a non-passing cancellation status.
-The control-plane gateway reserves a 3,610-second response budget for this
+The control-plane gateway reserves a 3,720-second response budget for this
 operation, covering the configuration's 3,600-second maximum plus bounded
-result capture.
+result capture. The execution yields the task guard after the child starts and
+rechecks the durable fence every second, allowing the same lease to renew while
+terminating work that expires or is superseded.
 
 ## Prerequisites
 

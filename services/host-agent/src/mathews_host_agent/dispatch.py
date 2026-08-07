@@ -95,7 +95,7 @@ class HostTaskGuard:
         self._lock = lock
 
     def __enter__(self) -> None:
-        self._lock.acquire()
+        self.acquire()
 
     def __exit__(
         self,
@@ -103,6 +103,12 @@ class HostTaskGuard:
         _exception: BaseException | None,
         _traceback: TracebackType | None,
     ) -> None:
+        self.release()
+
+    def acquire(self) -> None:
+        self._lock.acquire()
+
+    def release(self) -> None:
         self._lock.release()
 
 
@@ -160,6 +166,45 @@ class HostOperationContext:
                 self._effect_attempted = True
 
             result = effect(mark_effect_attempted)
+            self._journal.assert_authorized(self.request)
+        self._authorized_effects += 1
+        return result
+
+    def perform_renewable_authorized_effect(
+        self,
+        effect: Callable[
+            [Callable[[], None], Callable[[], None], Callable[[], None]],
+            EffectResult,
+        ],
+    ) -> EffectResult:
+        """Start under the fence, then permit renewal during a long process."""
+
+        guard = self._task_guard
+        if guard is None:
+            raise HostOperationRejected("AUTHORITY_NOT_ALLOWED")
+        guard.acquire()
+        guard_held = True
+        try:
+            self._journal.assert_authorized(self.request)
+
+            def mark_effect_attempted() -> None:
+                self._effect_attempted = True
+
+            def yield_guard() -> None:
+                nonlocal guard_held
+                if guard_held:
+                    guard.release()
+                    guard_held = False
+
+            def assert_authorized() -> None:
+                with guard:
+                    self._journal.assert_authorized(self.request)
+
+            result = effect(mark_effect_attempted, yield_guard, assert_authorized)
+        finally:
+            if guard_held:
+                guard.release()
+        with guard:
             self._journal.assert_authorized(self.request)
         self._authorized_effects += 1
         return result
@@ -581,8 +626,8 @@ def default_operation_registry(
         authority = _task_authority(context)
         configuration = _configuration_argument(authority, arguments)
         try:
-            result = context.perform_staged_authorized_effect(
-                lambda effect_started: execution_runner.run(
+            result = context.perform_renewable_authorized_effect(
+                lambda effect_started, effect_yielded, assert_authorized: execution_runner.run(
                     authority,
                     configuration,
                     operation_id=cast(str, arguments["operation_id"]),
@@ -592,6 +637,8 @@ def default_operation_registry(
                         arguments["validation_contract_version"],
                     ),
                     effect_started=effect_started,
+                    effect_yielded=effect_yielded,
+                    assert_authorized=assert_authorized,
                 )
             )
         except ConfiguredExecutionError as error:

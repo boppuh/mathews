@@ -467,6 +467,84 @@ def test_staged_effect_failure_after_mutation_start_is_ambiguous(
     assert response.code == "OPERATION_AMBIGUOUS"
 
 
+def test_renewable_effect_yields_guard_for_same_lease_renewal(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def long_operation(
+        context: HostOperationContext,
+        _arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        def effect(
+            mark_effect_attempted: Callable[[], None],
+            yield_guard: Callable[[], None],
+            assert_authorized: Callable[[], None],
+        ) -> None:
+            mark_effect_attempted()
+            yield_guard()
+            entered.set()
+            assert release.wait(timeout=2)
+            assert_authorized()
+
+        context.perform_renewable_authorized_effect(effect)
+        return {"completed": True}
+
+    authenticator = _authenticator()
+    dispatcher = HostRequestDispatcher(
+        authenticator=authenticator,
+        journal=HostOperationJournal(
+            _runtime_directory(tmp_path) / "journal.sqlite3",
+            clock_ms=lambda: NOW_MS,
+        ),
+        registry=HostOperationRegistry(
+            {
+                "test.execute": HostOperationDefinition(
+                    authority=HostAuthorityKind.TASK_LEASE,
+                    validate=_empty,
+                    handle=long_operation,
+                    mutates_host=True,
+                ),
+                "test.renew": HostOperationDefinition(
+                    authority=HostAuthorityKind.TASK_LEASE,
+                    validate=_empty,
+                    handle=lambda _context, _arguments: {"renewed": True},
+                ),
+            }
+        ),
+        host_id="host-1",
+        clock_ms=lambda: NOW_MS,
+    )
+    authority = _task_authority()
+    operation = _request(authority=authority, idempotency_key="long-operation")
+    renewal = _request(
+        name="test.renew",
+        authority=replace(
+            authority,
+            lease_expires_at_ms=authority.lease_expires_at_ms + 60_000,
+        ),
+        idempotency_key="renew-during-operation",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        operation_future = executor.submit(
+            dispatcher.dispatch,
+            authenticator.sign_request(operation),
+        )
+        assert entered.wait(timeout=2)
+        renewal_response = authenticator.verify_response(
+            dispatcher.dispatch(authenticator.sign_request(renewal))
+        )
+        release.set()
+        operation_response = authenticator.verify_response(
+            operation_future.result(timeout=2)
+        )
+
+    assert renewal_response.status is HostResponseStatus.OK
+    assert operation_response.status is HostResponseStatus.OK
+
+
 def test_finish_failure_remains_ambiguous_without_an_effect(
     tmp_path: Path,
 ) -> None:
@@ -1042,12 +1120,18 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
             expected_head_sha: str,
             validation_contract_version: int,
             effect_started: Callable[[], None] | None = None,
+            effect_yielded: Callable[[], None] | None = None,
+            assert_authorized: Callable[[], None] | None = None,
         ) -> dict[str, object]:
             assert operation_id == "build"
             assert expected_head_sha == "b" * 40
             assert validation_contract_version == 4
             assert effect_started is not None
+            assert effect_yielded is not None
+            assert assert_authorized is not None
             effect_started()
+            effect_yielded()
+            assert_authorized()
             calls.append("validation")
             return {
                 "operation_id": operation_id,

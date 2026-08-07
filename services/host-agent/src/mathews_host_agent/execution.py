@@ -18,6 +18,7 @@ from mathews_configuration import RepositoryConfiguration, TaskLeaseHostAuthorit
 from mathews_host_agent.workspaces import GitWorkspaceLifecycle, WorkspaceLifecycleError
 
 _MAX_CAPTURE_BYTES = 128 * 1024 * 1024
+_MAX_TOTAL_ARTIFACT_BYTES = 512 * 1024 * 1024
 _MAX_ARTIFACTS = 256
 
 
@@ -172,6 +173,8 @@ class ConfiguredOperationRunner:
         expected_head_sha: str,
         validation_contract_version: int,
         effect_started: Callable[[], None] | None = None,
+        effect_yielded: Callable[[], None] | None = None,
+        assert_authorized: Callable[[], None] | None = None,
     ) -> dict[str, object]:
         if validation_contract_version <= 0:
             raise ConfiguredExecutionError("VALIDATION_CONTRACT_VERSION_INVALID")
@@ -199,19 +202,27 @@ class ConfiguredOperationRunner:
             stderr_path = output_root / "stderr"
             if effect_started is not None:
                 effect_started()
-            returncode, timed_out, output_limited = self._execute(
+            returncode, timed_out, output_limited, authorization_lost = self._execute(
                 workspace,
                 operation.argv,
                 operation.timeout_seconds,
                 stdout_path,
                 stderr_path,
+                effect_yielded=effect_yielded,
+                assert_authorized=assert_authorized,
             )
             duration_ms = max(0, round((self._monotonic() - started) * 1000))
             references = [
                 self._artifacts.put_file(stdout_path, role="STDOUT", source_path=None),
                 self._artifacts.put_file(stderr_path, role="STDERR", source_path=None),
             ]
-            references.extend(self._collect_configured_artifacts(workspace, configuration))
+            references.extend(
+                self._collect_configured_artifacts(
+                    workspace,
+                    configuration,
+                    captured_bytes=sum(reference.size_bytes for reference in references),
+                )
+            )
         try:
             after = self._workspaces.execution_context(
                 authority,
@@ -228,6 +239,8 @@ class ConfiguredOperationRunner:
         cancellation_status = (
             "TIMED_OUT"
             if timed_out
+            else "AUTHORIZATION_LOST"
+            if authorization_lost
             else "TERMINATED"
             if returncode < 0
             else "NOT_REQUESTED"
@@ -265,7 +278,10 @@ class ConfiguredOperationRunner:
         timeout_seconds: int,
         stdout_path: Path,
         stderr_path: Path,
-    ) -> tuple[int, bool, bool]:
+        *,
+        effect_yielded: Callable[[], None] | None,
+        assert_authorized: Callable[[], None] | None,
+    ) -> tuple[int, bool, bool, bool]:
         isolated_home = stdout_path.parent / "home"
         isolated_temporary = stdout_path.parent / "tmp"
         isolated_home.mkdir(mode=0o700)
@@ -291,11 +307,16 @@ class ConfiguredOperationRunner:
                     stderr=stderr,
                     start_new_session=True,
                 )
+                if effect_yielded is not None:
+                    effect_yielded()
                 deadline = time.monotonic() + timeout_seconds
+                authorization_deadline = time.monotonic() + 1
                 timed_out = False
                 output_limited = False
+                authorization_lost = False
                 while process.poll() is None:
-                    timed_out = time.monotonic() >= deadline
+                    now = time.monotonic()
+                    timed_out = now >= deadline
                     output_limited = any(
                         path.stat().st_size > _MAX_CAPTURE_BYTES
                         for path in (stdout_path, stderr_path)
@@ -303,13 +324,21 @@ class ConfiguredOperationRunner:
                     if timed_out or output_limited:
                         ConfiguredOperationRunner._terminate(process)
                         break
+                    if assert_authorized is not None and now >= authorization_deadline:
+                        try:
+                            assert_authorized()
+                        except Exception:
+                            authorization_lost = True
+                            ConfiguredOperationRunner._terminate(process)
+                            break
+                        authorization_deadline = now + 1
                     time.sleep(0.02)
                 returncode = process.wait(timeout=2)
                 if output_limited:
                     for path in (stdout_path, stderr_path):
                         with path.open("r+b") as capture:
                             capture.truncate(_MAX_CAPTURE_BYTES)
-                return returncode, timed_out, output_limited
+                return returncode, timed_out, output_limited, authorization_lost
         except (OSError, subprocess.SubprocessError):
             raise ConfiguredExecutionError("CONFIGURED_OPERATION_FAILED") from None
 
@@ -335,6 +364,8 @@ class ConfiguredOperationRunner:
         self,
         workspace: Path,
         configuration: RepositoryConfiguration,
+        *,
+        captured_bytes: int,
     ) -> list[ArtifactReference]:
         references: list[ArtifactReference] = []
         for configured_path in configuration.artifacts.collection_paths:
@@ -359,6 +390,12 @@ class ConfiguredOperationRunner:
                     relative = candidate.relative_to(workspace).as_posix()
                 except ValueError:
                     raise ConfiguredExecutionError("ARTIFACT_PATH_INVALID") from None
+                try:
+                    candidate_size = candidate.stat(follow_symlinks=False).st_size
+                except OSError:
+                    raise ConfiguredExecutionError("ARTIFACT_UNAVAILABLE") from None
+                if captured_bytes + candidate_size > _MAX_TOTAL_ARTIFACT_BYTES:
+                    raise ConfiguredExecutionError("ARTIFACT_LIMIT_EXCEEDED")
                 references.append(
                     self._artifacts.put_file(
                         candidate,
@@ -366,4 +403,5 @@ class ConfiguredOperationRunner:
                         source_path=relative,
                     )
                 )
+                captured_bytes += candidate_size
         return references
