@@ -19,6 +19,7 @@ from mathews_control_plane.approvals import ApprovalRequestResult, ApprovalServi
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
+    ApprovalDecision,
     ApprovalRequestType,
     Brief,
     BriefApprovalDecision,
@@ -399,6 +400,7 @@ class BriefingService:
                 return _replayed_stored_brief(session, task, existing, draft)
             if TaskState(task.state) is not TaskState.BRIEFING:
                 raise BriefingConflictError("task is not in briefing")
+            _require_revision_boundary(session, task)
 
             policy = _active_policy(
                 session,
@@ -719,6 +721,31 @@ def _request_evidence_id(task: Task) -> UUID:
         return UUID(task.raw_request.removeprefix(prefix))
     except ValueError:
         raise BriefingConflictError("task request evidence is unavailable") from None
+
+
+def _require_revision_boundary(session: Session, task: Task) -> None:
+    brief_id = task.accepted_brief_id
+    decision_id = task.brief_approval_decision_id
+    if brief_id is None and decision_id is None:
+        return
+    if brief_id is None or decision_id is None:
+        raise BriefingConflictError("task brief bindings are incomplete")
+    decision = session.scalar(
+        select(BriefApprovalDecision)
+        .where(
+            BriefApprovalDecision.id == decision_id,
+            BriefApprovalDecision.task_id == task.id,
+            BriefApprovalDecision.brief_id == brief_id,
+        )
+        .with_for_update()
+    )
+    if (
+        decision is None
+        or decision.human_response != ApprovalDecision.REQUEST_REVISION.value
+    ):
+        raise BriefingConflictError(
+            "the exact stored brief must be routed before creating another version"
+        )
 
 
 def _repository_path(value: str) -> str:

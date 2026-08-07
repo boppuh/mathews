@@ -325,6 +325,44 @@ def test_revision_creates_a_new_version_and_returns_to_policy_routing(
         ) == 2
 
 
+def test_routing_failure_cannot_be_bypassed_with_a_different_brief(
+    briefing_harness: BriefingHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_task_and_policy(briefing_harness)
+    stranded_brief_id = uuid4()
+
+    def routing_failure(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("simulated routing failure")
+
+    monkeypatch.setattr(ApprovalService, "request", routing_failure)
+    with pytest.raises(RuntimeError, match="simulated routing failure"):
+        _service(briefing_harness).create(
+            task_id,
+            brief_id=stranded_brief_id,
+            draft=_draft(ambiguity_flags=("UNCLEAR_SCOPE",)),
+        )
+
+    with pytest.raises(
+        BriefingConflictError,
+        match="exact stored brief must be routed",
+    ):
+        _service(briefing_harness).create(
+            task_id,
+            brief_id=uuid4(),
+            draft=_draft(),
+        )
+
+    with briefing_harness.factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None and task.state is TaskState.BRIEFING
+        assert task.accepted_brief_id == stranded_brief_id
+        assert session.scalar(
+            select(func.count()).select_from(Brief).where(Brief.task_id == task_id)
+        ) == 1
+
+
 def test_invalid_policy_configuration_fails_closed_to_human_approval(
     briefing_harness: BriefingHarness,
 ) -> None:
