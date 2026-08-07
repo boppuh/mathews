@@ -431,17 +431,25 @@ class HermesRunService:
                     .select_from(BackgroundJobToolGrant)
                     .where(
                         BackgroundJobToolGrant.job_id == run.job_id,
+                        BackgroundJobToolGrant.lease_id == run.lease_id,
+                        BackgroundJobToolGrant.fencing_token == run.fencing_token,
                         BackgroundJobToolGrant.revoke_reason == "HERMES_RUN_CANCELLED",
                     )
                 )
                 return HermesCancellationResult(run.id, int(revoked or 0), True)
-            if run.status in {HermesRunStatus.SUCCEEDED, HermesRunStatus.FAILED}:
+            if run.status in {
+                HermesRunStatus.SUCCEEDED,
+                HermesRunStatus.FAILED,
+                HermesRunStatus.TIMED_OUT,
+            }:
                 raise HermesConflictError("completed Hermes run cannot be cancelled")
             grants = tuple(
                 session.scalars(
                     select(BackgroundJobToolGrant)
                     .where(
                         BackgroundJobToolGrant.job_id == run.job_id,
+                        BackgroundJobToolGrant.lease_id == run.lease_id,
+                        BackgroundJobToolGrant.fencing_token == run.fencing_token,
                         BackgroundJobToolGrant.revoked_at.is_(None),
                     )
                     .with_for_update()

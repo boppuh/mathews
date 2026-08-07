@@ -432,6 +432,70 @@ def test_dependency_failure_cannot_overwrite_a_successful_run(
         assert session.scalar(select(func.count()).select_from(DependencyOutageAttempt)) == 0
 
 
+def test_cancellation_cannot_overwrite_a_timed_out_run(
+    hermes_harness: HermesHarness,
+) -> None:
+    service, run_id = _started(hermes_harness)
+    service.fail_dependency(
+        hermes_harness.grant,
+        run_id=run_id,
+        error_code="HERMES_TIMEOUT",
+        timed_out=True,
+    )
+
+    with pytest.raises(HermesConflictError, match="completed"):
+        service.cancel(run_id)
+
+    with hermes_harness.factory() as session:
+        run = session.get(HermesRun, run_id)
+        assert run is not None and run.status is HermesRunStatus.TIMED_OUT
+
+
+def test_stale_run_cancellation_does_not_revoke_the_replacement_attempt(
+    hermes_harness: HermesHarness,
+) -> None:
+    service, stale_run_id = _started(hermes_harness)
+    jobs = BackgroundJobService(hermes_harness.factory, hermes_harness.store, clock=lambda: _NOW)
+    disposition = jobs.fail_attempt(
+        hermes_harness.grant,
+        error_code="RETRY_TEST",
+        retryable=True,
+    )
+    assert disposition.next_attempt_at is not None
+    later = disposition.next_attempt_at + timedelta(seconds=1)
+    retry_jobs = BackgroundJobService(
+        hermes_harness.factory,
+        hermes_harness.store,
+        clock=lambda: later,
+    )
+    replacement_grant = retry_jobs.claim_next(
+        worker_id="worker-2",
+        lease_duration=timedelta(minutes=5),
+    )
+    assert replacement_grant is not None
+    replacement_run_id = uuid4()
+    HermesRunService(
+        hermes_harness.factory,
+        hermes_harness.store,
+        clock=lambda: later,
+    ).prepare(
+        replacement_grant,
+        run_id=replacement_run_id,
+        prompt=hermes_harness.prompt,
+    )
+
+    cancelled = service.cancel(stale_run_id)
+
+    assert cancelled.revoked_tool_grants == 1
+    with hermes_harness.factory() as session:
+        grants = {
+            grant.grant_key: grant
+            for grant in session.scalars(select(BackgroundJobToolGrant))
+        }
+        assert grants[f"hermes:{stale_run_id}"].revoked_at is not None
+        assert grants[f"hermes:{replacement_run_id}"].revoked_at is None
+
+
 def test_run_commands_require_the_exact_lease_owner(
     hermes_harness: HermesHarness,
 ) -> None:

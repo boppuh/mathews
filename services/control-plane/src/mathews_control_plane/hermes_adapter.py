@@ -377,11 +377,13 @@ class HermesRunJobHandler:
                 self._fail_dependency(context, run_id, error.code)
             if observation.status is HermesObservedStatus.COMPLETED:
                 event = self._terminal_event(run_id, observation, HermesEventType.COMPLETED)
-                self._runs.ingest(run_id, event)
+                result = self._runs.ingest(run_id, event)
+                self._require_terminal_event(result.accepted, result.ignored_reason)
                 return {"hermes_run_id": str(run_id), "status": "SUCCEEDED"}
             if observation.status is HermesObservedStatus.FAILED:
                 event = self._terminal_event(run_id, observation, HermesEventType.FAILED)
-                self._runs.ingest(run_id, event)
+                result = self._runs.ingest(run_id, event)
+                self._require_terminal_event(result.accepted, result.ignored_reason)
                 raise TerminalBackgroundJobError("HERMES_RUN_FAILED")
             if observation.status is HermesObservedStatus.CANCELLED:
                 self._runs.cancel(run_id)
@@ -396,6 +398,14 @@ class HermesRunJobHandler:
                 )
                 raise BackgroundJobLeaseLostError("Hermes timeout retry was scheduled")
             self._sleep(job_input.poll_interval_seconds)
+
+    @staticmethod
+    def _require_terminal_event(accepted: bool, ignored_reason: str | None) -> None:
+        if accepted:
+            return
+        if ignored_reason == "STALE_LEASE":
+            raise BackgroundJobLeaseLostError("Hermes terminal event was fenced")
+        raise TerminalBackgroundJobError("HERMES_TERMINAL_EVENT_REJECTED")
 
     def _external_run_id(self, run_id: UUID) -> str | None:
         with self._factory() as session:
