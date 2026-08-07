@@ -63,6 +63,8 @@ EXPECTED_HEAD_TABLES = {
     "evidence_derivatives",
     "evidence_records",
     "evidence_tombstones",
+    "hermes_run_events",
+    "hermes_runs",
     "dependency_outage_attempts",
     "local_users",
     "policy_version_prompt_templates",
@@ -90,6 +92,7 @@ RELIABILITY_TABLES = {
     "reconciliation_targets",
     "task_cancellations",
 }
+HERMES_TABLES = {"hermes_run_events", "hermes_runs"}
 
 
 def _migration_config(database_url: str) -> Config:
@@ -115,6 +118,23 @@ def test_migrations_are_repeatable_from_clean_database(tmp_path: Path) -> None:
     command.upgrade(config, "head")
 
     assert _table_names(database_url) == EXPECTED_HEAD_TABLES
+    engine = create_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            trigger_names = set(
+                connection.execute(
+                    text(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'trigger' AND tbl_name = 'hermes_run_events'"
+                    )
+                ).scalars()
+            )
+        assert trigger_names == {
+            "hermes_run_events_no_delete",
+            "hermes_run_events_no_update",
+        }
+    finally:
+        engine.dispose()
 
 
 def test_migrations_can_rebuild_schema_after_downgrade(tmp_path: Path) -> None:
@@ -968,7 +988,9 @@ def test_job_loop_migration_enforces_fenced_provenance_and_guarded_downgrade(
         match="fenced background job provenance",
     ):
         command.downgrade(config, "0005")
-    assert _table_names(database_url) == EXPECTED_HEAD_TABLES - RELIABILITY_TABLES
+    assert _table_names(database_url) == (
+        EXPECTED_HEAD_TABLES - RELIABILITY_TABLES - HERMES_TABLES
+    )
 
 
 def test_cancellation_revision_fences_queued_and_running_jobs(
@@ -1125,7 +1147,7 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         match="cancellation or outage provenance",
     ):
         command.downgrade(config, "0007")
-    assert _table_names(database_url) == EXPECTED_HEAD_TABLES
+    assert _table_names(database_url) == EXPECTED_HEAD_TABLES - HERMES_TABLES
 
 
 def test_outage_escalation_and_resume_operate_through_migrated_guards(

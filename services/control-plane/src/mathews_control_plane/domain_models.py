@@ -130,6 +130,15 @@ class DependencyService(StrEnum):
     GITHUB = "GITHUB"
 
 
+class HermesRunStatus(StrEnum):
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    TIMED_OUT = "TIMED_OUT"
+
+
 class OwnedHostProcessStatus(StrEnum):
     RUNNING = "RUNNING"
     TERMINATION_REQUESTED = "TERMINATION_REQUESTED"
@@ -1875,6 +1884,101 @@ class ReconciliationTarget(RecordContext, Base):
         DateTime(timezone=True)
     )
     last_error_code: Mapped[str | None] = mapped_column(String(100))
+
+
+class HermesRun(RecordContext, Base):
+    """One exact Hermes attempt bound to a durable job lease fence."""
+
+    __tablename__ = "hermes_runs"
+    __table_args__ = (
+        CheckConstraint("attempt > 0", name="attempt_positive"),
+        CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        CheckConstraint("last_event_sequence >= 0", name="event_sequence_non_negative"),
+        CheckConstraint("length(prompt_fingerprint) = 64", name="prompt_fingerprint_length"),
+        UniqueConstraint("job_id", "attempt", name="uq_hermes_runs_job_attempt"),
+        UniqueConstraint("external_run_id", name="uq_hermes_runs_external_run"),
+        ForeignKeyConstraint(
+            ["job_id", "lease_id", "fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_hermes_runs_lease",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("background_jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    external_run_id: Mapped[str | None] = mapped_column(String(255))
+    prompt_template_version_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("prompt_template_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    policy_version_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("policy_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    evaluation_label: Mapped[str | None] = mapped_column(String(255))
+    prompt_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[HermesRunStatus] = mapped_column(
+        _enum(HermesRunStatus, name="hermes_run_status"),
+        nullable=False,
+        default=HermesRunStatus.STARTING,
+        server_default=HermesRunStatus.STARTING.value,
+    )
+    last_event_sequence: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_code: Mapped[str | None] = mapped_column(String(100))
+
+
+class HermesRunEvent(RecordContext, Base):
+    """Immutable provider delivery and its fenced normalization result."""
+
+    __tablename__ = "hermes_run_events"
+    __table_args__ = (
+        CheckConstraint("provider_sequence > 0", name="provider_sequence_positive"),
+        CheckConstraint("length(payload_fingerprint) = 64", name="payload_fingerprint_length"),
+        CheckConstraint(
+            "(accepted = true AND ignored_reason IS NULL AND task_event_id IS NOT NULL) "
+            "OR (accepted = false AND ignored_reason IS NOT NULL AND task_event_id IS NULL)",
+            name="acceptance_shape",
+        ),
+        UniqueConstraint("run_id", "provider_event_id", name="uq_hermes_run_events_delivery"),
+        UniqueConstraint("run_id", "provider_sequence", name="uq_hermes_run_events_sequence"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("hermes_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    provider_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_evidence_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("evidence_records.id", ondelete="RESTRICT"), nullable=False
+    )
+    accepted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    ignored_reason: Mapped[str | None] = mapped_column(String(100))
+    task_event_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("task_events.id", ondelete="RESTRICT")
+    )
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class WebhookDelivery(RecordContext, Base):
