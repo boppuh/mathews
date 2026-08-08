@@ -32,6 +32,7 @@ from mathews_control_plane.database import (
     create_task_record,
 )
 from mathews_control_plane.domain_models import (
+    BackgroundJob,
     Brief,
     BriefApprovalDecision,
     BriefDecisionDisposition,
@@ -478,6 +479,40 @@ def test_preflight_binding_is_revalidated_while_the_host_effect_is_dispatched(
     assert result.status is HermesToolResultStatus.REJECTED
     assert result.code == "AUTHORIZATION_STALE"
     assert calls == 2
+    assert gateway.requests == []
+
+
+def test_lease_is_revalidated_immediately_before_host_dispatch(
+    tool_harness: ToolHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _Gateway()
+    service = _service(tool_harness, gateway, monkeypatch)
+    authorize = service._authorize
+
+    def authorize_then_cancel(
+        grant: JobLeaseGrant,
+        *,
+        run_id: UUID,
+        proposal: HermesToolProposalRequest,
+    ) -> object:
+        authorization = authorize(grant, run_id=run_id, proposal=proposal)
+        with tool_harness.factory.begin() as session:
+            job = session.get(BackgroundJob, tool_harness.grant.job_id)
+            assert job is not None
+            job.cancellation_requested_at = _NOW
+        return authorization
+
+    monkeypatch.setattr(service, "_authorize", authorize_then_cancel)
+
+    result = service.execute(
+        tool_harness.grant,
+        run_id=tool_harness.run_id,
+        proposal=_proposal(),
+    )
+
+    assert result.status is HermesToolResultStatus.REJECTED
+    assert result.code == "AUTHORIZATION_STALE"
     assert gateway.requests == []
 
 

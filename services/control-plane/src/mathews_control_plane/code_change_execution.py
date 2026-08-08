@@ -443,11 +443,16 @@ class ScopedCodeExecutionService:
     ) -> HostResponseMessage:
         now = _as_utc(self._clock())
         with self._factory() as session, session.begin():
-            _begin_serialized(session)
             proposal = session.get(HermesToolProposal, authorization.proposal_id)
             if proposal is None:
                 raise ScopedToolConflictError("tool proposal is unavailable")
-            _run, task, _tool_grant = _proposal_context(session, grant, proposal.run_id, now)
+            _run, task, _tool_grant = _proposal_context(
+                session,
+                grant,
+                proposal.run_id,
+                now,
+                for_update=False,
+            )
             if task.state not in _ACTIVE_STATES:
                 raise ScopedToolConflictError("tool authorization is no longer current")
             decision = session.get(HermesToolDecision, authorization.decision_id)
@@ -461,9 +466,6 @@ class ScopedCodeExecutionService:
             configuration_id = decision.repository_configuration_id
             repository_key = task.repository
             base_revision = task.base_revision
-
-        with self._factory() as session, session.begin():
-            _begin_serialized(session)
             configuration_record = session.get(
                 RepositoryConfiguration,
                 configuration_id,
@@ -847,15 +849,22 @@ def _proposal_context(
     grant: JobLeaseGrant,
     run_id: UUID,
     now: datetime,
+    *,
+    for_update: bool = True,
 ) -> tuple[HermesRun, Task, BackgroundJobToolGrant]:
-    job = session.scalar(
-        select(BackgroundJob).where(BackgroundJob.id == grant.job_id).with_for_update()
-    )
-    lease = session.scalar(
-        select(BackgroundJobLease).where(BackgroundJobLease.id == grant.lease_id).with_for_update()
-    )
-    run = session.scalar(select(HermesRun).where(HermesRun.id == run_id).with_for_update())
-    task = session.scalar(select(Task).where(Task.id == grant.task_id).with_for_update())
+    job_query = select(BackgroundJob).where(BackgroundJob.id == grant.job_id)
+    lease_query = select(BackgroundJobLease).where(BackgroundJobLease.id == grant.lease_id)
+    run_query = select(HermesRun).where(HermesRun.id == run_id)
+    task_query = select(Task).where(Task.id == grant.task_id)
+    if for_update:
+        job_query = job_query.with_for_update()
+        lease_query = lease_query.with_for_update()
+        run_query = run_query.with_for_update()
+        task_query = task_query.with_for_update()
+    job = session.scalar(job_query)
+    lease = session.scalar(lease_query)
+    run = session.scalar(run_query)
+    task = session.scalar(task_query)
     if (
         job is None
         or lease is None
