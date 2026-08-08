@@ -25,12 +25,13 @@ complete here unless its backlog definition of done is satisfied on `main`.
   `3.4` controlled Git branch, commit, and push operations,
   `3.5` build, test, and artifact capture,
   `4.1` structured task briefing, `4.2` versioned role-specific prompts,
-  `4.3` durable, lease-fenced Hermes run integration,
+  `4.3` durable, lease-fenced Hermes run integration, `4.4`
+  control-plane-authorized scoped code-change execution,
   `5.1` deterministic simulator-flow
   contracts, and `6.1` least-privilege GitHub App authentication.
-- Remaining: 17 of 40 MVP tasks.
+- Remaining: 16 of 40 MVP tasks.
 - Active next wave: Wave 5 controlled execution adapters.
-- Next completion target: `4.4`.
+- Next completion target: `2.4`.
 
 ## Operating model
 

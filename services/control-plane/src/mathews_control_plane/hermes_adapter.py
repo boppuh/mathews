@@ -8,7 +8,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import NoReturn, Protocol, cast
 from urllib.error import HTTPError, URLError
@@ -22,11 +22,19 @@ from pydantic import BaseModel, ConfigDict, Field
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.background_jobs import (
     BackgroundJobLeaseLostError,
+    BackgroundJobService,
     LeasedJobContext,
     TerminalBackgroundJobError,
 )
+from mathews_control_plane.code_change_execution import (
+    HermesToolProposalRequest,
+    ScopedCodeExecutionService,
+    ScopedToolAmbiguousError,
+    ScopedToolExecutionResult,
+)
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
+    DependencyService,
     HermesRun,
     HermesRunStatus,
     ReconciliationStatus,
@@ -65,6 +73,7 @@ class HermesObservation:
     external_run_id: str
     status: HermesObservedStatus
     payload: dict[str, object]
+    events: tuple[HermesProviderEvent, ...] = ()
 
 
 class HermesRuntime(Protocol):
@@ -79,6 +88,12 @@ class HermesRuntime(Protocol):
     def observe(self, external_run_id: str) -> HermesObservation: ...
 
     def stop(self, external_run_id: str) -> None: ...
+
+    def submit_tool_result(
+        self,
+        external_run_id: str,
+        result: ScopedToolExecutionResult,
+    ) -> None: ...
 
     def reconcile(
         self,
@@ -180,6 +195,7 @@ class HermesHttpRuntime:
             external_run_id,
             observed_status,
             _observation_payload(response),
+            _provider_events(response, external_run_id),
         )
 
     def stop(self, external_run_id: str) -> None:
@@ -190,6 +206,27 @@ class HermesHttpRuntime:
             idempotency_key=f"mathews-stop:{external_run_id}",
         )
         if response.get("status") not in {"stopping", "cancelled"}:
+            raise HermesRuntimeError("HERMES_RESPONSE_INVALID")
+
+    def submit_tool_result(
+        self,
+        external_run_id: str,
+        result: ScopedToolExecutionResult,
+    ) -> None:
+        response = self._request(
+            "POST",
+            f"v1/runs/{quote(external_run_id, safe='')}/tool-results",
+            payload={
+                "proposal_id": result.proposal_id,
+                "status": result.status.value.lower(),
+                "code": result.code,
+                "result": result.result,
+                "authorization_evidence_id": str(result.decision_evidence_id),
+                "result_evidence_id": str(result.result_evidence_id),
+            },
+            idempotency_key=f"mathews-tool-result:{result.proposal_id}",
+        )
+        if response.get("accepted") is not True:
             raise HermesRuntimeError("HERMES_RESPONSE_INVALID")
 
     def reconcile(
@@ -308,6 +345,13 @@ class UnavailableHermesRuntime:
     def stop(self, _external_run_id: str) -> None:
         raise HermesRuntimeError("HERMES_UNCONFIGURED")
 
+    def submit_tool_result(
+        self,
+        _external_run_id: str,
+        _result: ScopedToolExecutionResult,
+    ) -> None:
+        raise HermesRuntimeError("HERMES_UNCONFIGURED")
+
     def reconcile(
         self,
         *,
@@ -331,14 +375,18 @@ class HermesRunJobHandler:
         factory: SessionFactory,
         artifact_store: ArtifactStore,
         runtime: HermesRuntime,
+        tool_execution: ScopedCodeExecutionService | None = None,
         *,
         sleeper: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._factory = factory
-        self._runs = HermesRunService(factory, artifact_store, clock=clock)
+        effective_clock = clock or (lambda: datetime.now(UTC))
+        self._runs = HermesRunService(factory, artifact_store, clock=effective_clock)
         self._runtime = runtime
+        self._tool_execution = tool_execution
+        self._jobs = BackgroundJobService(factory, artifact_store, clock=effective_clock)
         self._sleep = sleeper
         self._monotonic = monotonic
 
@@ -389,6 +437,19 @@ class HermesRunJobHandler:
                 observation = self._runtime.observe(external_run_id)
             except HermesRuntimeError as error:
                 self._fail_dependency(context, run_id, error.code)
+            for event in observation.events:
+                ingested = self._runs.ingest(run_id, event)
+                if not ingested.accepted:
+                    if ingested.ignored_reason == "STALE_LEASE":
+                        raise BackgroundJobLeaseLostError("Hermes tool event was fenced")
+                    continue
+                if event.event_type is HermesEventType.TOOL_PROPOSAL:
+                    self._execute_tool_proposal(
+                        context,
+                        run_id=run_id,
+                        external_run_id=external_run_id,
+                        event=event,
+                    )
             if observation.status is HermesObservedStatus.COMPLETED:
                 event = self._terminal_event(run_id, observation, HermesEventType.COMPLETED)
                 result = self._runs.ingest(run_id, event)
@@ -415,6 +476,47 @@ class HermesRunJobHandler:
                 )
                 raise BackgroundJobLeaseLostError("Hermes timeout retry was scheduled")
             self._sleep(job_input.poll_interval_seconds)
+
+    def _execute_tool_proposal(
+        self,
+        context: LeasedJobContext,
+        *,
+        run_id: UUID,
+        external_run_id: str,
+        event: HermesProviderEvent,
+    ) -> None:
+        if self._tool_execution is None:
+            raise TerminalBackgroundJobError("HERMES_TOOL_GATEWAY_UNAVAILABLE")
+        try:
+            proposal = HermesToolProposalRequest.model_validate(event.payload)
+        except ValueError:
+            raise TerminalBackgroundJobError("HERMES_TOOL_PROPOSAL_INVALID") from None
+        try:
+            result = self._tool_execution.execute(
+                context.grant,
+                run_id=run_id,
+                proposal=proposal,
+            )
+        except ScopedToolAmbiguousError:
+            self._fail_host_dependency(context, run_id, external_run_id)
+        try:
+            self._runtime.submit_tool_result(external_run_id, result)
+        except HermesRuntimeError as error:
+            self._fail_dependency(context, run_id, error.code)
+
+    def _fail_host_dependency(
+        self,
+        context: LeasedJobContext,
+        run_id: UUID,
+        external_run_id: str,
+    ) -> NoReturn:
+        self._stop_and_cancel(run_id, external_run_id)
+        self._jobs.fail_dependency_attempt(
+            context.grant,
+            service=DependencyService.HOST,
+            error_code="HOST_OPERATION_AMBIGUOUS",
+        )
+        raise BackgroundJobLeaseLostError("host outage retry was scheduled")
 
     @staticmethod
     def _require_terminal_event(accepted: bool, ignored_reason: str | None) -> None:
@@ -497,3 +599,32 @@ def _observation_payload(response: Mapping[str, object]) -> dict[str, object]:
             if isinstance((value := usage.get(key)), (int, float))
         }
     return payload
+
+
+def _provider_events(
+    response: Mapping[str, object],
+    external_run_id: str,
+) -> tuple[HermesProviderEvent, ...]:
+    raw_events = response.get("events", [])
+    if not isinstance(raw_events, list) or len(raw_events) > 100:
+        raise HermesRuntimeError("HERMES_RESPONSE_INVALID")
+    events: list[HermesProviderEvent] = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            raise HermesRuntimeError("HERMES_RESPONSE_INVALID")
+        try:
+            event = HermesProviderEvent.model_validate(
+                {
+                    "provider_event_id": raw.get("event_id"),
+                    "external_run_id": external_run_id,
+                    "sequence": raw.get("sequence"),
+                    "event_type": raw.get("type"),
+                    "payload": raw.get("payload"),
+                }
+            )
+        except ValueError:
+            raise HermesRuntimeError("HERMES_RESPONSE_INVALID") from None
+        if event.event_type in {HermesEventType.COMPLETED, HermesEventType.FAILED}:
+            raise HermesRuntimeError("HERMES_RESPONSE_INVALID")
+        events.append(event)
+    return tuple(events)

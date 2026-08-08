@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -11,8 +12,10 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from difflib import unified_diff
 from pathlib import Path, PurePosixPath
 from threading import RLock
+from typing import cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -28,6 +31,13 @@ _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _MANIFEST_VERSION = 2
 _MAX_GIT_OUTPUT_BYTES = 64 * 1024
 _GIT_TIMEOUT_SECONDS = 30
+_MAX_CODE_FILE_BYTES = 256 * 1024
+_MAX_CODE_DIFF_BYTES = 256 * 1024
+_MAX_CODE_SEARCH_RESULTS = 200
+
+
+def _content_digest(content: bytes) -> str:
+    return "sha256:" + hashlib.sha256(content).hexdigest()
 
 
 class WorkspaceLifecycleError(RuntimeError):
@@ -96,9 +106,7 @@ class WorkspaceOwnership:
         if not expected_fields or set(value) != expected_fields:
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
         string_fields = {
-            name: value[name]
-            for name in value
-            if name not in {"version", "candidate_head_sha"}
+            name: value[name] for name in value if name not in {"version", "candidate_head_sha"}
         }
         if any(not isinstance(item, str) for item in string_fields.values()):
             raise WorkspaceLifecycleError("WORKSPACE_OWNERSHIP_CORRUPT")
@@ -150,9 +158,7 @@ class GitWorkspaceLifecycle:
         repository_root = self._repository_root(configuration)
         self._assert_no_external_filters(repository_root)
         self._prepare_root()
-        branch_name = configuration.git.task_branch_template.format(
-            task_id=str(authority.task_id)
-        )
+        branch_name = configuration.git.task_branch_template.format(task_id=str(authority.task_id))
         self._validate_branch(repository_root, branch_name)
         workspace_path = self._workspace_path(authority.task_id)
         manifest_path = self._manifest_path(authority.task_id)
@@ -223,6 +229,195 @@ class GitWorkspaceLifecycle:
         with self._lock:
             ownership = self._active_ownership(authority, configuration)
             return self._git_boundary_state(ownership, configuration)
+
+    def list_files(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+        *,
+        path_prefix: str,
+        limit: int,
+    ) -> dict[str, object]:
+        """List a bounded set of repository files without exposing host paths."""
+
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            prefix = self._scoped_relative_path(path_prefix, configuration, allow_root=True)
+            output = self._run_git(
+                Path(ownership.workspace_path),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                "." if prefix == "." else prefix,
+                failure_code="WORKSPACE_LIST_FAILED",
+            )
+            files = tuple(sorted(path for path in output.split("\0") if path))
+            visible: list[str] = []
+            for path in files:
+                if self._path_is_prohibited(path, configuration):
+                    continue
+                self._assert_paths_allowed((path,), configuration)
+                visible.append(path)
+            return {
+                "head_sha": self._repository_state(ownership)["head_sha"],
+                "files": visible[:limit],
+                "truncated": len(visible) > limit,
+            }
+
+    def read_file(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+        *,
+        path: str,
+    ) -> dict[str, object]:
+        """Read one bounded regular UTF-8 file from the owned workspace."""
+
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            relative, candidate = self._existing_code_file(ownership, configuration, path)
+            content = self._read_code_file(candidate)
+            return {
+                "head_sha": self._repository_state(ownership)["head_sha"],
+                "path": relative,
+                "digest": _content_digest(content),
+                "content": content.decode("utf-8"),
+            }
+
+    def search_files(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+        *,
+        query: str,
+        path_prefix: str,
+        limit: int,
+    ) -> dict[str, object]:
+        """Perform a literal, bounded UTF-8 search without a shell or regex."""
+
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            listed = self.list_files(
+                authority,
+                configuration,
+                path_prefix=path_prefix,
+                limit=_MAX_CODE_SEARCH_RESULTS,
+            )
+            matches: list[dict[str, object]] = []
+            for raw_path in cast(list[object], listed["files"]):
+                assert isinstance(raw_path, str)
+                try:
+                    _, candidate = self._existing_code_file(
+                        ownership,
+                        configuration,
+                        raw_path,
+                    )
+                    text = self._read_code_file(candidate).decode("utf-8")
+                except (UnicodeDecodeError, WorkspaceLifecycleError):
+                    continue
+                for line_number, line in enumerate(text.splitlines(), start=1):
+                    if query in line:
+                        matches.append(
+                            {
+                                "path": raw_path,
+                                "line": line_number,
+                                "text": line[:1_000],
+                            }
+                        )
+                        if len(matches) == limit:
+                            return {
+                                "head_sha": self._repository_state(ownership)["head_sha"],
+                                "matches": matches,
+                                "truncated": True,
+                            }
+            return {
+                "head_sha": self._repository_state(ownership)["head_sha"],
+                "matches": matches,
+                "truncated": bool(listed["truncated"]),
+            }
+
+    def diff_workspace(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+    ) -> dict[str, object]:
+        """Return a bounded, configuration-checked diff for the owned workspace."""
+
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            return self._code_change_state(ownership, configuration)
+
+    def apply_file_changes(
+        self,
+        authority: TaskLeaseHostAuthority,
+        configuration: RepositoryConfiguration,
+        *,
+        changes: tuple[dict[str, object], ...],
+    ) -> dict[str, object]:
+        """Atomically apply typed whole-file changes under the workspace fence."""
+
+        with self._lock:
+            ownership = self._active_ownership(authority, configuration)
+            workspace = Path(ownership.workspace_path).resolve(strict=True)
+            prepared: list[tuple[str, Path, bytes | None, int | None]] = []
+            seen: set[str] = set()
+            for change in changes:
+                raw_path = change["path"]
+                expected_digest = change["expected_digest"]
+                content = change["content"]
+                assert isinstance(raw_path, str)
+                assert expected_digest is None or isinstance(expected_digest, str)
+                assert content is None or isinstance(content, str)
+                relative = self._scoped_relative_path(raw_path, configuration)
+                if relative in seen:
+                    raise WorkspaceLifecycleError("DUPLICATE_CHANGE_PATH")
+                seen.add(relative)
+                candidate = workspace / relative
+                self._assert_no_symlink_components(workspace, relative)
+                try:
+                    parent = candidate.parent.resolve(strict=True)
+                except OSError:
+                    raise WorkspaceLifecycleError("PARENT_DIRECTORY_NOT_FOUND") from None
+                if workspace != parent and workspace not in parent.parents:
+                    raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+                if candidate.is_symlink():
+                    raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+                existing: bytes | None = None
+                mode: int | None = None
+                if candidate.exists():
+                    existing = self._read_code_file(candidate)
+                    mode = stat.S_IMODE(candidate.stat(follow_symlinks=False).st_mode)
+                actual_digest = None if existing is None else _content_digest(existing)
+                if actual_digest != expected_digest:
+                    raise WorkspaceLifecycleError("FILE_DIGEST_MISMATCH")
+                encoded = None if content is None else content.encode("utf-8")
+                if encoded is not None and len(encoded) > _MAX_CODE_FILE_BYTES:
+                    raise WorkspaceLifecycleError("FILE_TOO_LARGE")
+                if encoded is None and existing is None:
+                    raise WorkspaceLifecycleError("FILE_NOT_FOUND")
+                prepared.append((relative, candidate, encoded, mode))
+
+            rollback: list[tuple[Path, bytes | None, int | None]] = []
+            try:
+                for _relative, candidate, encoded, mode in prepared:
+                    previous = candidate.read_bytes() if candidate.exists() else None
+                    rollback.append((candidate, previous, mode))
+                    if encoded is None:
+                        candidate.unlink()
+                    else:
+                        self._replace_code_file(candidate, encoded, mode=mode)
+            except OSError:
+                self._rollback_file_changes(rollback)
+                raise WorkspaceLifecycleError("WORKSPACE_CHANGE_FAILED") from None
+            try:
+                state = self._code_change_state(ownership, configuration)
+            except WorkspaceLifecycleError:
+                self._rollback_file_changes(rollback)
+                raise
+            return {**state, "applied_paths": sorted(seen)}
 
     def commit_candidate(
         self,
@@ -448,9 +643,7 @@ class GitWorkspaceLifecycle:
                 state="ABSENT",
             )
         expected_path = self._workspace_path(authority.task_id)
-        branch_name = configuration.git.task_branch_template.format(
-            task_id=str(authority.task_id)
-        )
+        branch_name = configuration.git.task_branch_template.format(task_id=str(authority.task_id))
         self._assert_owned(
             ownership,
             authority=authority,
@@ -471,9 +664,7 @@ class GitWorkspaceLifecycle:
         if workspace_path.is_symlink():
             raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
         if workspace_path.exists():
-            if str(workspace_path) in self._registered_worktrees(
-                repository_root
-            ):
+            if str(workspace_path) in self._registered_worktrees(repository_root):
                 self._run_git(
                     repository_root,
                     "worktree",
@@ -568,9 +759,7 @@ class GitWorkspaceLifecycle:
             raise WorkspaceLifecycleError("WORKSPACE_NOT_FOUND")
         self._validate_root()
         workspace_path = self._workspace_path(authority.task_id)
-        branch_name = configuration.git.task_branch_template.format(
-            task_id=str(authority.task_id)
-        )
+        branch_name = configuration.git.task_branch_template.format(task_id=str(authority.task_id))
         ownership = self._read_ownership(self._manifest_path(authority.task_id))
         if ownership is None:
             raise WorkspaceLifecycleError("WORKSPACE_NOT_FOUND")
@@ -724,9 +913,7 @@ class GitWorkspaceLifecycle:
                     "-z",
                     failure_code="GIT_STATUS_UNAVAILABLE",
                 )
-                staged_paths = tuple(
-                    sorted(path for path in staged_output.split("\0") if path)
-                )
+                staged_paths = tuple(sorted(path for path in staged_output.split("\0") if path))
                 if not staged_paths:
                     raise WorkspaceLifecycleError("NOTHING_TO_COMMIT")
                 tree_sha = self._validated_git_object(
@@ -804,11 +991,7 @@ class GitWorkspaceLifecycle:
         (git_directory / "refs" / "heads").mkdir(mode=0o700, parents=True)
         object_format = "sha256" if len(expected_head_sha) == 64 else "sha1"
         repository_version = "1" if object_format == "sha256" else "0"
-        config = (
-            "[core]\n"
-            f"\trepositoryformatversion = {repository_version}\n"
-            "\tbare = false\n"
-        )
+        config = f"[core]\n\trepositoryformatversion = {repository_version}\n\tbare = false\n"
         if object_format == "sha256":
             config += "[extensions]\n\tobjectformat = sha256\n"
         self._write_private_file(git_directory / "config", config)
@@ -904,13 +1087,170 @@ class GitWorkspaceLifecycle:
         return tuple(sorted({path for path in output.split("\0") if path}))
 
     @staticmethod
+    def _scoped_relative_path(
+        raw_path: str,
+        configuration: RepositoryConfiguration,
+        *,
+        allow_root: bool = False,
+    ) -> str:
+        GitWorkspaceLifecycle._assert_paths_allowed((raw_path,), configuration)
+        path = PurePosixPath(raw_path)
+        normalized = path.as_posix()
+        if normalized in {"", "."}:
+            if allow_root:
+                return "."
+            raise WorkspaceLifecycleError("INVALID_WORKSPACE_PATH")
+        if normalized != raw_path or any(part in {"", "."} for part in path.parts):
+            raise WorkspaceLifecycleError("INVALID_WORKSPACE_PATH")
+        return normalized
+
+    def _existing_code_file(
+        self,
+        ownership: WorkspaceOwnership,
+        configuration: RepositoryConfiguration,
+        raw_path: str,
+    ) -> tuple[str, Path]:
+        relative = self._scoped_relative_path(raw_path, configuration)
+        workspace = Path(ownership.workspace_path).resolve(strict=True)
+        candidate = workspace / relative
+        self._assert_no_symlink_components(workspace, relative)
+        if candidate.is_symlink() or not candidate.exists():
+            raise WorkspaceLifecycleError("FILE_NOT_FOUND")
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            raise WorkspaceLifecycleError("FILE_NOT_FOUND") from None
+        if workspace not in resolved.parents or not resolved.is_file():
+            raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+        return relative, resolved
+
+    @staticmethod
+    def _assert_no_symlink_components(workspace: Path, relative: str) -> None:
+        candidate = workspace
+        for part in PurePosixPath(relative).parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+
+    @staticmethod
+    def _read_code_file(path: Path) -> bytes:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > _MAX_CODE_FILE_BYTES:
+                    raise WorkspaceLifecycleError("FILE_TOO_LARGE")
+                content = os.read(descriptor, _MAX_CODE_FILE_BYTES + 1)
+            finally:
+                os.close(descriptor)
+        except WorkspaceLifecycleError:
+            raise
+        except OSError:
+            raise WorkspaceLifecycleError("FILE_READ_FAILED") from None
+        if len(content) > _MAX_CODE_FILE_BYTES:
+            raise WorkspaceLifecycleError("FILE_TOO_LARGE")
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise WorkspaceLifecycleError("FILE_NOT_UTF8") from None
+        return content
+
+    @staticmethod
+    def _replace_code_file(path: Path, content: bytes, *, mode: int | None) -> None:
+        descriptor, raw_temporary = tempfile.mkstemp(prefix=".mathews-change-", dir=path.parent)
+        temporary = Path(raw_temporary)
+        try:
+            os.fchmod(descriptor, 0o644 if mode is None else mode)
+            offset = 0
+            while offset < len(content):
+                written = os.write(descriptor, content[offset:])
+                if written <= 0:
+                    raise OSError("workspace write did not advance")
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, path)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _rollback_file_changes(
+        rollback: list[tuple[Path, bytes | None, int | None]],
+    ) -> None:
+        for candidate, previous, mode in reversed(rollback):
+            try:
+                if previous is None:
+                    candidate.unlink(missing_ok=True)
+                else:
+                    GitWorkspaceLifecycle._replace_code_file(candidate, previous, mode=mode)
+            except OSError:
+                raise WorkspaceLifecycleError("WORKSPACE_ROLLBACK_FAILED") from None
+
+    def _code_change_state(
+        self,
+        ownership: WorkspaceOwnership,
+        configuration: RepositoryConfiguration,
+    ) -> dict[str, object]:
+        changed_paths = self._changed_paths(ownership)
+        self._assert_paths_allowed(changed_paths, configuration)
+        workspace = Path(ownership.workspace_path)
+        diff_parts: list[str] = []
+        total_bytes = 0
+        for relative in changed_paths:
+            before_result = self._run_git_result(
+                workspace,
+                "show",
+                f"HEAD:{relative}",
+            )
+            if before_result.returncode not in {0, 128}:
+                raise WorkspaceLifecycleError("GIT_DIFF_UNAVAILABLE")
+            before = before_result.stdout if before_result.returncode == 0 else ""
+            candidate = workspace / relative
+            if candidate.is_symlink():
+                raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+            if candidate.exists():
+                try:
+                    after = self._read_code_file(candidate).decode("utf-8")
+                except WorkspaceLifecycleError as error:
+                    if error.code == "FILE_NOT_UTF8":
+                        raise WorkspaceLifecycleError("BINARY_CHANGE_PROHIBITED") from None
+                    raise
+            else:
+                after = ""
+            part = "".join(
+                unified_diff(
+                    before.splitlines(keepends=True),
+                    after.splitlines(keepends=True),
+                    fromfile=f"a/{relative}",
+                    tofile=f"b/{relative}",
+                )
+            )
+            encoded_size = len(part.encode("utf-8"))
+            total_bytes += encoded_size
+            if total_bytes > _MAX_CODE_DIFF_BYTES:
+                raise WorkspaceLifecycleError("DIFF_TOO_LARGE")
+            diff_parts.append(part)
+        state = self._repository_state(ownership)
+        return {
+            "head_sha": state["head_sha"],
+            "base_sha": ownership.base_sha,
+            "changed_paths": list(changed_paths),
+            "diff": "".join(diff_parts),
+        }
+
+    @staticmethod
     def _assert_paths_allowed(
         changed_paths: tuple[str, ...],
         configuration: RepositoryConfiguration,
     ) -> None:
         prohibited = tuple(
-            PurePosixPath(path.casefold())
-            for path in configuration.prohibited_paths
+            PurePosixPath(path.casefold()) for path in configuration.prohibited_paths
         )
         for raw_path in changed_paths:
             path = PurePosixPath(raw_path)
@@ -923,11 +1263,23 @@ class GitWorkspaceLifecycle:
                 or len(raw_path) > 4096
                 or any(ord(character) < 32 for character in raw_path)
                 or any(
-                    denied == folded_path or denied in folded_path.parents
-                    for denied in prohibited
+                    denied == folded_path or denied in folded_path.parents for denied in prohibited
                 )
             ):
                 raise WorkspaceLifecycleError("PROHIBITED_PATH_CHANGED")
+
+    @staticmethod
+    def _path_is_prohibited(
+        raw_path: str,
+        configuration: RepositoryConfiguration,
+    ) -> bool:
+        folded = PurePosixPath(raw_path.casefold())
+        return any(
+            denied == folded or denied in folded.parents
+            for denied in (
+                PurePosixPath(path.casefold()) for path in configuration.prohibited_paths
+            )
+        )
 
     def _push_remote_url(
         self,
@@ -1017,11 +1369,14 @@ class GitWorkspaceLifecycle:
             "--cached",
             "--quiet",
         )
-        worktree_clean = self._quiet_git_clean(
-            workspace_path,
-            "diff",
-            "--quiet",
-        ) and not untracked
+        worktree_clean = (
+            self._quiet_git_clean(
+                workspace_path,
+                "diff",
+                "--quiet",
+            )
+            and not untracked
+        )
         return {
             "task_id": ownership.task_id,
             "repository_key": ownership.repository_key,
@@ -1051,10 +1406,7 @@ class GitWorkspaceLifecycle:
             repository_root = configured.resolve(strict=True)
         except OSError:
             raise WorkspaceLifecycleError("REPOSITORY_UNAVAILABLE") from None
-        if (
-            str(repository_root) != configuration.repository.root
-            or not repository_root.is_dir()
-        ):
+        if str(repository_root) != configuration.repository.root or not repository_root.is_dir():
             raise WorkspaceLifecycleError("REPOSITORY_BOUNDARY_MISMATCH")
         top_level = self._run_git(
             repository_root,
@@ -1208,9 +1560,7 @@ class GitWorkspaceLifecycle:
             "task_id": str(task_id),
             "state": state,
             "reason": reason,
-            "cancellation_id": (
-                None if cancellation_id is None else str(cancellation_id)
-            ),
+            "cancellation_id": (None if cancellation_id is None else str(cancellation_id)),
         }
 
     def _validate_branch(self, repository_root: Path, branch_name: str) -> None:
@@ -1256,9 +1606,9 @@ class GitWorkspaceLifecycle:
 
     def _remove_owned_partial_path(self, workspace_path: Path) -> None:
         try:
-            if workspace_path.parent.resolve(strict=True) != (
-                self._root / "tasks"
-            ).resolve(strict=True):
+            if workspace_path.parent.resolve(strict=True) != (self._root / "tasks").resolve(
+                strict=True
+            ):
                 raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
             path_stat = workspace_path.lstat()
             if stat.S_ISLNK(path_stat.st_mode):

@@ -139,6 +139,17 @@ class HermesRunStatus(StrEnum):
     TIMED_OUT = "TIMED_OUT"
 
 
+class HermesToolDecisionStatus(StrEnum):
+    AUTHORIZED = "AUTHORIZED"
+    DENIED = "DENIED"
+
+
+class HermesToolResultStatus(StrEnum):
+    SUCCEEDED = "SUCCEEDED"
+    REJECTED = "REJECTED"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
 class OwnedHostProcessStatus(StrEnum):
     RUNNING = "RUNNING"
     TERMINATION_REQUESTED = "TERMINATION_REQUESTED"
@@ -807,8 +818,7 @@ class ApprovalRequest(RecordContext, Base):
     __tablename__ = "approval_requests"
     __table_args__ = (
         CheckConstraint(
-            "length(request_fingerprint) = 64 AND "
-            f"{_hex_only_sql('request_fingerprint')}",
+            f"length(request_fingerprint) = 64 AND {_hex_only_sql('request_fingerprint')}",
             name="request_fingerprint",
         ),
         CheckConstraint(
@@ -1625,17 +1635,13 @@ class OwnedHostProcess(RecordContext, Base):
         server_default=OwnedHostProcessStatus.RUNNING.value,
     )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    termination_requested_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    termination_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     terminated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     partial_evidence_id: Mapped[UUID | None] = mapped_column(
         Uuid,
         ForeignKey("evidence_records.id", ondelete="RESTRICT"),
     )
-    cleanup_completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    cleanup_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class BackgroundJobIgnoredResult(RecordContext, Base):
@@ -1711,8 +1717,7 @@ class DependencyOutageAttempt(RecordContext, Base):
             name="service",
         ),
         CheckConstraint(
-            "(exhausted = false AND approval_request_id IS NULL) "
-            "OR exhausted = true",
+            "(exhausted = false AND approval_request_id IS NULL) OR exhausted = true",
             name="approval_only_when_exhausted",
         ),
         CheckConstraint(
@@ -1816,9 +1821,7 @@ class TaskCancellation(RecordContext, Base):
     )
     transition_event_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    cleanup_completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    cleanup_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ReconciliationTarget(RecordContext, Base):
@@ -1880,9 +1883,7 @@ class ReconciliationTarget(RecordContext, Base):
         default=0,
         server_default="0",
     )
-    last_reconciled_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error_code: Mapped[str | None] = mapped_column(String(100))
 
 
@@ -1979,6 +1980,117 @@ class HermesRunEvent(RecordContext, Base):
         Uuid, ForeignKey("task_events.id", ondelete="RESTRICT")
     )
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class HermesToolProposal(RecordContext, Base):
+    """Immutable Hermes tool proposal bound to one exact run lease."""
+
+    __tablename__ = "hermes_tool_proposals"
+    __table_args__ = (
+        CheckConstraint("fencing_token > 0", name="fencing_token_positive"),
+        CheckConstraint("length(arguments_fingerprint) = 64", name="arguments_fingerprint_length"),
+        UniqueConstraint(
+            "run_id",
+            "external_proposal_id",
+            name="uq_hermes_tool_proposals_run_external",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "lease_id", "fencing_token"],
+            [
+                "background_job_leases.job_id",
+                "background_job_leases.id",
+                "background_job_leases.fencing_token",
+            ],
+            name="fk_hermes_tool_proposals_lease",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("hermes_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("background_jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    external_proposal_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    arguments_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    proposal_evidence_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("evidence_records.id", ondelete="RESTRICT"), nullable=False
+    )
+    proposed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class HermesToolDecision(RecordContext, Base):
+    """Immutable control-plane authorization for one Hermes proposal."""
+
+    __tablename__ = "hermes_tool_decisions"
+    __table_args__ = (UniqueConstraint("proposal_id", name="uq_hermes_tool_decisions_proposal"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    proposal_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("hermes_tool_proposals.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[HermesToolDecisionStatus] = mapped_column(
+        _enum(HermesToolDecisionStatus, name="hermes_tool_decision_status"),
+        nullable=False,
+    )
+    reason_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    tool_grant_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("background_job_tool_grants.id", ondelete="RESTRICT"), nullable=False
+    )
+    brief_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("briefs.id", ondelete="RESTRICT")
+    )
+    repository_configuration_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("repository_configurations.id", ondelete="RESTRICT")
+    )
+    policy_version_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("policy_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    decision_evidence_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("evidence_records.id", ondelete="RESTRICT"), nullable=False
+    )
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class HermesToolResult(RecordContext, Base):
+    """Append-only host outcome returned for an authorized Hermes proposal."""
+
+    __tablename__ = "hermes_tool_results"
+    __table_args__ = (
+        CheckConstraint("attempt > 0", name="attempt_positive"),
+        UniqueConstraint(
+            "proposal_id",
+            "attempt",
+            name="uq_hermes_tool_results_proposal_attempt",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    proposal_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("hermes_tool_proposals.id", ondelete="RESTRICT"), nullable=False
+    )
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[HermesToolResultStatus] = mapped_column(
+        _enum(HermesToolResultStatus, name="hermes_tool_result_status"),
+        nullable=False,
+    )
+    code: Mapped[str] = mapped_column(String(100), nullable=False)
+    repository_revision: Mapped[str | None] = mapped_column(String(64))
+    result_evidence_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("evidence_records.id", ondelete="RESTRICT"), nullable=False
+    )
+    diff_evidence_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("evidence_records.id", ondelete="RESTRICT")
+    )
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class WebhookDelivery(RecordContext, Base):

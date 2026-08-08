@@ -537,9 +537,7 @@ def test_renewable_effect_yields_guard_for_same_lease_renewal(
             dispatcher.dispatch(authenticator.sign_request(renewal))
         )
         release.set()
-        operation_response = authenticator.verify_response(
-            operation_future.result(timeout=2)
-        )
+        operation_response = authenticator.verify_response(operation_future.result(timeout=2))
 
     assert renewal_response.status is HostResponseStatus.OK
     assert operation_response.status is HostResponseStatus.OK
@@ -826,9 +824,7 @@ def test_renewable_effect_returns_recovery_evidence_when_authority_is_lost(
         host_id="host-1",
         clock_ms=lambda: clock[0],
     )
-    request = _request(
-        authority=_task_authority(lease_expires_at_ms=NOW_MS + 10)
-    )
+    request = _request(authority=_task_authority(lease_expires_at_ms=NOW_MS + 10))
 
     response = authenticator.verify_response(
         dispatcher.dispatch(authenticator.sign_request(request))
@@ -929,6 +925,7 @@ def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
 
     assert registry.capabilities == (
         "artifact.read",
+        "git.apply_patch",
         "git.commit",
         "git.inspect",
         "git.push",
@@ -939,7 +936,11 @@ def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
         "validation.run",
         "workspace.cleanup",
         "workspace.create",
+        "workspace.diff",
         "workspace.inspect",
+        "workspace.list_files",
+        "workspace.read_file",
+        "workspace.search",
     )
     assert all(
         forbidden not in capability
@@ -1119,9 +1120,7 @@ def test_workspace_operations_are_configuration_bound_fenced_and_typed(
                 "task_id": str(authority.task_id),
                 "state": "CLEANED",
                 "reason": reason,
-                "cancellation_id": (
-                    None if cancellation_id is None else str(cancellation_id)
-                ),
+                "cancellation_id": (None if cancellation_id is None else str(cancellation_id)),
             }
 
     monkeypatch.setattr(
@@ -1169,9 +1168,7 @@ def test_workspace_operations_are_configuration_bound_fenced_and_typed(
     )
 
     responses = tuple(
-        authenticator.verify_response(
-            dispatcher.dispatch(authenticator.sign_request(request))
-        )
+        authenticator.verify_response(dispatcher.dispatch(authenticator.sign_request(request)))
         for request in requests
     )
 
@@ -1310,9 +1307,7 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
         registry=default_operation_registry(
             workspaces=cast(GitWorkspaceLifecycle, FakeWorkspaces()),
             git_credentials=cast(SecretProvider, FakeCredentials()),
-            git_push_transport=GitCredentialPushTransport(
-                (tmp_path / "git-helpers").resolve()
-            ),
+            git_push_transport=GitCredentialPushTransport((tmp_path / "git-helpers").resolve()),
             configured_execution=cast(
                 ConfiguredOperationRunner,
                 FakeExecution(),
@@ -1362,9 +1357,7 @@ def test_controlled_git_operations_are_fenced_and_resolve_credentials_off_messag
     )
 
     responses = tuple(
-        authenticator.verify_response(
-            dispatcher.dispatch(authenticator.sign_request(request))
-        )
+        authenticator.verify_response(dispatcher.dispatch(authenticator.sign_request(request)))
         for request in requests
     )
 
