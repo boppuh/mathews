@@ -65,6 +65,9 @@ EXPECTED_HEAD_TABLES = {
     "evidence_tombstones",
     "hermes_run_events",
     "hermes_runs",
+    "hermes_tool_decisions",
+    "hermes_tool_proposals",
+    "hermes_tool_results",
     "dependency_outage_attempts",
     "local_users",
     "policy_version_prompt_templates",
@@ -92,7 +95,13 @@ RELIABILITY_TABLES = {
     "reconciliation_targets",
     "task_cancellations",
 }
-HERMES_TABLES = {"hermes_run_events", "hermes_runs"}
+HERMES_TABLES = {
+    "hermes_run_events",
+    "hermes_runs",
+    "hermes_tool_decisions",
+    "hermes_tool_proposals",
+    "hermes_tool_results",
+}
 
 
 def _migration_config(database_url: str) -> Config:

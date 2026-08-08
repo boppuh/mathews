@@ -3,7 +3,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from pydantic import SecretStr
+from mathews_configuration import SecretReference
+from pydantic import AnyHttpUrl, SecretStr
 
 
 def test_worker_probe() -> None:
@@ -52,6 +53,38 @@ def test_empty_handler_registry_is_reported_as_fail_closed(
         assert "remain idle" in caplog.text
     finally:
         engine.dispose()
+
+
+def test_custom_handlers_do_not_resolve_an_unused_host_gateway(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mathews_control_plane import worker as worker_module
+    from mathews_control_plane.settings import Settings
+
+    runtime_settings = Settings(
+        environment="test",
+        database_url=SecretStr(f"sqlite:///{tmp_path / 'worker.sqlite3'}"),
+        artifact_root=tmp_path / "artifacts",
+        target_repository_root=tmp_path,
+        host_socket_path=tmp_path / "host.sock",
+        host_auth_key_ref=SecretReference.parse("keychain://mathews.host/control-plane"),
+        hermes_endpoint=AnyHttpUrl("https://hermes.example.test"),
+        hermes_api_key_ref=SecretReference.parse("keychain://mathews.hermes/api-key"),
+        github_app_id=1,
+        github_installation_id=2,
+        github_repository_id=3,
+        github_private_key_ref=SecretReference.parse("keychain://mathews.github/private-key"),
+        github_webhook_secret_ref=SecretReference.parse("keychain://mathews.github/webhook"),
+    )
+
+    def unexpected_gateway(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("custom handlers must not resolve the host gateway")
+
+    monkeypatch.setattr(worker_module, "configured_local_host_gateway", unexpected_gateway)
+
+    _worker, engine = worker_module.build_worker(runtime_settings, handlers={})
+    engine.dispose()
 
 
 def test_default_worker_registers_the_fail_closed_hermes_handler(

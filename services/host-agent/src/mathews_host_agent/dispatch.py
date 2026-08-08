@@ -398,9 +398,7 @@ class HostRequestDispatcher:
         except HostEffectAmbiguous as error:
             return self._ambiguous_response(
                 request,
-                result=normalize_host_json_object(
-                    cast(dict[str, object], error.result)
-                ),
+                result=normalize_host_json_object(cast(dict[str, object], error.result)),
             )
         except HostOperationRejected as error:
             journal_result = JournalResult(
@@ -499,11 +497,7 @@ def default_operation_registry(
         Path.home() / "Library" / "Application Support" / "Mathews" / "git-helpers"
     )
     default_artifact_store = HostArtifactStore(
-        Path.home()
-        / "Library"
-        / "Application Support"
-        / "Mathews"
-        / "validation-artifacts"
+        Path.home() / "Library" / "Application Support" / "Mathews" / "validation-artifacts"
     )
     execution_runner = configured_execution or ConfiguredOperationRunner(
         workspace_lifecycle,
@@ -598,6 +592,89 @@ def default_operation_registry(
         configuration = _configuration_argument(authority, arguments)
         try:
             result = workspace_lifecycle.inspect_git(authority, configuration)
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def workspace_list_files(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = workspace_lifecycle.list_files(
+                authority,
+                configuration,
+                path_prefix=cast(str, arguments["path_prefix"]),
+                limit=cast(int, arguments["limit"]),
+            )
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def workspace_read_file(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = workspace_lifecycle.read_file(
+                authority,
+                configuration,
+                path=cast(str, arguments["path"]),
+            )
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def workspace_search(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = workspace_lifecycle.search_files(
+                authority,
+                configuration,
+                query=cast(str, arguments["query"]),
+                path_prefix=cast(str, arguments["path_prefix"]),
+                limit=cast(int, arguments["limit"]),
+            )
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def workspace_diff(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        try:
+            result = workspace_lifecycle.diff_workspace(authority, configuration)
+        except WorkspaceLifecycleError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
+    def git_apply_patch(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        configuration = _configuration_argument(authority, arguments)
+        raw_changes = cast(list[JsonValue], arguments["changes"])
+        changes = tuple(cast(dict[str, object], change) for change in raw_changes)
+        try:
+            result = context.perform_authorized_effect(
+                lambda: workspace_lifecycle.apply_file_changes(
+                    authority,
+                    configuration,
+                    changes=changes,
+                )
+            )
         except WorkspaceLifecycleError as error:
             raise HostOperationRejected(error.code) from None
         return cast(dict[str, JsonValue], result)
@@ -744,6 +821,12 @@ def default_operation_registry(
                 validate=_validate_configuration,
                 handle=git_inspect,
             ),
+            "git.apply_patch": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_apply_patch,
+                handle=git_apply_patch,
+                mutates_host=True,
+            ),
             "git.push": HostOperationDefinition(
                 authority=HostAuthorityKind.TASK_LEASE,
                 validate=_validate_git_push,
@@ -793,6 +876,26 @@ def default_operation_registry(
                 validate=_validate_configuration,
                 handle=workspace_inspect,
             ),
+            "workspace.diff": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_configuration,
+                handle=workspace_diff,
+            ),
+            "workspace.list_files": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_workspace_list,
+                handle=workspace_list_files,
+            ),
+            "workspace.read_file": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_workspace_read,
+                handle=workspace_read_file,
+            ),
+            "workspace.search": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_workspace_search,
+                handle=workspace_search,
+            ),
         }
     )
 
@@ -817,10 +920,105 @@ def _validate_preflight(
 def _validate_configuration(
     arguments: dict[str, JsonValue],
 ) -> dict[str, JsonValue]:
-    if set(arguments) != {"configuration"} or not isinstance(
-        arguments["configuration"], dict
+    if set(arguments) != {"configuration"} or not isinstance(arguments["configuration"], dict):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    return arguments
+
+
+def _workspace_path_argument(value: JsonValue, *, allow_root: bool = False) -> str:
+    if not isinstance(value, str) or len(value) > 4_096:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    if allow_root and value == ".":
+        return value
+    if (
+        not value
+        or value.startswith("/")
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or any(ord(character) < 32 for character in value)
     ):
         raise HostOperationRejected("INVALID_ARGUMENTS")
+    return value
+
+
+def _bounded_limit(value: JsonValue) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= 200:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    return value
+
+
+def _validate_workspace_list(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"configuration", "path_prefix", "limit"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    _validate_configuration_field(arguments)
+    _workspace_path_argument(arguments["path_prefix"], allow_root=True)
+    _bounded_limit(arguments["limit"])
+    return arguments
+
+
+def _validate_workspace_read(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"configuration", "path"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    _validate_configuration_field(arguments)
+    _workspace_path_argument(arguments["path"])
+    return arguments
+
+
+def _validate_workspace_search(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"configuration", "query", "path_prefix", "limit"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    _validate_configuration_field(arguments)
+    query = arguments["query"]
+    if (
+        not isinstance(query, str)
+        or not query
+        or len(query.encode("utf-8")) > 1_000
+        or any(ord(character) < 32 and character not in {"\t"} for character in query)
+    ):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    _workspace_path_argument(arguments["path_prefix"], allow_root=True)
+    _bounded_limit(arguments["limit"])
+    return arguments
+
+
+def _validate_apply_patch(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"configuration", "changes"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    _validate_configuration_field(arguments)
+    changes = arguments["changes"]
+    if not isinstance(changes, list) or not 0 < len(changes) <= 32:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    total_bytes = 0
+    for change in changes:
+        if not isinstance(change, dict) or set(change) != {
+            "path",
+            "expected_digest",
+            "content",
+        }:
+            raise HostOperationRejected("INVALID_ARGUMENTS")
+        _workspace_path_argument(change["path"])
+        digest = change["expected_digest"]
+        content = change["content"]
+        if digest is not None and (
+            not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        ):
+            raise HostOperationRejected("INVALID_ARGUMENTS")
+        if content is not None and not isinstance(content, str):
+            raise HostOperationRejected("INVALID_ARGUMENTS")
+        if content is None and digest is None:
+            raise HostOperationRejected("INVALID_ARGUMENTS")
+        if isinstance(content, str):
+            total_bytes += len(content.encode("utf-8"))
+        if total_bytes > 256 * 1024:
+            raise HostOperationRejected("INVALID_ARGUMENTS")
     return arguments
 
 

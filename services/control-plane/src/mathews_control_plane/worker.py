@@ -14,6 +14,10 @@ from mathews_control_plane.background_jobs import (
     DurableJobWorker,
     WorkerRunOutcome,
 )
+from mathews_control_plane.code_change_execution import (
+    HostGateway,
+    ScopedCodeExecutionService,
+)
 from mathews_control_plane.database import (
     create_database_engine,
     create_session_factory,
@@ -26,6 +30,7 @@ from mathews_control_plane.hermes_adapter import (
     KeychainSecretProvider,
     UnavailableHermesRuntime,
 )
+from mathews_control_plane.host_gateway import configured_local_host_gateway
 from mathews_control_plane.reliability import (
     OwnedProcessTerminator,
     OwnedWorkspaceCleaner,
@@ -49,18 +54,34 @@ def build_worker(
     *,
     handlers: dict[str, BackgroundJobHandler] | None = None,
     hermes_runtime: HermesRuntime | None = None,
+    host_gateway: HostGateway | None = None,
 ) -> tuple[DurableJobWorker, Engine]:
     """Build one database-backed worker and return its disposable engine."""
 
     engine = create_database_engine(runtime_settings.database_url)
     factory = create_session_factory(engine)
     store = ArtifactStore(runtime_settings.artifact_root)
-    runtime = hermes_runtime or configured_hermes_runtime(runtime_settings)
-    handler_registry = (
-        {"hermes-run": HermesRunJobHandler(factory, store, runtime)}
-        if handlers is None
-        else dict(handlers)
-    )
+    if handlers is None:
+        runtime = hermes_runtime or configured_hermes_runtime(runtime_settings)
+        gateway = host_gateway
+        if gateway is None and runtime_settings.automation_ready:
+            gateway = configured_local_host_gateway(
+                runtime_settings.require_automation_configuration(),
+                secrets=KeychainSecretProvider(),
+            )
+        tool_execution = (
+            None if gateway is None else ScopedCodeExecutionService(factory, store, gateway)
+        )
+        handler_registry: dict[str, BackgroundJobHandler] = {
+            "hermes-run": HermesRunJobHandler(
+                factory,
+                store,
+                runtime,
+                tool_execution,
+            )
+        }
+    else:
+        handler_registry = dict(handlers)
     if not handler_registry:
         logger.warning("worker has no registered handlers; durable polling will remain idle")
     service = BackgroundJobService(
@@ -121,10 +142,7 @@ def recover_worker_startup(
 def configured_hermes_runtime(runtime_settings: Settings) -> HermesRuntime:
     """Build the production Hermes boundary or a bounded fail-closed substitute."""
 
-    if (
-        runtime_settings.hermes_endpoint is None
-        or runtime_settings.hermes_api_key_ref is None
-    ):
+    if runtime_settings.hermes_endpoint is None or runtime_settings.hermes_api_key_ref is None:
         return UnavailableHermesRuntime()
     return HermesHttpRuntime(
         str(runtime_settings.hermes_endpoint),
@@ -164,13 +182,9 @@ def main() -> None:
         logger.info(
             "worker startup recovery completed",
             extra={
-                "completed_cancellations": len(
-                    recovery.completed_cancellation_ids
-                ),
+                "completed_cancellations": len(recovery.completed_cancellation_ids),
                 "escalated_jobs": len(recovery.escalated_job_ids),
-                "reconciled_targets": len(
-                    recovery.reconciled_target_ids
-                ),
+                "reconciled_targets": len(recovery.reconciled_target_ids),
                 "recovered_jobs": len(recovery.recovered_job_ids),
                 "resolved_outages": len(recovery.resolved_outage_ids),
             },

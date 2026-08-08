@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shlex
 import subprocess
@@ -22,6 +23,10 @@ from mathews_host_agent.workspaces import (
     WorkspaceLifecycleError,
     WorkspaceOwnership,
 )
+
+
+def _digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -225,6 +230,231 @@ def test_distinct_tasks_receive_unique_branches_and_workspaces(tmp_path: Path) -
     assert first["workspace_path"] != second["workspace_path"]
 
 
+def test_scoped_code_tools_read_search_change_and_diff_owned_workspace(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+
+    listed = lifecycle.list_files(
+        authority,
+        configuration,
+        path_prefix=".",
+        limit=20,
+    )
+    read = lifecycle.read_file(
+        authority,
+        configuration,
+        path="README.md",
+    )
+    searched = lifecycle.search_files(
+        authority,
+        configuration,
+        query="base",
+        path_prefix=".",
+        limit=20,
+    )
+    changed = lifecycle.apply_file_changes(
+        authority,
+        configuration,
+        changes=(
+            {
+                "path": "README.md",
+                "expected_digest": _digest("base\n"),
+                "content": "candidate\n",
+            },
+            {
+                "path": "feature.txt",
+                "expected_digest": None,
+                "content": "new\n",
+            },
+            {
+                "path": "Sources/New/Feature.swift",
+                "expected_digest": None,
+                "content": "struct Feature {}\n",
+            },
+        ),
+    )
+
+    assert listed == {"head_sha": base, "files": ["README.md"], "truncated": False}
+    assert read["content"] == "base\n"
+    assert read["digest"] == _digest("base\n")
+    assert searched["matches"] == [{"path": "README.md", "line": 1, "text": "base"}]
+    assert changed["head_sha"] == base
+    assert changed["changed_paths"] == [
+        "README.md",
+        "Sources/New/Feature.swift",
+        "feature.txt",
+    ]
+    assert "-base" in cast(str, changed["diff"])
+    assert "+candidate" in cast(str, changed["diff"])
+    assert "+new" in cast(str, changed["diff"])
+    assert "+struct Feature {}" in cast(str, changed["diff"])
+    workspace = Path(cast(str, created["workspace_path"]))
+    assert (workspace / "README.md").read_text() == "candidate\n"
+    assert (workspace / "feature.txt").read_text() == "new\n"
+    assert (workspace / "Sources/New/Feature.swift").read_text() == "struct Feature {}\n"
+
+
+def test_scoped_code_change_is_digest_checked_atomic_and_prohibited_path_safe(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+
+    with pytest.raises(WorkspaceLifecycleError, match="FILE_DIGEST_MISMATCH"):
+        lifecycle.apply_file_changes(
+            authority,
+            configuration,
+            changes=(
+                {
+                    "path": "README.md",
+                    "expected_digest": _digest("wrong\n"),
+                    "content": "changed\n",
+                },
+            ),
+        )
+    with pytest.raises(WorkspaceLifecycleError, match="PROHIBITED_PATH_CHANGED"):
+        lifecycle.apply_file_changes(
+            authority,
+            configuration,
+            changes=(
+                {
+                    "path": ".env",
+                    "expected_digest": None,
+                    "content": "SECRET=value\n",
+                },
+            ),
+        )
+
+    assert (workspace / "README.md").read_text() == "base\n"
+    assert not (workspace / ".env").exists()
+
+
+def test_scoped_search_considers_files_after_the_first_two_hundred(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    source = repository / "Sources"
+    source.mkdir()
+    for index in range(205):
+        marker = "needle\n" if index == 204 else "ordinary\n"
+        (source / f"File{index:03}.swift").write_text(marker)
+    _git(repository, "add", "Sources")
+    _git(
+        repository,
+        "-c",
+        "user.name=Mathews Test",
+        "-c",
+        "user.email=mathews@example.invalid",
+        "commit",
+        "-m",
+        "add search fixtures",
+    )
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    lifecycle.create(authority, configuration)
+
+    result = lifecycle.search_files(
+        authority,
+        configuration,
+        query="needle",
+        path_prefix="Sources",
+        limit=10,
+    )
+
+    assert result["matches"] == [
+        {"path": "Sources/File204.swift", "line": 1, "text": "needle"}
+    ]
+    assert result["truncated"] is False
+
+
+def test_scoped_diff_preserves_the_head_preimage_trailing_newline(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    (repository / "README.md").write_text("first\nunchanged\n")
+    _git(repository, "add", "README.md")
+    _git(
+        repository,
+        "-c",
+        "user.name=Mathews Test",
+        "-c",
+        "user.email=mathews@example.invalid",
+        "commit",
+        "-m",
+        "add multiline fixture",
+    )
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    lifecycle.create(authority, configuration)
+
+    result = lifecycle.apply_file_changes(
+        authority,
+        configuration,
+        changes=(
+            {
+                "path": "README.md",
+                "expected_digest": _digest("first\nunchanged\n"),
+                "content": "changed\nunchanged\n",
+            },
+        ),
+    )
+    diff = cast(str, result["diff"])
+
+    assert "-first\n" in diff
+    assert "+changed\n" in diff
+    assert "-unchanged\n" not in diff
+    assert "+unchanged\n" not in diff
+
+
+def test_scoped_patch_rolls_back_a_new_ignored_file(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    (repository / ".gitignore").write_text("ignored/\n")
+    _git(repository, "add", ".gitignore")
+    _git(
+        repository,
+        "-c",
+        "user.name=Mathews Test",
+        "-c",
+        "user.email=mathews@example.invalid",
+        "commit",
+        "-m",
+        "ignore generated files",
+    )
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+
+    with pytest.raises(WorkspaceLifecycleError, match="IGNORED_PATH_PROHIBITED"):
+        lifecycle.apply_file_changes(
+            authority,
+            configuration,
+            changes=(
+                {
+                    "path": "ignored/New.swift",
+                    "expected_digest": None,
+                    "content": "struct New {}\n",
+                },
+            ),
+        )
+
+    assert not (workspace / "ignored").exists()
+
+
 def test_inspect_is_read_only_when_no_workspace_registry_exists(
     tmp_path: Path,
 ) -> None:
@@ -327,9 +557,7 @@ def test_workspace_is_task_owned_across_jobs_but_rejects_changed_configuration(
     configuration = _configuration(repository)
     lifecycle.create(authority, configuration)
     changed_job = replace(authority, job_id=uuid4(), lease_id=uuid4())
-    assert lifecycle.inspect(changed_job, configuration)["task_id"] == str(
-        authority.task_id
-    )
+    assert lifecycle.inspect(changed_job, configuration)["task_id"] == str(authority.task_id)
     changed_configuration = replace(
         authority,
         configuration_digest="sha256:" + "2" * 64,
@@ -467,13 +695,16 @@ def test_candidate_commit_preserves_repository_info_excludes(
     candidate_head = cast(str, committed["head_sha"])
 
     assert committed["changed_paths"] == ["feature.txt"]
-    assert "ignored.txt" not in _git(
-        workspace,
-        "ls-tree",
-        "-r",
-        "--name-only",
-        candidate_head,
-    ).splitlines()
+    assert (
+        "ignored.txt"
+        not in _git(
+            workspace,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            candidate_head,
+        ).splitlines()
+    )
 
 
 def test_candidate_commit_rejects_head_drift_and_prohibited_paths(
@@ -594,11 +825,7 @@ def test_candidate_commit_never_executes_repository_clean_filters(
     repository, base = _repository(tmp_path)
     marker = tmp_path / "filter-executed"
     clean_filter = tmp_path / "clean-filter"
-    clean_filter.write_text(
-        "#!/bin/sh\n"
-        f"touch {shlex.quote(str(marker))}\n"
-        "cat\n"
-    )
+    clean_filter.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\ncat\n")
     clean_filter.chmod(0o700)
     lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
     authority = _authority()
@@ -629,11 +856,7 @@ def test_repository_commands_never_execute_a_local_filesystem_monitor(
     repository, _base = _repository(tmp_path)
     marker = tmp_path / "fsmonitor-executed"
     monitor = tmp_path / "fsmonitor"
-    monitor.write_text(
-        "#!/bin/sh\n"
-        f"touch {shlex.quote(str(marker))}\n"
-        "printf '1\\n'\n"
-    )
+    monitor.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nprintf '1\\n'\n")
     monitor.chmod(0o700)
     lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
     authority = _authority()

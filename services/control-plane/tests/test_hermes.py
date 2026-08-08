@@ -14,6 +14,12 @@ from mathews_control_plane.background_jobs import (
     JobLeaseGrant,
     LeasedJobContext,
     RetryPolicy,
+    TerminalBackgroundJobError,
+)
+from mathews_control_plane.code_change_execution import (
+    ScopedCodeExecutionService,
+    ScopedToolAmbiguousError,
+    ScopedToolExecutionResult,
 )
 from mathews_control_plane.database import (
     Base,
@@ -32,6 +38,7 @@ from mathews_control_plane.domain_models import (
     HermesRun,
     HermesRunEvent,
     HermesRunStatus,
+    HermesToolResultStatus,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PromptTemplateVersion,
@@ -47,6 +54,7 @@ from mathews_control_plane.hermes import (
     HermesEventType,
     HermesProviderEvent,
     HermesRunService,
+    _bounded_payload,
 )
 from mathews_control_plane.hermes_adapter import (
     HermesJobInput,
@@ -55,7 +63,9 @@ from mathews_control_plane.hermes_adapter import (
     HermesObservedStatus,
     HermesRunJobHandler,
     HermesRuntime,
+    HermesRuntimeError,
     _observation_payload,
+    _provider_events,
 )
 from mathews_control_plane.prompt_compiler import (
     CompiledPrompt,
@@ -293,9 +303,7 @@ def test_out_of_order_event_can_be_replayed_after_the_gap_closes(
     assert recovered.accepted is True
     with hermes_harness.factory() as session:
         events = tuple(
-            session.scalars(
-                select(HermesRunEvent).order_by(HermesRunEvent.provider_sequence)
-            )
+            session.scalars(select(HermesRunEvent).order_by(HermesRunEvent.provider_sequence))
         )
         assert [event.provider_sequence for event in events] == [1, 2]
 
@@ -355,6 +363,82 @@ def test_runtime_observation_preserves_a_bounded_provider_error_code() -> None:
     )
 
     assert payload["error_code"] == "RATE_LIMITED"
+
+
+def test_runtime_projects_typed_tool_proposals_without_mixing_them_into_prose() -> None:
+    events = _provider_events(
+        {
+            "events": [
+                {
+                    "event_id": "proposal-event-1",
+                    "sequence": 1,
+                    "type": "TOOL_PROPOSAL",
+                    "payload": {
+                        "proposal_id": "proposal-1",
+                        "tool_name": "workspace.read_file",
+                        "arguments": {"path": "Sources/App.swift"},
+                    },
+                }
+            ]
+        },
+        "run-1",
+    )
+
+    assert len(events) == 1
+    assert events[0].event_type is HermesEventType.TOOL_PROPOSAL
+    assert events[0].payload["proposal_id"] == "proposal-1"
+
+
+def test_runtime_orders_provider_events_and_rejects_duplicate_sequences() -> None:
+    events = _provider_events(
+        {
+            "events": [
+                {
+                    "event_id": "event-2",
+                    "sequence": 2,
+                    "type": "OUTPUT",
+                    "payload": {"text": "second"},
+                },
+                {
+                    "event_id": "event-1",
+                    "sequence": 1,
+                    "type": "OUTPUT",
+                    "payload": {"text": "first"},
+                },
+            ]
+        },
+        "run-1",
+    )
+
+    assert [event.sequence for event in events] == [1, 2]
+    with pytest.raises(HermesRuntimeError, match="HERMES_RESPONSE_INVALID"):
+        _provider_events(
+            {
+                "events": [
+                    {
+                        "event_id": "event-a",
+                        "sequence": 1,
+                        "type": "OUTPUT",
+                        "payload": {},
+                    },
+                    {
+                        "event_id": "event-b",
+                        "sequence": 1,
+                        "type": "HEARTBEAT",
+                        "payload": {},
+                    },
+                ]
+            },
+            "run-1",
+        )
+
+
+def test_hermes_event_bound_accepts_the_scoped_patch_transport_limit() -> None:
+    payload = _bounded_payload({"content": "x" * (256 * 1024)})
+
+    assert len(cast(str, payload["content"])) == 256 * 1024
+    with pytest.raises(HermesConflictError, match="size limit"):
+        _bounded_payload({"content": "x" * (513 * 1024)})
 
 
 def test_hermes_outage_uses_bounded_background_job_retry(
@@ -503,8 +587,7 @@ def test_stale_run_cancellation_does_not_revoke_the_replacement_attempt(
     assert cancelled.revoked_tool_grants == 1
     with hermes_harness.factory() as session:
         grants = {
-            grant.grant_key: grant
-            for grant in session.scalars(select(BackgroundJobToolGrant))
+            grant.grant_key: grant for grant in session.scalars(select(BackgroundJobToolGrant))
         }
         assert grants[f"hermes:{stale_run_id}"].revoked_at is not None
         assert grants[f"hermes:{replacement_run_id}"].revoked_at is None
@@ -596,6 +679,94 @@ class _CompletingRuntime:
         raise AssertionError("startup reconciliation is not used by the handler")
 
 
+class _ToolRuntime(_CompletingRuntime):
+    def __init__(self) -> None:
+        self.observations = 0
+        self.results: list[ScopedToolExecutionResult] = []
+
+    def observe(self, external_run_id: str) -> HermesObservation:
+        self.observations += 1
+        if self.observations == 1:
+            return HermesObservation(
+                external_run_id,
+                HermesObservedStatus.RUNNING,
+                {"run_id": external_run_id, "status": "running"},
+                (
+                    HermesProviderEvent(
+                        provider_event_id="proposal-event-1",
+                        external_run_id=external_run_id,
+                        sequence=1,
+                        event_type=HermesEventType.TOOL_PROPOSAL,
+                        payload={
+                            "proposal_id": "proposal-1",
+                            "tool_name": "workspace.read_file",
+                            "arguments": {"path": "Sources/App.swift"},
+                        },
+                    ),
+                ),
+            )
+        return super().observe(external_run_id)
+
+    def submit_tool_result(
+        self,
+        _external_run_id: str,
+        result: ScopedToolExecutionResult,
+    ) -> None:
+        self.results.append(result)
+
+
+class _ToolExecution:
+    def execute(self, *_args: object, **_kwargs: object) -> ScopedToolExecutionResult:
+        return ScopedToolExecutionResult(
+            proposal_id="proposal-1",
+            status=HermesToolResultStatus.SUCCEEDED,
+            code="OK",
+            result={"head_sha": "a" * 40, "content": "let enabled = true\n"},
+            decision_evidence_id=uuid4(),
+            result_evidence_id=uuid4(),
+            diff_evidence_id=None,
+            replayed=False,
+        )
+
+
+class _AmbiguousThenSuccessfulToolExecution(_ToolExecution):
+    def __init__(self) -> None:
+        self.grants: list[JobLeaseGrant] = []
+
+    def execute(self, *args: object, **kwargs: object) -> ScopedToolExecutionResult:
+        grant = cast(JobLeaseGrant, args[0])
+        self.grants.append(grant)
+        if len(self.grants) == 1:
+            raise ScopedToolAmbiguousError("host response was ambiguous")
+        return super().execute(*args, **kwargs)
+
+
+class _MalformedToolRuntime(_ToolRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stopped: list[str] = []
+
+    def observe(self, external_run_id: str) -> HermesObservation:
+        self.observations += 1
+        return HermesObservation(
+            external_run_id,
+            HermesObservedStatus.RUNNING,
+            {"run_id": external_run_id, "status": "running"},
+            (
+                HermesProviderEvent(
+                    provider_event_id="proposal-event-invalid",
+                    external_run_id=external_run_id,
+                    sequence=1,
+                    event_type=HermesEventType.TOOL_PROPOSAL,
+                    payload={"proposal_id": "missing-tool-fields"},
+                ),
+            ),
+        )
+
+    def stop(self, external_run_id: str) -> None:
+        self.stopped.append(external_run_id)
+
+
 def test_registered_worker_handler_executes_a_hermes_run(
     hermes_harness: HermesHarness,
 ) -> None:
@@ -638,3 +809,132 @@ def test_registered_worker_handler_executes_a_hermes_run(
     with hermes_harness.factory() as session:
         run = session.scalar(select(HermesRun))
         assert run is not None and run.status is HermesRunStatus.SUCCEEDED
+
+
+def test_worker_brokers_tool_proposal_before_returning_result_to_hermes(
+    hermes_harness: HermesHarness,
+) -> None:
+    prompt = HermesJobPrompt(
+        task_id=hermes_harness.prompt.task_id,
+        role=hermes_harness.prompt.role,
+        template_id=hermes_harness.prompt.template_id,
+        template_version=hermes_harness.prompt.template_version,
+        policy_version_id=hermes_harness.prompt.policy_version_id,
+        evaluation_label=hermes_harness.prompt.evaluation_label,
+        content=hermes_harness.prompt.content,
+        evidence_ids=hermes_harness.prompt.evidence_ids,
+    )
+    grant = replace(
+        hermes_harness.grant,
+        input_payload=HermesJobInput(
+            prompt=prompt,
+            poll_interval_seconds=0.001,
+        ).model_dump(mode="json"),
+    )
+    context = LeasedJobContext(
+        BackgroundJobService(
+            hermes_harness.factory,
+            hermes_harness.store,
+            clock=lambda: _NOW,
+        ),
+        grant,
+    )
+    runtime = _ToolRuntime()
+
+    result = HermesRunJobHandler(
+        hermes_harness.factory,
+        hermes_harness.store,
+        cast(HermesRuntime, runtime),
+        cast(ScopedCodeExecutionService, _ToolExecution()),
+        sleeper=lambda _seconds: None,
+        clock=lambda: _NOW,
+    )(context)
+
+    assert result["status"] == "SUCCEEDED"
+    assert len(runtime.results) == 1
+    assert runtime.results[0].proposal_id == "proposal-1"
+    with hermes_harness.factory() as session:
+        event = session.scalar(
+            select(HermesRunEvent).where(
+                HermesRunEvent.event_type == HermesEventType.TOOL_PROPOSAL.value
+            )
+        )
+        assert event is not None and event.accepted is True
+
+
+def test_worker_reconciles_an_ambiguous_host_effect_under_the_same_lease(
+    hermes_harness: HermesHarness,
+) -> None:
+    prompt = HermesJobPrompt(
+        task_id=hermes_harness.prompt.task_id,
+        role=hermes_harness.prompt.role,
+        template_id=hermes_harness.prompt.template_id,
+        template_version=hermes_harness.prompt.template_version,
+        policy_version_id=hermes_harness.prompt.policy_version_id,
+        content=hermes_harness.prompt.content,
+    )
+    grant = replace(
+        hermes_harness.grant,
+        input_payload=HermesJobInput(
+            prompt=prompt,
+            poll_interval_seconds=0.001,
+        ).model_dump(mode="json"),
+    )
+    context = LeasedJobContext(
+        BackgroundJobService(hermes_harness.factory, hermes_harness.store, clock=lambda: _NOW),
+        grant,
+    )
+    runtime = _ToolRuntime()
+    execution = _AmbiguousThenSuccessfulToolExecution()
+
+    result = HermesRunJobHandler(
+        hermes_harness.factory,
+        hermes_harness.store,
+        cast(HermesRuntime, runtime),
+        cast(ScopedCodeExecutionService, execution),
+        sleeper=lambda _seconds: None,
+        clock=lambda: _NOW,
+    )(context)
+
+    assert result["status"] == "SUCCEEDED"
+    assert len(execution.grants) == 2
+    assert {item.lease_id for item in execution.grants} == {grant.lease_id}
+    assert {item.fencing_token for item in execution.grants} == {grant.fencing_token}
+    assert len(runtime.results) == 1
+
+
+def test_worker_stops_and_cancels_a_run_with_a_malformed_tool_proposal(
+    hermes_harness: HermesHarness,
+) -> None:
+    prompt = HermesJobPrompt(
+        task_id=hermes_harness.prompt.task_id,
+        role=hermes_harness.prompt.role,
+        template_id=hermes_harness.prompt.template_id,
+        template_version=hermes_harness.prompt.template_version,
+        policy_version_id=hermes_harness.prompt.policy_version_id,
+        content=hermes_harness.prompt.content,
+    )
+    grant = replace(
+        hermes_harness.grant,
+        input_payload=HermesJobInput(prompt=prompt).model_dump(mode="json"),
+    )
+    context = LeasedJobContext(
+        BackgroundJobService(hermes_harness.factory, hermes_harness.store, clock=lambda: _NOW),
+        grant,
+    )
+    runtime = _MalformedToolRuntime()
+
+    with pytest.raises(TerminalBackgroundJobError, match="HERMES_TOOL_PROPOSAL_INVALID"):
+        HermesRunJobHandler(
+            hermes_harness.factory,
+            hermes_harness.store,
+            cast(HermesRuntime, runtime),
+            cast(ScopedCodeExecutionService, _ToolExecution()),
+            sleeper=lambda _seconds: None,
+            clock=lambda: _NOW,
+        )(context)
+
+    assert runtime.stopped == ["worker-run-1"]
+    with hermes_harness.factory() as session:
+        run = session.scalar(select(HermesRun))
+        assert run is not None and run.status is HermesRunStatus.CANCELLED
