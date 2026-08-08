@@ -1036,7 +1036,16 @@ def _host_result_validation_code(
     if not isinstance(revision, str) or _GIT_OBJECT.fullmatch(revision) is None:
         return "HOST_RESULT_INVALID"
     brief = None if decision.brief_id is None else session.get(Brief, decision.brief_id)
-    if brief is None:
+    configuration_record = (
+        None
+        if decision.repository_configuration_id is None
+        else session.get(RepositoryConfiguration, decision.repository_configuration_id)
+    )
+    if brief is None or configuration_record is None:
+        return "HOST_RESULT_INVALID"
+    try:
+        configuration = _validated_configuration(configuration_record)
+    except (TypeError, ValueError):
         return "HOST_RESULT_INVALID"
     if tool_name in {ScopedToolName.DIFF, ScopedToolName.APPLY_PATCH} and (
         not isinstance(result.get("diff"), str) or not isinstance(result.get("changed_paths"), list)
@@ -1065,6 +1074,9 @@ def _host_result_validation_code(
     included = _included_paths(brief)
     if any(not _path_in_scope(path, included) for path in paths):
         return "HOST_RESULT_OUTSIDE_BRIEF"
+    prohibited = tuple(path.casefold() for path in configuration.prohibited_paths)
+    if any(_path_prohibited(path, prohibited) for path in paths):
+        return "HOST_RESULT_PROHIBITED"
     return None
 
 

@@ -377,12 +377,7 @@ class GitWorkspaceLifecycle:
                 seen.add(relative)
                 candidate = workspace / relative
                 self._assert_no_symlink_components(workspace, relative)
-                try:
-                    parent = candidate.parent.resolve(strict=True)
-                except OSError:
-                    raise WorkspaceLifecycleError("PARENT_DIRECTORY_NOT_FOUND") from None
-                if workspace != parent and workspace not in parent.parents:
-                    raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+                self._assert_parent_boundary(workspace, candidate.parent)
                 if candidate.is_symlink():
                     raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
                 existing: bytes | None = None
@@ -401,6 +396,7 @@ class GitWorkspaceLifecycle:
                 prepared.append((relative, candidate, encoded, mode))
 
             rollback: list[tuple[Path, bytes | None, int | None]] = []
+            created_directories: list[Path] = []
             try:
                 for _relative, candidate, encoded, mode in prepared:
                     previous = candidate.read_bytes() if candidate.exists() else None
@@ -408,14 +404,17 @@ class GitWorkspaceLifecycle:
                     if encoded is None:
                         candidate.unlink()
                     else:
+                        created_directories.extend(
+                            self._create_parent_directories(workspace, candidate.parent)
+                        )
                         self._replace_code_file(candidate, encoded, mode=mode)
-            except OSError:
-                self._rollback_file_changes(rollback)
+            except (OSError, WorkspaceLifecycleError):
+                self._rollback_file_changes(rollback, created_directories)
                 raise WorkspaceLifecycleError("WORKSPACE_CHANGE_FAILED") from None
             try:
                 state = self._code_change_state(ownership, configuration)
             except WorkspaceLifecycleError:
-                self._rollback_file_changes(rollback)
+                self._rollback_file_changes(rollback, created_directories)
                 raise
             return {**state, "applied_paths": sorted(seen)}
 
@@ -1133,6 +1132,48 @@ class GitWorkspaceLifecycle:
                 raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
 
     @staticmethod
+    def _assert_parent_boundary(workspace: Path, parent: Path) -> None:
+        cursor = parent
+        while cursor != workspace and not cursor.exists():
+            if cursor.is_symlink():
+                raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+            cursor = cursor.parent
+        if cursor != workspace and workspace not in cursor.parents:
+            raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+        if cursor.is_symlink():
+            raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+        try:
+            resolved = cursor.resolve(strict=True)
+        except OSError:
+            raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION") from None
+        if resolved != workspace and workspace not in resolved.parents:
+            raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+
+    @staticmethod
+    def _create_parent_directories(workspace: Path, parent: Path) -> list[Path]:
+        missing: list[Path] = []
+        cursor = parent
+        while cursor != workspace and not cursor.exists():
+            if cursor.is_symlink():
+                raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+            missing.append(cursor)
+            cursor = cursor.parent
+        if cursor != workspace and workspace not in cursor.parents:
+            raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
+        created: list[Path] = []
+        try:
+            for directory in reversed(missing):
+                os.mkdir(directory, mode=0o755)
+                if directory.is_symlink():
+                    raise OSError("created directory became a symlink")
+                created.append(directory)
+        except OSError:
+            for directory in reversed(created):
+                directory.rmdir()
+            raise WorkspaceLifecycleError("WORKSPACE_CHANGE_FAILED") from None
+        return created
+
+    @staticmethod
     def _read_code_file(path: Path) -> bytes:
         try:
             descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -1182,6 +1223,7 @@ class GitWorkspaceLifecycle:
     @staticmethod
     def _rollback_file_changes(
         rollback: list[tuple[Path, bytes | None, int | None]],
+        created_directories: list[Path],
     ) -> None:
         for candidate, previous, mode in reversed(rollback):
             try:
@@ -1189,6 +1231,11 @@ class GitWorkspaceLifecycle:
                     candidate.unlink(missing_ok=True)
                 else:
                     GitWorkspaceLifecycle._replace_code_file(candidate, previous, mode=mode)
+            except OSError:
+                raise WorkspaceLifecycleError("WORKSPACE_ROLLBACK_FAILED") from None
+        for directory in reversed(created_directories):
+            try:
+                directory.rmdir()
             except OSError:
                 raise WorkspaceLifecycleError("WORKSPACE_ROLLBACK_FAILED") from None
 

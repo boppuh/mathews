@@ -83,7 +83,7 @@ class _Configuration:
     configuration_id: UUID
     repository_key: str = "boppuh/mathews"
     digest: str = "sha256:" + "1" * 64
-    prohibited_paths: tuple[str, ...] = (".git", ".env")
+    prohibited_paths: tuple[str, ...] = (".git", ".env", "Sources/Generated")
 
     def to_dict(self) -> dict[str, object]:
         return {"repository_key": self.repository_key, "version": 1}
@@ -453,6 +453,23 @@ def test_host_result_outside_brief_is_not_returned_or_captured(
 
     assert result.status is HermesToolResultStatus.REJECTED
     assert result.code == "HOST_RESULT_OUTSIDE_BRIEF"
+    assert result.result == {"head_sha": "a" * 40}
+    assert result.diff_evidence_id is None
+
+
+def test_prohibited_host_result_is_not_returned_or_captured(
+    tool_harness: ToolHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _Gateway(result_path="Sources/Generated/App.swift")
+    result = _service(tool_harness, gateway, monkeypatch).execute(
+        tool_harness.grant,
+        run_id=tool_harness.run_id,
+        proposal=_proposal(),
+    )
+
+    assert result.status is HermesToolResultStatus.REJECTED
+    assert result.code == "HOST_RESULT_PROHIBITED"
     assert result.result == {"head_sha": "a" * 40}
     assert result.diff_evidence_id is None
 

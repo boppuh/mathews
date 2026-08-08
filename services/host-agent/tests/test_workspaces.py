@@ -271,6 +271,11 @@ def test_scoped_code_tools_read_search_change_and_diff_owned_workspace(
                 "expected_digest": None,
                 "content": "new\n",
             },
+            {
+                "path": "Sources/New/Feature.swift",
+                "expected_digest": None,
+                "content": "struct Feature {}\n",
+            },
         ),
     )
 
@@ -279,13 +284,19 @@ def test_scoped_code_tools_read_search_change_and_diff_owned_workspace(
     assert read["digest"] == _digest("base\n")
     assert searched["matches"] == [{"path": "README.md", "line": 1, "text": "base"}]
     assert changed["head_sha"] == base
-    assert changed["changed_paths"] == ["README.md", "feature.txt"]
+    assert changed["changed_paths"] == [
+        "README.md",
+        "Sources/New/Feature.swift",
+        "feature.txt",
+    ]
     assert "-base" in cast(str, changed["diff"])
     assert "+candidate" in cast(str, changed["diff"])
     assert "+new" in cast(str, changed["diff"])
+    assert "+struct Feature {}" in cast(str, changed["diff"])
     workspace = Path(cast(str, created["workspace_path"]))
     assert (workspace / "README.md").read_text() == "candidate\n"
     assert (workspace / "feature.txt").read_text() == "new\n"
+    assert (workspace / "Sources/New/Feature.swift").read_text() == "struct Feature {}\n"
 
 
 def test_scoped_code_change_is_digest_checked_atomic_and_prohibited_path_safe(
