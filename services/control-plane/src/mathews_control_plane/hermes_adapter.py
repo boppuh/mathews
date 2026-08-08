@@ -30,11 +30,11 @@ from mathews_control_plane.code_change_execution import (
     HermesToolProposalRequest,
     ScopedCodeExecutionService,
     ScopedToolAmbiguousError,
+    ScopedToolConflictError,
     ScopedToolExecutionResult,
 )
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
-    DependencyService,
     HermesRun,
     HermesRunStatus,
     ReconciliationStatus,
@@ -49,6 +49,7 @@ from mathews_control_plane.prompt_compiler import CompiledPrompt, PromptRole
 from mathews_control_plane.reliability import ReconciliationObservation
 
 _MAX_RESPONSE_BYTES = 1_000_000
+_HOST_RECONCILIATION_ATTEMPTS = 3
 
 
 class HermesRuntimeError(RuntimeError):
@@ -441,6 +442,7 @@ class HermesRunJobHandler:
                 ingested = self._runs.ingest(run_id, event)
                 if not ingested.accepted:
                     if ingested.ignored_reason == "STALE_LEASE":
+                        self._stop_and_cancel(run_id, external_run_id)
                         raise BackgroundJobLeaseLostError("Hermes tool event was fenced")
                     continue
                 if event.event_type is HermesEventType.TOOL_PROPOSAL:
@@ -486,37 +488,40 @@ class HermesRunJobHandler:
         event: HermesProviderEvent,
     ) -> None:
         if self._tool_execution is None:
+            self._stop_and_cancel(run_id, external_run_id)
             raise TerminalBackgroundJobError("HERMES_TOOL_GATEWAY_UNAVAILABLE")
         try:
             proposal = HermesToolProposalRequest.model_validate(event.payload)
         except ValueError:
+            self._stop_and_cancel(run_id, external_run_id)
             raise TerminalBackgroundJobError("HERMES_TOOL_PROPOSAL_INVALID") from None
-        try:
-            result = self._tool_execution.execute(
-                context.grant,
-                run_id=run_id,
-                proposal=proposal,
-            )
-        except ScopedToolAmbiguousError:
-            self._fail_host_dependency(context, run_id, external_run_id)
+        for attempt in range(1, _HOST_RECONCILIATION_ATTEMPTS + 1):
+            try:
+                result = self._tool_execution.execute(
+                    context.grant,
+                    run_id=run_id,
+                    proposal=proposal,
+                )
+                break
+            except ScopedToolAmbiguousError:
+                if attempt == _HOST_RECONCILIATION_ATTEMPTS:
+                    self._stop_and_cancel(run_id, external_run_id)
+                    raise TerminalBackgroundJobError(
+                        "HOST_OPERATION_RECONCILIATION_REQUIRED"
+                    ) from None
+                try:
+                    context.heartbeat(timedelta(seconds=30))
+                except BackgroundJobLeaseLostError:
+                    self._stop_and_cancel(run_id, external_run_id)
+                    raise
+                self._sleep(0.1)
+            except ScopedToolConflictError:
+                self._stop_and_cancel(run_id, external_run_id)
+                raise TerminalBackgroundJobError("HERMES_TOOL_EXECUTION_INVALID") from None
         try:
             self._runtime.submit_tool_result(external_run_id, result)
         except HermesRuntimeError as error:
             self._fail_dependency(context, run_id, error.code)
-
-    def _fail_host_dependency(
-        self,
-        context: LeasedJobContext,
-        run_id: UUID,
-        external_run_id: str,
-    ) -> NoReturn:
-        self._stop_and_cancel(run_id, external_run_id)
-        self._jobs.fail_dependency_attempt(
-            context.grant,
-            service=DependencyService.HOST,
-            error_code="HOST_OPERATION_AMBIGUOUS",
-        )
-        raise BackgroundJobLeaseLostError("host outage retry was scheduled")
 
     @staticmethod
     def _require_terminal_event(accepted: bool, ignored_reason: str | None) -> None:
@@ -627,4 +632,10 @@ def _provider_events(
         if event.event_type in {HermesEventType.COMPLETED, HermesEventType.FAILED}:
             raise HermesRuntimeError("HERMES_RESPONSE_INVALID")
         events.append(event)
-    return tuple(events)
+    ordered = tuple(sorted(events, key=lambda event: event.sequence))
+    if any(
+        left.sequence == right.sequence
+        for left, right in zip(ordered, ordered[1:], strict=False)
+    ):
+        raise HermesRuntimeError("HERMES_RESPONSE_INVALID")
+    return ordered

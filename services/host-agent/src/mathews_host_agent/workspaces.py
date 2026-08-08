@@ -15,7 +15,6 @@ from dataclasses import dataclass, replace
 from difflib import unified_diff
 from pathlib import Path, PurePosixPath
 from threading import RLock
-from typing import cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -33,7 +32,7 @@ _MAX_GIT_OUTPUT_BYTES = 64 * 1024
 _GIT_TIMEOUT_SECONDS = 30
 _MAX_CODE_FILE_BYTES = 256 * 1024
 _MAX_CODE_DIFF_BYTES = 256 * 1024
-_MAX_CODE_SEARCH_RESULTS = 200
+_MAX_CODE_SEARCH_BYTES = 8 * 1024 * 1024
 
 
 def _content_digest(content: bytes) -> str:
@@ -300,22 +299,44 @@ class GitWorkspaceLifecycle:
 
         with self._lock:
             ownership = self._active_ownership(authority, configuration)
-            listed = self.list_files(
-                authority,
+            prefix = self._scoped_relative_path(
+                path_prefix,
                 configuration,
-                path_prefix=path_prefix,
-                limit=_MAX_CODE_SEARCH_RESULTS,
+                allow_root=True,
             )
+            output = self._run_git(
+                Path(ownership.workspace_path),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                "." if prefix == "." else prefix,
+                failure_code="WORKSPACE_SEARCH_FAILED",
+            )
+            files = tuple(sorted(path for path in output.split("\0") if path))
             matches: list[dict[str, object]] = []
-            for raw_path in cast(list[object], listed["files"]):
-                assert isinstance(raw_path, str)
+            searched_bytes = 0
+            for raw_path in files:
+                if self._path_is_prohibited(raw_path, configuration):
+                    continue
+                self._assert_paths_allowed((raw_path,), configuration)
                 try:
                     _, candidate = self._existing_code_file(
                         ownership,
                         configuration,
                         raw_path,
                     )
-                    text = self._read_code_file(candidate).decode("utf-8")
+                    content = self._read_code_file(candidate)
+                    if searched_bytes + len(content) > _MAX_CODE_SEARCH_BYTES:
+                        return {
+                            "head_sha": self._repository_state(ownership)["head_sha"],
+                            "matches": matches,
+                            "truncated": True,
+                        }
+                    searched_bytes += len(content)
+                    text = content.decode("utf-8")
                 except (UnicodeDecodeError, WorkspaceLifecycleError):
                     continue
                 for line_number, line in enumerate(text.splitlines(), start=1):
@@ -336,7 +357,7 @@ class GitWorkspaceLifecycle:
             return {
                 "head_sha": self._repository_state(ownership)["head_sha"],
                 "matches": matches,
-                "truncated": bool(listed["truncated"]),
+                "truncated": False,
             }
 
     def diff_workspace(
@@ -397,6 +418,11 @@ class GitWorkspaceLifecycle:
 
             rollback: list[tuple[Path, bytes | None, int | None]] = []
             created_directories: list[Path] = []
+            new_paths = tuple(
+                relative
+                for relative, candidate, encoded, _mode in prepared
+                if encoded is not None and not candidate.exists()
+            )
             try:
                 for _relative, candidate, encoded, mode in prepared:
                     previous = candidate.read_bytes() if candidate.exists() else None
@@ -412,6 +438,7 @@ class GitWorkspaceLifecycle:
                 self._rollback_file_changes(rollback, created_directories)
                 raise WorkspaceLifecycleError("WORKSPACE_CHANGE_FAILED") from None
             try:
+                self._assert_new_files_not_ignored(workspace, new_paths)
                 state = self._code_change_state(ownership, configuration)
             except WorkspaceLifecycleError:
                 self._rollback_file_changes(rollback, created_directories)
@@ -1250,14 +1277,41 @@ class GitWorkspaceLifecycle:
         diff_parts: list[str] = []
         total_bytes = 0
         for relative in changed_paths:
-            before_result = self._run_git_result(
+            tree_result = self._run_git_bytes_result(
                 workspace,
-                "show",
-                f"HEAD:{relative}",
+                "ls-tree",
+                "--full-tree",
+                "-z",
+                "HEAD",
+                "--",
+                relative,
             )
-            if before_result.returncode not in {0, 128}:
+            if tree_result.returncode != 0:
                 raise WorkspaceLifecycleError("GIT_DIFF_UNAVAILABLE")
-            before = before_result.stdout if before_result.returncode == 0 else ""
+            if tree_result.stdout:
+                entries = tuple(entry for entry in tree_result.stdout.split(b"\0") if entry)
+                expected_path = relative.encode("utf-8")
+                if len(entries) != 1 or b"\t" not in entries[0]:
+                    raise WorkspaceLifecycleError("GIT_DIFF_UNAVAILABLE")
+                metadata, stored_path = entries[0].split(b"\t", 1)
+                fields = metadata.split(b" ")
+                if len(fields) != 3 or fields[1] != b"blob" or stored_path != expected_path:
+                    raise WorkspaceLifecycleError("GIT_DIFF_UNAVAILABLE")
+                before_result = self._run_git_bytes_result(
+                    workspace,
+                    "show",
+                    f"HEAD:{relative}",
+                    maximum_stdout_bytes=_MAX_CODE_FILE_BYTES,
+                )
+                if before_result.returncode != 0:
+                    raise WorkspaceLifecycleError("GIT_DIFF_UNAVAILABLE")
+                before_bytes = before_result.stdout
+            else:
+                before_bytes = b""
+            try:
+                before = before_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                raise WorkspaceLifecycleError("BINARY_CHANGE_PROHIBITED") from None
             candidate = workspace / relative
             if candidate.is_symlink():
                 raise WorkspaceLifecycleError("WORKSPACE_BOUNDARY_VIOLATION")
@@ -1290,6 +1344,25 @@ class GitWorkspaceLifecycle:
             "changed_paths": list(changed_paths),
             "diff": "".join(diff_parts),
         }
+
+    def _assert_new_files_not_ignored(
+        self,
+        workspace: Path,
+        paths: tuple[str, ...],
+    ) -> None:
+        for path in paths:
+            result = self._run_git_result(
+                workspace,
+                "check-ignore",
+                "--quiet",
+                "--no-index",
+                "--",
+                path,
+            )
+            if result.returncode == 0:
+                raise WorkspaceLifecycleError("IGNORED_PATH_PROHIBITED")
+            if result.returncode != 1:
+                raise WorkspaceLifecycleError("GIT_STATUS_UNAVAILABLE")
 
     @staticmethod
     def _assert_paths_allowed(
@@ -1747,4 +1820,43 @@ class GitWorkspaceLifecycle:
         ):
             raise WorkspaceLifecycleError("GIT_OUTPUT_TOO_LARGE")
         result.stdout = result.stdout.rstrip("\n")
+        return result
+
+    @staticmethod
+    def _run_git_bytes_result(
+        repository_root: Path,
+        *arguments: str,
+        maximum_stdout_bytes: int = _MAX_GIT_OUTPUT_BYTES,
+    ) -> subprocess.CompletedProcess[bytes]:
+        environment = {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }
+        try:
+            result = subprocess.run(
+                (
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-C",
+                    str(repository_root),
+                    *arguments,
+                ),
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=False,
+                timeout=_GIT_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise WorkspaceLifecycleError("GIT_UNAVAILABLE") from None
+        if (
+            len(result.stdout) > maximum_stdout_bytes
+            or len(result.stderr) > _MAX_GIT_OUTPUT_BYTES
+        ):
+            raise WorkspaceLifecycleError("GIT_OUTPUT_TOO_LARGE")
         return result

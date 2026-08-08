@@ -19,6 +19,7 @@ from mathews_configuration import (
     HostResponseMessage,
     HostResponseStatus,
     JsonValue,
+    TaskLeaseHostAuthority,
 )
 from mathews_configuration import (
     RepositoryConfiguration as ValidatedRepositoryConfiguration,
@@ -182,19 +183,8 @@ class ScopedCodeExecutionService:
                 result={},
                 replayed=authorization.replayed,
             )
-        assert authorization.configuration is not None
-        assert authorization.normalized_arguments is not None
-        try:
-            self._assert_dispatch_still_authorized(grant, authorization.proposal_id)
-        except ScopedToolConflictError:
-            return self._record_result(
-                authorization,
-                proposal=proposal,
-                response_status=HostResponseStatus.REJECTED,
-                code="AUTHORIZATION_STALE",
-                result={},
-                replayed=False,
-            )
+        if authorization.configuration is None or authorization.normalized_arguments is None:
+            raise ScopedToolConflictError("authorized tool proposal is incomplete")
         now = _as_utc(self._clock())
         configuration = authorization.configuration
         operation_arguments = cast(
@@ -216,7 +206,20 @@ class ScopedCodeExecutionService:
             ),
         )
         try:
-            response = self._host.execute(request)
+            response = self._dispatch_if_still_authorized(
+                grant,
+                authorization=authorization,
+                request=request,
+            )
+        except ScopedToolConflictError:
+            return self._record_result(
+                authorization,
+                proposal=proposal,
+                response_status=HostResponseStatus.REJECTED,
+                code="AUTHORIZATION_STALE",
+                result={},
+                replayed=False,
+            )
         except HostGatewayError as error:
             self._record_result(
                 authorization,
@@ -431,20 +434,62 @@ class ScopedCodeExecutionService:
                 False,
             )
 
-    def _assert_dispatch_still_authorized(
+    def _dispatch_if_still_authorized(
         self,
         grant: JobLeaseGrant,
-        proposal_id: UUID,
-    ) -> None:
+        *,
+        authorization: _Authorization,
+        request: HostRequestMessage,
+    ) -> HostResponseMessage:
         now = _as_utc(self._clock())
-        with self._factory() as session:
-            proposal = session.get(HermesToolProposal, proposal_id)
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            proposal = session.get(HermesToolProposal, authorization.proposal_id)
             if proposal is None:
                 raise ScopedToolConflictError("tool proposal is unavailable")
-            _proposal_context(session, grant, proposal.run_id, now)
-            task = session.get(Task, grant.task_id)
-            if task is None or task.state not in _ACTIVE_STATES:
+            _run, task, _tool_grant = _proposal_context(session, grant, proposal.run_id, now)
+            if task.state not in _ACTIVE_STATES:
                 raise ScopedToolConflictError("tool authorization is no longer current")
+            decision = session.get(HermesToolDecision, authorization.decision_id)
+            if (
+                decision is None
+                or decision.proposal_id != proposal.id
+                or decision.status is not HermesToolDecisionStatus.AUTHORIZED
+                or decision.repository_configuration_id is None
+            ):
+                raise ScopedToolConflictError("tool authorization is no longer current")
+            configuration_record = session.get(
+                RepositoryConfiguration,
+                decision.repository_configuration_id,
+            )
+            configuration = authorization.configuration
+            if configuration_record is None or configuration is None:
+                raise ScopedToolConflictError("authorized configuration is unavailable")
+            try:
+                validated = _validated_configuration(configuration_record)
+                require_preflight_ready(
+                    session,
+                    self._store,
+                    repository_key=task.repository,
+                    configuration_id=configuration_record.id,
+                    configuration_version=configuration_record.version,
+                    configuration_digest=repository_configuration_digest(configuration_record),
+                    resolved_base_sha=task.base_revision,
+                )
+            except (RepositoryPreflightNotReadyError, TypeError, ValueError):
+                raise ScopedToolConflictError(
+                    "authorized configuration is no longer current"
+                ) from None
+            authority = request.authority
+            if (
+                validated.configuration_id != configuration.configuration_id
+                or validated.digest != configuration.digest
+                or not isinstance(authority, TaskLeaseHostAuthority)
+                or authority.configuration_id != validated.configuration_id
+                or authority.configuration_digest != validated.digest
+            ):
+                raise ScopedToolConflictError("authorized configuration is no longer current")
+            return self._host.execute(request)
 
     def _terminal_result(
         self,
@@ -491,8 +536,16 @@ class ScopedCodeExecutionService:
         replayed: bool,
     ) -> ScopedToolExecutionResult:
         now = _as_utc(self._clock())
-        normalized_result = _bounded_result(result)
         result_code = _error_code(code)
+        try:
+            normalized_result = _bounded_result(result)
+        except ScopedToolConflictError:
+            revision = result.get("head_sha")
+            normalized_result = {
+                "head_sha": revision if isinstance(revision, str) else None,
+            }
+            result_code = "HOST_RESULT_UNBOUNDED"
+            response_status = HostResponseStatus.REJECTED
         status = {
             HostResponseStatus.OK: HermesToolResultStatus.SUCCEEDED,
             HostResponseStatus.REJECTED: HermesToolResultStatus.REJECTED,
@@ -651,7 +704,8 @@ class ScopedCodeExecutionService:
                 )
             )
             task = session.get(Task, stored_proposal.task_id)
-            assert task is not None
+            if task is None:
+                raise ScopedToolConflictError("tool proposal task is unavailable")
             _task_event(
                 session,
                 task=task,
@@ -962,8 +1016,10 @@ def _path_prohibited(path: str, prohibited: tuple[str, ...]) -> bool:
 def _path(value: object, *, allow_root: bool = False) -> str:
     if not isinstance(value, str) or len(value) > 4_096:
         raise ValueError("path is invalid")
-    if allow_root and value == ".":
-        return value
+    if value == ".":
+        if allow_root:
+            return value
+        raise ValueError("path is invalid")
     path = PurePosixPath(value)
     if (
         not value
@@ -1103,22 +1159,27 @@ def _task_event(
     principal_id: str,
     extra_evidence_ids: tuple[UUID, ...] = (),
 ) -> None:
+    locked_task = session.scalar(select(Task).where(Task.id == task.id).with_for_update())
+    if locked_task is None:
+        raise ScopedToolConflictError("tool proposal task is unavailable")
     sequence = (
         int(
-            session.scalar(select(func.max(TaskEvent.sequence)).where(TaskEvent.task_id == task.id))
+            session.scalar(
+                select(func.max(TaskEvent.sequence)).where(TaskEvent.task_id == locked_task.id)
+            )
             or 0
         )
         + 1
     )
     event = TaskEvent(
-        task_id=task.id,
+        task_id=locked_task.id,
         sequence=sequence,
         event_type=event_type,
         payload=payload,
         occurred_at=occurred_at,
-        owner_id=task.owner_id,
+        owner_id=locked_task.owner_id,
         actor_id=principal_id,
-        root_correlation_id=task.root_correlation_id,
+        root_correlation_id=locked_task.root_correlation_id,
         causation_id=causation_id,
         parent_correlation_id=parent_correlation_id,
     )
@@ -1127,7 +1188,7 @@ def _task_event(
     for position, reference in enumerate((evidence_id, *extra_evidence_ids), start=1):
         session.add(
             TaskEventEvidenceReference(
-                task_id=task.id,
+                task_id=locked_task.id,
                 task_event_id=event.id,
                 evidence_id=reference,
                 position=position,

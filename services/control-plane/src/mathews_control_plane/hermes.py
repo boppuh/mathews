@@ -55,6 +55,7 @@ from mathews_control_plane.evidence import (
 from mathews_control_plane.prompt_compiler import CompiledPrompt
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
+_MAX_EVENT_PAYLOAD_BYTES = 512 * 1024
 
 
 class HermesError(RuntimeError):
@@ -766,7 +767,7 @@ def _bounded_payload(value: Mapping[str, object]) -> dict[str, object]:
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
     except (TypeError, ValueError):
         raise HermesConflictError("Hermes event payload is not JSON safe") from None
-    if len(encoded) > 64_000:
+    if len(encoded.encode("utf-8")) > _MAX_EVENT_PAYLOAD_BYTES:
         raise HermesConflictError("Hermes event payload exceeds its size limit")
     return cast(dict[str, object], json.loads(encoded))
 

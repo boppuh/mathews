@@ -61,18 +61,18 @@ def build_worker(
     engine = create_database_engine(runtime_settings.database_url)
     factory = create_session_factory(engine)
     store = ArtifactStore(runtime_settings.artifact_root)
-    runtime = hermes_runtime or configured_hermes_runtime(runtime_settings)
-    gateway = host_gateway
-    if gateway is None and runtime_settings.automation_ready:
-        gateway = configured_local_host_gateway(
-            runtime_settings.require_automation_configuration(),
-            secrets=KeychainSecretProvider(),
+    if handlers is None:
+        runtime = hermes_runtime or configured_hermes_runtime(runtime_settings)
+        gateway = host_gateway
+        if gateway is None and runtime_settings.automation_ready:
+            gateway = configured_local_host_gateway(
+                runtime_settings.require_automation_configuration(),
+                secrets=KeychainSecretProvider(),
+            )
+        tool_execution = (
+            None if gateway is None else ScopedCodeExecutionService(factory, store, gateway)
         )
-    tool_execution = (
-        None if gateway is None else ScopedCodeExecutionService(factory, store, gateway)
-    )
-    handler_registry = (
-        {
+        handler_registry: dict[str, BackgroundJobHandler] = {
             "hermes-run": HermesRunJobHandler(
                 factory,
                 store,
@@ -80,9 +80,8 @@ def build_worker(
                 tool_execution,
             )
         }
-        if handlers is None
-        else dict(handlers)
-    )
+    else:
+        handler_registry = dict(handlers)
     if not handler_registry:
         logger.warning("worker has no registered handlers; durable polling will remain idle")
     service = BackgroundJobService(

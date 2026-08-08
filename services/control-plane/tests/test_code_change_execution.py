@@ -62,6 +62,7 @@ from mathews_control_plane.prompt_compiler import (
     PromptRole,
     StructuredPromptTemplate,
 )
+from mathews_control_plane.repository_configuration import RepositoryPreflightNotReadyError
 from sqlalchemy import Engine, select
 
 _NOW = datetime(2026, 8, 7, 18, 0, tzinfo=UTC)
@@ -135,6 +136,30 @@ class _Gateway:
 class _UnavailableGateway:
     def execute(self, _request: HostRequestMessage) -> HostResponseMessage:
         raise HostGatewayError("HOST_UNAVAILABLE")
+
+
+class _OversizedResultGateway(_Gateway):
+    def execute(self, request: HostRequestMessage) -> HostResponseMessage:
+        self.requests.append(request)
+        return HostResponseMessage(
+            request_id=request.request_id,
+            operation_name=request.operation.name,
+            idempotency_key=request.operation.idempotency_key,
+            host_id="host-1",
+            host_version="0.1.0",
+            status=HostResponseStatus.OK,
+            code="OK",
+            replayed=False,
+            completed_at_ms=1_800_000_000_000,
+            execution_fencing_token=cast(
+                TaskLeaseHostAuthority,
+                request.authority,
+            ).fencing_token,
+            result={
+                "head_sha": "a" * 40,
+                **{f"content_{index}": "x" * 60_000 for index in range(16)},
+            },
+        )
 
 
 @pytest.fixture
@@ -409,6 +434,53 @@ def test_out_of_brief_path_is_denied_without_host_dispatch(
         assert decision is not None and decision.status is HermesToolDecisionStatus.DENIED
 
 
+def test_repository_root_is_not_accepted_as_a_patch_file(
+    tool_harness: ToolHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _Gateway()
+    result = _service(tool_harness, gateway, monkeypatch).execute(
+        tool_harness.grant,
+        run_id=tool_harness.run_id,
+        proposal=_proposal("."),
+    )
+
+    assert result.status is HermesToolResultStatus.REJECTED
+    assert result.code == "INVALID_TOOL_ARGUMENTS"
+    assert gateway.requests == []
+
+
+def test_preflight_binding_is_revalidated_while_the_host_effect_is_dispatched(
+    tool_harness: ToolHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mathews_control_plane.code_change_execution as module
+
+    gateway = _Gateway()
+    service = _service(tool_harness, gateway, monkeypatch)
+    calls = 0
+
+    def require_current(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RepositoryPreflightNotReadyError("configuration was superseded")
+        return object()
+
+    monkeypatch.setattr(module, "require_preflight_ready", require_current)
+
+    result = service.execute(
+        tool_harness.grant,
+        run_id=tool_harness.run_id,
+        proposal=_proposal(),
+    )
+
+    assert result.status is HermesToolResultStatus.REJECTED
+    assert result.code == "AUTHORIZATION_STALE"
+    assert calls == 2
+    assert gateway.requests == []
+
+
 def test_ambiguous_host_attempt_is_evidenced_and_idempotently_reconciled(
     tool_harness: ToolHarness,
     monkeypatch: pytest.MonkeyPatch,
@@ -472,6 +544,25 @@ def test_prohibited_host_result_is_not_returned_or_captured(
     assert result.code == "HOST_RESULT_PROHIBITED"
     assert result.result == {"head_sha": "a" * 40}
     assert result.diff_evidence_id is None
+
+
+def test_oversized_host_result_is_recorded_as_a_bounded_rejection(
+    tool_harness: ToolHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _OversizedResultGateway()
+    result = _service(tool_harness, gateway, monkeypatch).execute(
+        tool_harness.grant,
+        run_id=tool_harness.run_id,
+        proposal=_proposal(),
+    )
+
+    assert result.status is HermesToolResultStatus.REJECTED
+    assert result.code == "HOST_RESULT_UNBOUNDED"
+    assert result.result == {"head_sha": "a" * 40}
+    with tool_harness.factory() as session:
+        stored = session.scalar(select(HermesToolResult))
+        assert stored is not None and stored.status is HermesToolResultStatus.REJECTED
 
 
 def test_host_outage_is_evidenced_as_ambiguous_before_retry(

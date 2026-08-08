@@ -338,6 +338,123 @@ def test_scoped_code_change_is_digest_checked_atomic_and_prohibited_path_safe(
     assert not (workspace / ".env").exists()
 
 
+def test_scoped_search_considers_files_after_the_first_two_hundred(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    source = repository / "Sources"
+    source.mkdir()
+    for index in range(205):
+        marker = "needle\n" if index == 204 else "ordinary\n"
+        (source / f"File{index:03}.swift").write_text(marker)
+    _git(repository, "add", "Sources")
+    _git(
+        repository,
+        "-c",
+        "user.name=Mathews Test",
+        "-c",
+        "user.email=mathews@example.invalid",
+        "commit",
+        "-m",
+        "add search fixtures",
+    )
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    lifecycle.create(authority, configuration)
+
+    result = lifecycle.search_files(
+        authority,
+        configuration,
+        query="needle",
+        path_prefix="Sources",
+        limit=10,
+    )
+
+    assert result["matches"] == [
+        {"path": "Sources/File204.swift", "line": 1, "text": "needle"}
+    ]
+    assert result["truncated"] is False
+
+
+def test_scoped_diff_preserves_the_head_preimage_trailing_newline(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    (repository / "README.md").write_text("first\nunchanged\n")
+    _git(repository, "add", "README.md")
+    _git(
+        repository,
+        "-c",
+        "user.name=Mathews Test",
+        "-c",
+        "user.email=mathews@example.invalid",
+        "commit",
+        "-m",
+        "add multiline fixture",
+    )
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    lifecycle.create(authority, configuration)
+
+    result = lifecycle.apply_file_changes(
+        authority,
+        configuration,
+        changes=(
+            {
+                "path": "README.md",
+                "expected_digest": _digest("first\nunchanged\n"),
+                "content": "changed\nunchanged\n",
+            },
+        ),
+    )
+    diff = cast(str, result["diff"])
+
+    assert "-first\n" in diff
+    assert "+changed\n" in diff
+    assert "-unchanged\n" not in diff
+    assert "+unchanged\n" not in diff
+
+
+def test_scoped_patch_rolls_back_a_new_ignored_file(
+    tmp_path: Path,
+) -> None:
+    repository, _base = _repository(tmp_path)
+    (repository / ".gitignore").write_text("ignored/\n")
+    _git(repository, "add", ".gitignore")
+    _git(
+        repository,
+        "-c",
+        "user.name=Mathews Test",
+        "-c",
+        "user.email=mathews@example.invalid",
+        "commit",
+        "-m",
+        "ignore generated files",
+    )
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+
+    with pytest.raises(WorkspaceLifecycleError, match="IGNORED_PATH_PROHIBITED"):
+        lifecycle.apply_file_changes(
+            authority,
+            configuration,
+            changes=(
+                {
+                    "path": "ignored/New.swift",
+                    "expected_digest": None,
+                    "content": "struct New {}\n",
+                },
+            ),
+        )
+
+    assert not (workspace / "ignored").exists()
+
+
 def test_inspect_is_read_only_when_no_workspace_registry_exists(
     tmp_path: Path,
 ) -> None:
