@@ -458,9 +458,15 @@ class ScopedCodeExecutionService:
                 or decision.repository_configuration_id is None
             ):
                 raise ScopedToolConflictError("tool authorization is no longer current")
+            configuration_id = decision.repository_configuration_id
+            repository_key = task.repository
+            base_revision = task.base_revision
+
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
             configuration_record = session.get(
                 RepositoryConfiguration,
-                decision.repository_configuration_id,
+                configuration_id,
             )
             configuration = authorization.configuration
             if configuration_record is None or configuration is None:
@@ -470,11 +476,11 @@ class ScopedCodeExecutionService:
                 require_preflight_ready(
                     session,
                     self._store,
-                    repository_key=task.repository,
+                    repository_key=repository_key,
                     configuration_id=configuration_record.id,
                     configuration_version=configuration_record.version,
                     configuration_digest=repository_configuration_digest(configuration_record),
-                    resolved_base_sha=task.base_revision,
+                    resolved_base_sha=base_revision,
                 )
             except (RepositoryPreflightNotReadyError, TypeError, ValueError):
                 raise ScopedToolConflictError(
