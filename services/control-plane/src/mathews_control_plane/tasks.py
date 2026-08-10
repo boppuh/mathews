@@ -982,6 +982,7 @@ def _acceptance_criteria_response(
     if brief is None:
         return []
     result: list[TaskAcceptanceCriterionResponse] = []
+    seen_criterion_ids: set[str] = set()
     allowed_verifications = {
         "AUTOMATED_TEST",
         "SIMULATOR_ASSERTION",
@@ -1005,6 +1006,9 @@ def _acceptance_criteria_response(
             or verification not in allowed_verifications
         ):
             continue
+        if criterion_id in seen_criterion_ids:
+            continue
+        seen_criterion_ids.add(criterion_id)
         result.append(
             TaskAcceptanceCriterionResponse(
                 id=criterion_id,

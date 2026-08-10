@@ -10,6 +10,8 @@ import { cookieValue, normalizeControlPlaneUrl } from "./auth";
 import { parseTaskCockpit, parseTaskList, parseTaskSummary } from "./tasks";
 
 const CSRF_COOKIE_NAME = "__Host-mathews-csrf";
+const MAX_EVIDENCE_CONTENT_BYTES = 1024 * 1024;
+const MAX_EVIDENCE_PREVIEW_CHARACTERS = 4 * 1024 * 1024;
 const controlPlaneUrl = normalizeControlPlaneUrl(process.env.NEXT_PUBLIC_CONTROL_PLANE_URL);
 
 export function taskEventStreamUrl(taskId: string): string {
@@ -131,7 +133,14 @@ export const evidenceClient = {
     if (contentType !== "application/json" && contentType !== "text/plain") {
       throw new TaskRequestError("This evidence format cannot be previewed safely.", 415);
     }
+    const contentLength = Number(response.headers.get("Content-Length"));
+    if (Number.isFinite(contentLength) && contentLength > MAX_EVIDENCE_CONTENT_BYTES) {
+      throw new TaskRequestError("This evidence content is too large to preview.", 413);
+    }
     const raw = await response.text();
+    if (new TextEncoder().encode(raw).byteLength > MAX_EVIDENCE_CONTENT_BYTES) {
+      throw new TaskRequestError("This evidence content is too large to preview.", 413);
+    }
     let text = raw;
     if (contentType === "application/json") {
       try {
@@ -139,6 +148,9 @@ export const evidenceClient = {
       } catch {
         throw new TaskRequestError("This evidence content is malformed.", 502);
       }
+    }
+    if (text.length > MAX_EVIDENCE_PREVIEW_CHARACTERS) {
+      throw new TaskRequestError("This evidence content is too large to preview.", 413);
     }
     return { text, mediaType: contentType };
   },

@@ -113,6 +113,20 @@ describe("task cockpit parsing", () => {
     expect(parseTaskEvent(cockpit.events[0])).toEqual(cockpit.events[0]);
   });
 
+  it("accepts a legacy deletion without a structured reason", () => {
+    const deletedEvidence = {
+      ...cockpit.evidence[0],
+      status: "DELETED",
+      content_access: "DELETED",
+      deleted_at: "2026-07-30T12:02:00Z",
+      download_path: null,
+    };
+
+    expect(parseTaskCockpit({ ...cockpit, evidence: [deletedEvidence] }).evidence).toEqual([
+      deletedEvidence,
+    ]);
+  });
+
   it.each([
     { ...cockpit, state_context: { ...cockpit.state_context, kind: "MERGED" } },
     { ...cockpit, events: [{ ...cockpit.events[0], sequence: 0 }] },

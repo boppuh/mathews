@@ -78,7 +78,13 @@ function previewFailure(error: unknown): string {
   return "This evidence content is unavailable.";
 }
 
-function EvidenceCard({ record }: { record: TaskEvidenceSummary }) {
+function EvidenceCard({
+  record,
+  onRevealEvidence,
+}: {
+  record: TaskEvidenceSummary;
+  onRevealEvidence: (evidenceId: string) => void;
+}) {
   const [preview, setPreview] = useState<PreviewState>({ status: "idle" });
   const [contentQuery, setContentQuery] = useState("");
   const controller = useRef<AbortController | null>(null);
@@ -122,7 +128,10 @@ function EvidenceCard({ record }: { record: TaskEvidenceSummary }) {
     );
   };
 
-  const count = preview.status === "ready" ? matchCount(preview.content.text, contentQuery) : 0;
+  const count = useMemo(
+    () => (preview.status === "ready" ? matchCount(preview.content.text, contentQuery) : 0),
+    [contentQuery, preview],
+  );
 
   return (
     <article
@@ -151,7 +160,15 @@ function EvidenceCard({ record }: { record: TaskEvidenceSummary }) {
       {record.corrected_by_id ? (
         <p className="evidence-lineage">
           Superseded by{" "}
-          <a href={`#evidence-${record.corrected_by_id}`}>{record.corrected_by_id.slice(0, 8)}</a>
+          <a
+            href={`#evidence-${record.corrected_by_id}`}
+            onClick={(event) => {
+              event.preventDefault();
+              onRevealEvidence(record.corrected_by_id ?? "");
+            }}
+          >
+            {record.corrected_by_id.slice(0, 8)}
+          </a>
         </p>
       ) : null}
 
@@ -237,6 +254,18 @@ export function EvidenceWorkbench({
             .includes(normalizedQuery)),
     );
   }, [category, evidence, query]);
+  const revealEvidence = (evidenceId: string) => {
+    if (!evidenceId) {
+      return;
+    }
+    setCategory("ALL");
+    setQuery("");
+    window.requestAnimationFrame(() => {
+      const anchor = `evidence-${evidenceId}`;
+      window.history.replaceState(null, "", `#${anchor}`);
+      document.getElementById(anchor)?.scrollIntoView({ block: "center" });
+    });
+  };
 
   return (
     <section
@@ -321,7 +350,7 @@ export function EvidenceWorkbench({
       ) : (
         <div className="evidence-grid">
           {visibleEvidence.map((record) => (
-            <EvidenceCard key={record.id} record={record} />
+            <EvidenceCard key={record.id} record={record} onRevealEvidence={revealEvidence} />
           ))}
         </div>
       )}

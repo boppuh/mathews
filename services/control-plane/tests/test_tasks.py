@@ -454,7 +454,12 @@ def test_cockpit_projects_criteria_lineage_access_fences_and_tombstones(
                     "criterion_id": "criterion-1",
                     "requirement": "Redacted logs are searchable on demand.",
                     "verification": "HUMAN_INSPECTION",
-                }
+                },
+                {
+                    "criterion_id": "criterion-1",
+                    "requirement": "A stale duplicate must not break the cockpit.",
+                    "verification": "STATIC_CHECK",
+                },
             ],
             risks=[],
             affected_flow={"id": "task-cockpit"},

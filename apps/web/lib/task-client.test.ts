@@ -207,6 +207,25 @@ describe("evidenceClient", () => {
       message: "This evidence content is unavailable.",
     });
   });
+
+  it("rejects an oversized preview before reading its body", async () => {
+    const textSpy = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          "Content-Type": "text/plain",
+          "Content-Length": String(1024 * 1024 + 1),
+        }),
+        text: textSpy,
+      }),
+    );
+
+    await expect(evidenceClient.content(evidence)).rejects.toMatchObject({ status: 413 });
+    expect(textSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe("LatestTaskListLoader", () => {

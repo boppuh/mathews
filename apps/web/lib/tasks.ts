@@ -217,10 +217,7 @@ function parseEvidence(value: unknown): TaskEvidenceSummary {
   const expectedDownloadPath = `/api/evidence/${value.id}/download`;
   const deleted = value.status === "DELETED";
   if (
-    (deleted &&
-      (value.content_access !== "DELETED" ||
-        value.deletion_reason === null ||
-        value.download_path !== null)) ||
+    (deleted && (value.content_access !== "DELETED" || value.download_path !== null)) ||
     (!deleted && (value.deletion_reason !== null || value.deleted_at !== null)) ||
     (value.status === "CORRECTION" && correctionOfId === null) ||
     (value.status === "SUPERSEDED" && correctedById === null) ||
