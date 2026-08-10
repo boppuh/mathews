@@ -1451,6 +1451,10 @@ section {
   opacity: 0.55;
 }
 
+.evidence-reauthentication input:disabled {
+  opacity: 0.55;
+}
+
 .evidence-reauthentication .task-error {
   grid-column: 1 / -1;
   margin: 0;

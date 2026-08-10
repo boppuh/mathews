@@ -241,10 +241,15 @@ function EvidenceCard({
               type="password"
               autoComplete="current-password"
               value={password}
+              disabled={
+                reauthenticationState === "submitting" || reauthenticationState === "refresh_failed"
+              }
               onChange={(event) => {
                 setPassword(event.target.value);
-                setReauthenticationState("idle");
-                setReauthenticationError("");
+                if (reauthenticationState !== "refresh_failed") {
+                  setReauthenticationState("idle");
+                  setReauthenticationError("");
+                }
               }}
             />
           </label>
