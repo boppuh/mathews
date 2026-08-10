@@ -1,0 +1,322 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
+
+import {
+  type ApprovalDecision,
+  type ApprovalInboxItem,
+  type ApprovalInboxResponse,
+  ApprovalRequestError,
+  approvalClient,
+} from "../../lib/approval-client";
+import { stageLabel } from "../../lib/stages";
+
+type InboxState =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | { status: "ready"; inbox: ApprovalInboxResponse };
+
+const decisionLabels: Record<ApprovalDecision, string> = {
+  APPROVE: "Approve",
+  REQUEST_REVISION: "Request revision",
+  RETRY: "Retry",
+  DENY: "Deny",
+  REJECT: "Reject",
+  ABANDON: "Abandon",
+  CANCEL: "Cancel task",
+};
+
+function timestamp(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof ApprovalRequestError) return error.message;
+  if (error instanceof Error && error.message.startsWith("The control plane returned")) {
+    return error.message;
+  }
+  return "Unable to load the approval inbox.";
+}
+
+function EvidenceLinks({
+  approval,
+  evidenceIds = approval.supporting_evidence_ids,
+}: {
+  approval: ApprovalInboxItem;
+  evidenceIds?: string[];
+}) {
+  return (
+    <div className="inbox-evidence">
+      <span>Evidence</span>
+      {evidenceIds.map((id) => (
+        <Link href={`${approval.task.cockpit_path}#evidence`} key={id}>
+          {id.slice(0, 8)}
+        </Link>
+      ))}
+    </div>
+  );
+}
+
+export function DecisionInbox() {
+  const [state, setState] = useState<InboxState>({ status: "loading" });
+  const [pendingRequest, setPendingRequest] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const load = useCallback(async (signal?: AbortSignal, background = false) => {
+    if (!background) setState({ status: "loading" });
+    try {
+      const inbox = await approvalClient.inbox(signal);
+      setState({ status: "ready", inbox });
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") return;
+      if (!background) setState({ status: "failed", message: errorMessage(error) });
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void load(controller.signal);
+    const interval = window.setInterval(() => void load(controller.signal, true), 30_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [load]);
+
+  async function decide(requestId: string, decision: ApprovalDecision) {
+    setPendingRequest(requestId);
+    setActionError(null);
+    try {
+      await approvalClient.decide(requestId, decision);
+      await load(undefined, true);
+    } catch (error) {
+      setActionError(errorMessage(error));
+      if (error instanceof ApprovalRequestError && [404, 409].includes(error.status)) {
+        await load(undefined, true);
+      }
+    } finally {
+      setPendingRequest(null);
+    }
+  }
+
+  if (state.status === "loading") {
+    return (
+      <main className="decision-inbox inbox-centered" aria-busy="true">
+        <div className="task-list-status" role="status">
+          <span className="status-dot" aria-hidden="true" />
+          Loading durable decisions…
+        </div>
+      </main>
+    );
+  }
+
+  if (state.status === "failed") {
+    return (
+      <main className="decision-inbox inbox-centered">
+        <Link href="/" className="back-link">
+          ← Work
+        </Link>
+        <section className="cockpit-load-error">
+          <p className="eyebrow">Decision inbox</p>
+          <h1>Inbox unavailable</h1>
+          <p className="task-error" role="alert">
+            {state.message}
+          </p>
+          <button type="button" onClick={() => void load()}>
+            Try again
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  const approvals = state.inbox.approvals.filter(
+    (approval) => approval.request_type !== "REVIEW_RULE",
+  );
+  const approvalById = new Map(state.inbox.approvals.map((approval) => [approval.id, approval]));
+  const total = approvals.length + state.inbox.rule_candidates.length;
+
+  return (
+    <main className="decision-inbox">
+      <div className="inbox-topline">
+        <Link href="/" className="back-link">
+          ← Work
+        </Link>
+        <span>
+          {total} pending {total === 1 ? "decision" : "decisions"}
+        </span>
+      </div>
+      <header className="inbox-header">
+        <div>
+          <p className="eyebrow">Human control plane</p>
+          <h1>Decision inbox</h1>
+          <p className="lede">
+            Review the exact task state, bounded operation, and evidence before work resumes.
+          </p>
+        </div>
+        <button type="button" onClick={() => void load()} disabled={pendingRequest !== null}>
+          Refresh
+        </button>
+      </header>
+
+      {actionError ? (
+        <p className="inbox-action-error" role="alert">
+          {actionError}
+        </p>
+      ) : null}
+
+      <section className="inbox-section" aria-labelledby="approval-inbox-heading">
+        <div className="inbox-section-heading">
+          <div>
+            <p className="eyebrow">Approval inbox</p>
+            <h2 id="approval-inbox-heading">Blocked work</h2>
+          </div>
+          <span>{approvals.length}</span>
+        </div>
+        {approvals.length === 0 ? (
+          <div className="inbox-empty">No task actions are waiting for approval.</div>
+        ) : (
+          <div className="inbox-cards">
+            {approvals.map((approval) => (
+              <article className="inbox-card" key={approval.id}>
+                <div className="inbox-card-topline">
+                  <span className="inbox-kind">{approval.type_label}</span>
+                  <time dateTime={approval.created_at}>{timestamp(approval.created_at)}</time>
+                </div>
+                <h3>{approval.task.summary}</h3>
+                <p className="inbox-repository">{approval.task.repository}</p>
+                <dl className="inbox-facts">
+                  <div>
+                    <dt>Blocked at</dt>
+                    <dd>{stageLabel(approval.requesting_state)}</dd>
+                  </div>
+                  <div>
+                    <dt>Resumes at</dt>
+                    <dd>{approval.resume_state ? stageLabel(approval.resume_state) : "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Reason</dt>
+                    <dd>
+                      <code>{approval.reason_code}</code>
+                    </dd>
+                  </div>
+                  {approval.expires_at ? (
+                    <div>
+                      <dt>Expires</dt>
+                      <dd>{timestamp(approval.expires_at)}</dd>
+                    </div>
+                  ) : null}
+                </dl>
+                {approval.operation_name ? (
+                  <div className="bounded-operation">
+                    <strong>Exact bounded operation</strong>
+                    <code>{approval.operation_name}</code>
+                    <small>Input {approval.operation_fingerprint?.slice(0, 12)}</small>
+                  </div>
+                ) : null}
+                <EvidenceLinks approval={approval} />
+                <div className="inbox-card-footer">
+                  <Link href={approval.task.cockpit_path}>Open task</Link>
+                  <div className="decision-actions">
+                    {approval.options.map((option) => (
+                      <button
+                        className={option === "APPROVE" || option === "RETRY" ? "primary" : ""}
+                        disabled={pendingRequest !== null}
+                        key={option}
+                        onClick={() => void decide(approval.id, option)}
+                        type="button"
+                      >
+                        {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="inbox-section rule-inbox-section" aria-labelledby="rule-inbox-heading">
+        <div className="inbox-section-heading">
+          <div>
+            <p className="eyebrow">Rule inbox</p>
+            <h2 id="rule-inbox-heading">Evaluated candidates</h2>
+          </div>
+          <span>{state.inbox.rule_candidates.length}</span>
+        </div>
+        <p className="rule-safety-note">
+          Approval promotes only this evaluated rule into a new policy version. Prompt templates
+          remain unchanged.
+        </p>
+        {state.inbox.rule_candidates.length === 0 ? (
+          <div className="inbox-empty">No evaluated rules are waiting for a human decision.</div>
+        ) : (
+          <div className="inbox-cards">
+            {state.inbox.rule_candidates.map((rule) => {
+              const approval = approvalById.get(rule.approval_request_id);
+              if (!approval) return null;
+              return (
+                <article className="inbox-card rule-card" key={rule.candidate_id}>
+                  <div className="inbox-card-topline">
+                    <span className="inbox-kind">Rule · {rule.lineage_key}</span>
+                    <span className="risk-chip">{rule.risk_class} risk</span>
+                  </div>
+                  <h3>{rule.proposed_rule}</h3>
+                  <p className="inbox-repository">
+                    {rule.task.repository} · {rule.task.summary}
+                  </p>
+                  <dl className="inbox-facts">
+                    <div>
+                      <dt>Recurrence</dt>
+                      <dd>{rule.recurrence_assessment}</dd>
+                    </div>
+                    <div>
+                      <dt>Severity</dt>
+                      <dd>{rule.severity_assessment}</dd>
+                    </div>
+                    <div>
+                      <dt>Permitted action</dt>
+                      <dd>
+                        <code>{rule.permitted_action}</code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>False-positive risks</dt>
+                      <dd>
+                        {rule.false_positive_risks.length
+                          ? rule.false_positive_risks.join(" · ")
+                          : "None recorded"}
+                      </dd>
+                    </div>
+                  </dl>
+                  <EvidenceLinks approval={approval} evidenceIds={rule.cited_evidence_ids} />
+                  <div className="inbox-card-footer">
+                    <Link href={rule.task.cockpit_path}>Open task</Link>
+                    <div className="decision-actions">
+                      {approval.options.map((option) => (
+                        <button
+                          className={option === "APPROVE" ? "primary" : ""}
+                          disabled={pendingRequest !== null}
+                          key={option}
+                          onClick={() => void decide(approval.id, option)}
+                          type="button"
+                        >
+                          {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+    </main>
+  );
+}

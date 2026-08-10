@@ -11,7 +11,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 from mathews_control_plane import __version__
-from mathews_control_plane.approvals import ApprovalService
+from mathews_control_plane.approvals import ApprovalService, create_approval_router
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     CSRF_HEADER_NAME,
@@ -79,12 +79,8 @@ def create_app(
     if authentication_service is None:
         authentication_service = AuthenticationService(
             session_factory,
-            idle_ttl=timedelta(
-                seconds=current_settings.auth_session_idle_ttl_seconds
-            ),
-            absolute_ttl=timedelta(
-                seconds=current_settings.auth_session_absolute_ttl_seconds
-            ),
+            idle_ttl=timedelta(seconds=current_settings.auth_session_idle_ttl_seconds),
+            absolute_ttl=timedelta(seconds=current_settings.auth_session_absolute_ttl_seconds),
             reauthentication_ttl=timedelta(
                 seconds=current_settings.auth_reauthentication_ttl_seconds
             ),
@@ -163,6 +159,7 @@ def create_app(
     application.include_router(create_authentication_router(authentication_service))
     application.include_router(create_evidence_router(evidence_service))
     application.include_router(create_task_router(task_service))
+    application.include_router(create_approval_router(approval_service))
 
     @application.exception_handler(RequestValidationError)
     async def sanitized_validation_error(

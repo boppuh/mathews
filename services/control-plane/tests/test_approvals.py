@@ -20,7 +20,12 @@ from mathews_control_plane.approvals import (
     InvalidApprovalError,
 )
 from mathews_control_plane.artifacts import ArtifactStore
-from mathews_control_plane.authentication import AuthenticationService
+from mathews_control_plane.authentication import (
+    CSRF_COOKIE_NAME,
+    CSRF_HEADER_NAME,
+    AuthenticationService,
+    generate_bootstrap_token,
+)
 from mathews_control_plane.database import (
     Base,
     SessionFactory,
@@ -38,6 +43,9 @@ from mathews_control_plane.domain_models import (
     BriefDecisionDisposition,
     EvidenceRecord,
     PolicyVersion,
+    PolicyVersionPromptTemplate,
+    PolicyVersionReviewRule,
+    ReviewRule,
     RuleCandidate,
     RuleCandidateStatus,
     Task,
@@ -51,6 +59,8 @@ from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
 _NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+_ORIGIN = "http://localhost:3000"
+_PASSWORD = "correct horse battery staple"
 
 
 @dataclass(slots=True)
@@ -62,9 +72,7 @@ class ApprovalHarness:
 
 @pytest.fixture
 def approval_harness(tmp_path: Path) -> Iterator[ApprovalHarness]:
-    engine = create_database_engine(
-        f"sqlite:///{tmp_path / 'approvals.sqlite3'}"
-    )
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'approvals.sqlite3'}")
     Base.metadata.create_all(engine)
     yield ApprovalHarness(
         engine=engine,
@@ -94,12 +102,15 @@ def _create_task(
             actor_id="local-user",
         )
         task.state = state
-        if session.scalar(
-            select(PolicyVersion.id).where(
-                PolicyVersion.lineage_key == "mvp",
-                PolicyVersion.version == 1,
+        if (
+            session.scalar(
+                select(PolicyVersion.id).where(
+                    PolicyVersion.lineage_key == "mvp",
+                    PolicyVersion.version == 1,
+                )
             )
-        ) is None:
+            is None
+        ):
             session.add(
                 PolicyVersion(
                     lineage_key="mvp",
@@ -114,9 +125,7 @@ def _create_task(
             )
         session.flush()
         evidence_id = session.scalar(
-            select(EvidenceRecord.id).where(
-                EvidenceRecord.task_id == task.id
-            )
+            select(EvidenceRecord.id).where(EvidenceRecord.task_id == task.id)
         )
         assert evidence_id is not None
         subject_id: UUID | None = None
@@ -144,9 +153,7 @@ def _create_task(
             disposition = BriefApprovalDecision(
                 task_id=task.id,
                 brief_id=brief.id,
-                disposition=(
-                    BriefDecisionDisposition.HUMAN_APPROVAL_REQUIRED
-                ),
+                disposition=(BriefDecisionDisposition.HUMAN_APPROVAL_REQUIRED),
                 evaluator_id="brief-policy",
                 reason="Approval required",
                 ambiguity_flags=["scope"],
@@ -166,7 +173,17 @@ def _create_task(
                 recurrence_assessment="repeated",
                 severity_assessment="low",
                 false_positive_risks=[],
-                evaluation_result={"passed": True},
+                evaluation_result={
+                    "passed": True,
+                    "review_rule": {
+                        "lineage_key": "format-repair",
+                        "scope": {"repository": "boppuh/mathews"},
+                        "matcher": {"check": "formatter"},
+                        "permitted_action": "repair.format",
+                        "risk_class": "low",
+                        "evidence_requirements": ["formatter-output"],
+                    },
+                },
                 status=RuleCandidateStatus.EVALUATED,
                 **context,
             )
@@ -233,16 +250,10 @@ def _request(
         request_type=request_type,
         reason_code=f"{request_type.value}_REQUIRED",
         subject_type=(
-            "BRIEF"
-            if is_brief
-            else "RULE_CANDIDATE"
-            if is_rule
-            else "BLOCKED_OPERATION"
+            "BRIEF" if is_brief else "RULE_CANDIDATE" if is_rule else "BLOCKED_OPERATION"
         ),
         subject_id=subject_id,
-        blocked_operation=(
-            None if is_brief else _blocked_operation()
-        ),
+        blocked_operation=(None if is_brief else _blocked_operation()),
         retry_history=retry_history,
         evidence_ids=(evidence_id,),
         expires_at=expires_at or _NOW + timedelta(hours=1),
@@ -308,9 +319,7 @@ def test_exact_brief_approval_is_audited_idempotent_and_resumes(
         )
         events = list(
             session.scalars(
-                select(TaskEvent)
-                .where(TaskEvent.task_id == task_id)
-                .order_by(TaskEvent.sequence)
+                select(TaskEvent).where(TaskEvent.task_id == task_id).order_by(TaskEvent.sequence)
             )
         )
     assert task is not None and request is not None
@@ -583,7 +592,7 @@ def test_changed_preconditions_block_resume_without_consuming_decision(
     assert request.decision_id is None
 
 
-def test_rule_candidate_approval_is_non_executable_until_recorded(
+def test_rule_candidate_approval_versions_rule_and_policy_without_prompts(
     approval_harness: ApprovalHarness,
 ) -> None:
     task_id, evidence_id, candidate_id = _create_task(
@@ -612,8 +621,150 @@ def test_rule_candidate_approval_is_non_executable_until_recorded(
     assert result.task_state is TaskState.REPAIRING
     with approval_harness.factory() as session:
         candidate = session.get(RuleCandidate, candidate_id)
+        rules = session.scalars(select(ReviewRule).order_by(ReviewRule.version)).all()
+        policies = session.scalars(select(PolicyVersion).order_by(PolicyVersion.version)).all()
+        memberships = session.scalars(select(PolicyVersionReviewRule)).all()
+        prompt_memberships = session.scalars(select(PolicyVersionPromptTemplate)).all()
     assert candidate is not None
     assert candidate.status is RuleCandidateStatus.APPROVED
+    assert len(rules) == 1
+    assert rules[0].lineage_key == "format-repair"
+    assert rules[0].version == 1
+    assert rules[0].candidate_id == candidate_id
+    assert rules[0].approval_request_id == request_id
+    assert rules[0].permitted_action == "repair.format"
+    assert rules[0].matcher == {"check": "formatter"}
+    assert len(policies) == 2
+    assert policies[1].version == 2
+    assert policies[1].predecessor_id == policies[0].id
+    assert policies[1].rollback_policy_version_id == policies[0].id
+    assert [(item.policy_version_id, item.review_rule_id) for item in memberships] == [
+        (policies[1].id, rules[0].id)
+    ]
+    assert prompt_memberships == []
+
+
+def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
+    approval_harness: ApprovalHarness,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    service = _service(approval_harness, clock=[now])
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+        expires_at=now + timedelta(hours=1),
+    )
+    authentication = AuthenticationService(approval_harness.factory)
+    bootstrap_token = generate_bootstrap_token(approval_harness.factory)
+    application = create_app(
+        Settings(
+            database_url=SecretStr(str(approval_harness.engine.url)),
+            artifact_root=approval_harness.store.root,
+        ),
+        session_factory=approval_harness.factory,
+        authentication_service=authentication,
+        approval_service=service,
+    )
+    client = TestClient(application, base_url="https://localhost")
+    try:
+        assert client.get("/api/approvals/inbox").status_code == 401
+        assert client.get("/api/auth/status").status_code == 200
+        csrf_token = client.cookies.get(CSRF_COOKIE_NAME)
+        assert csrf_token is not None
+        bootstrap = client.post(
+            "/api/auth/bootstrap",
+            json={
+                "bootstrap_token": bootstrap_token,
+                "password": _PASSWORD,
+            },
+            headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+        )
+        assert bootstrap.status_code == 201
+        bound_csrf = client.cookies.get(CSRF_COOKIE_NAME)
+        assert bound_csrf is not None
+
+        response = client.get("/api/approvals/inbox")
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json() == {
+            "approvals": [
+                {
+                    "id": str(request_id),
+                    "task": {
+                        "id": str(task_id),
+                        "summary": "Implement approvals",
+                        "repository": "boppuh/mathews",
+                        "cockpit_path": f"/tasks/{task_id}",
+                    },
+                    "request_type": "REVIEW_RULE",
+                    "type_label": "Review rule",
+                    "reason_code": "REVIEW_RULE_REQUIRED",
+                    "options": ["APPROVE", "REJECT", "CANCEL"],
+                    "requesting_state": "REPAIRING",
+                    "resume_state": "REPAIRING",
+                    "created_at": now.isoformat().replace("+00:00", "Z"),
+                    "expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+                    "operation_name": "host.mutate",
+                    "operation_fingerprint": "a" * 64,
+                    "supporting_evidence_ids": [str(evidence_id)],
+                }
+            ],
+            "rule_candidates": [
+                {
+                    "candidate_id": str(candidate_id),
+                    "approval_request_id": str(request_id),
+                    "task": {
+                        "id": str(task_id),
+                        "summary": "Implement approvals",
+                        "repository": "boppuh/mathews",
+                        "cockpit_path": f"/tasks/{task_id}",
+                    },
+                    "proposed_rule": "Retry exact formatting failures once.",
+                    "recurrence_assessment": "repeated",
+                    "severity_assessment": "low",
+                    "false_positive_risks": [],
+                    "cited_evidence_ids": [str(evidence_id)],
+                    "lineage_key": "format-repair",
+                    "permitted_action": "repair.format",
+                    "risk_class": "low",
+                }
+            ],
+        }
+        missing_csrf = client.post(
+            f"/api/approvals/{request_id}/decisions",
+            json={"decision": "APPROVE"},
+            headers={"Origin": _ORIGIN},
+        )
+        assert missing_csrf.status_code == 403
+        decided = client.post(
+            f"/api/approvals/{request_id}/decisions",
+            json={"decision": "APPROVE"},
+            headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: bound_csrf},
+        )
+        assert decided.status_code == 200, decided.text
+        assert decided.json()["task_state"] == "REPAIRING"
+        assert decided.json()["status"] == "APPROVED"
+        assert client.get("/api/approvals/inbox").json() == {
+            "approvals": [],
+            "rule_candidates": [],
+        }
+        with approval_harness.factory() as session:
+            audit = session.get(TaskEvent, UUID(decided.json()["audit_event_id"]))
+        assert audit is not None
+        assert audit.event_type == "APPROVAL_DECIDED"
+        assert audit.payload["approval_request_id"] == str(request_id)
+    finally:
+        client.close()
 
 
 def test_rule_candidate_rejection_records_decision_and_resumes(
@@ -647,10 +798,14 @@ def test_rule_candidate_rejection_records_decision_and_resumes(
     with approval_harness.factory() as session:
         candidate = session.get(RuleCandidate, candidate_id)
         task = session.get(Task, task_id)
+        rule_count = session.scalar(select(func.count(ReviewRule.id)))
+        policy_count = session.scalar(select(func.count(PolicyVersion.id)))
     assert candidate is not None and task is not None
     assert candidate.status is RuleCandidateStatus.REJECTED
     assert task.escalation_resume_state is None
     assert task.terminal_outcome is None
+    assert rule_count == 0
+    assert policy_count == 1
 
 
 def test_cancelling_rule_review_does_not_reject_candidate(
@@ -810,9 +965,7 @@ def test_expiry_reconciliation_skips_stale_row_and_continues(
     with caplog.at_level("WARNING"):
         results = service.expire_due(limit=1)
 
-    assert [result.request_id for result in results] == [
-        valid_request_id
-    ]
+    assert [result.request_id for result in results] == [valid_request_id]
     assert str(stale_request_id) in caplog.text
     with approval_harness.factory() as session:
         stale_request = session.get(ApprovalRequest, stale_request_id)
@@ -826,9 +979,7 @@ def test_expiry_reconciliation_skips_stale_row_and_continues(
             artifact_root=approval_harness.store.root,
         ),
         session_factory=approval_harness.factory,
-        authentication_service=AuthenticationService(
-            approval_harness.factory
-        ),
+        authentication_service=AuthenticationService(approval_harness.factory),
         approval_service=service,
     )
     with TestClient(application, base_url="https://localhost"):
@@ -890,9 +1041,7 @@ def test_startup_drains_every_expired_approval_batch(
             artifact_root=approval_harness.store.root,
         ),
         session_factory=approval_harness.factory,
-        authentication_service=AuthenticationService(
-            approval_harness.factory
-        ),
+        authentication_service=AuthenticationService(approval_harness.factory),
         approval_service=service,
     )
 
@@ -974,9 +1123,7 @@ def test_concurrent_human_decisions_have_one_durable_winner(
         task = session.get(Task, task_id)
         request = session.get(ApprovalRequest, request_id)
         event_count = session.scalar(
-            select(func.count())
-            .select_from(TaskEvent)
-            .where(TaskEvent.task_id == task_id)
+            select(func.count()).select_from(TaskEvent).where(TaskEvent.task_id == task_id)
         )
     assert task is not None and request is not None
     assert task.state in {TaskState.FAILED, TaskState.CANCELLED}

@@ -121,9 +121,14 @@ export function TaskWorkspace() {
             blockers.
           </p>
         </div>
-        <div className="work-count" aria-live="polite">
-          <strong>{listState.status === "ready" ? listState.tasks.length : "—"}</strong>
-          <span>tasks</span>
+        <div className="work-header-actions">
+          <Link href="/inbox" className="inbox-link">
+            Decision inbox →
+          </Link>
+          <div className="work-count" aria-live="polite">
+            <strong>{listState.status === "ready" ? listState.tasks.length : "—"}</strong>
+            <span>tasks</span>
+          </div>
         </div>
       </header>
 
