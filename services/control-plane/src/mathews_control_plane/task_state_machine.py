@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -574,10 +574,28 @@ def _replayed_result(
     *,
     task_id: UUID,
     transition_id: UUID,
+    kind: TaskTransitionKind,
+    validation_candidate: ValidationCandidate | None,
     fingerprint: str,
 ) -> TaskTransitionResult:
+    stored_candidate = event.payload.get("validation_candidate")
+    candidate_matches = True
+    if kind in {
+        TaskTransitionKind.BEGIN_VALIDATION,
+        TaskTransitionKind.REVALIDATE,
+    }:
+        candidate_matches = (
+            validation_candidate is not None
+            and isinstance(stored_candidate, Mapping)
+            and set(stored_candidate) == {"commit_sha", "tree_sha"}
+            and stored_candidate.get("commit_sha")
+            == validation_candidate.commit_sha
+            and stored_candidate.get("tree_sha") == validation_candidate.tree_sha
+        )
     if (
         event.task_id != task_id
+        or event.transition_kind != kind.value
+        or not candidate_matches
         or event.transition_fingerprint != fingerprint
         or event.transition_from_state is None
         or event.transition_to_state is None
@@ -677,6 +695,18 @@ def _transition_task(
         or len(unique_evidence_ids) > MAX_TRANSITION_EVIDENCE_REFERENCES
     ):
         raise InvalidTaskTransitionError("transition evidence references are invalid")
+    if kind in {
+        TaskTransitionKind.BEGIN_VALIDATION,
+        TaskTransitionKind.REVALIDATE,
+    }:
+        if validation_candidate is None:
+            raise InvalidTaskTransitionError(
+                "validation transition requires exact candidate Git objects"
+            )
+    elif validation_candidate is not None:
+        raise InvalidTaskTransitionError(
+            "validation candidate is not allowed for this transition"
+        )
     fingerprint = _command_fingerprint(
         task_id=task_id,
         transition_id=transition_id,
@@ -699,6 +729,8 @@ def _transition_task(
             existing,
             task_id=task_id,
             transition_id=transition_id,
+            kind=kind,
+            validation_candidate=validation_candidate,
             fingerprint=fingerprint,
         )
     if TaskState(task.state) is not expected_state:
@@ -733,18 +765,6 @@ def _transition_task(
         now=now,
     )
     plan = evaluate_task_transition(snapshot, kind, guards)
-    if kind in {
-        TaskTransitionKind.BEGIN_VALIDATION,
-        TaskTransitionKind.REVALIDATE,
-    }:
-        if validation_candidate is None:
-            raise InvalidTaskTransitionError(
-                "validation transition requires exact candidate Git objects"
-            )
-    elif validation_candidate is not None:
-        raise InvalidTaskTransitionError(
-            "validation candidate is not allowed for this transition"
-        )
     sequence = _next_event_sequence(session, task.id)
     invalidated_ids = (
         {
@@ -924,5 +944,7 @@ class TaskTransitionService:
                     existing,
                     task_id=task_id,
                     transition_id=transition_id,
+                    kind=kind,
+                    validation_candidate=validation_candidate,
                     fingerprint=fingerprint,
                 )

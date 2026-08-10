@@ -2149,6 +2149,13 @@ class BackgroundJobService:
         evidence_ids: Sequence[UUID],
         active_policy_lineage: str = "mvp",
     ) -> TaskTransitionResult:
+        if kind in {
+            TaskTransitionKind.BEGIN_VALIDATION,
+            TaskTransitionKind.REVALIDATE,
+        }:
+            raise InvalidBackgroundJobError(
+                "background jobs cannot issue validation transitions without a candidate"
+            )
         with self._factory() as session, session.begin():
             _begin_serialized(session)
             task = session.scalar(

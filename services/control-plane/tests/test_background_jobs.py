@@ -801,6 +801,30 @@ def test_current_lease_can_transition_task_in_the_same_transaction(
     assert provenance.fencing_token == grant.fencing_token
 
 
+def test_background_job_transition_rejects_validation_without_candidate(
+    job_harness: JobHarness,
+) -> None:
+    task_id, evidence_id = _create_task(job_harness)
+    service = job_harness.service()
+    service.schedule(
+        task_id=task_id,
+        job_type="task-action",
+        idempotency_key="task-transition:validation",
+        input_payload={"transition": "validation"},
+    )
+    grant = _claim(job_harness)
+
+    with pytest.raises(InvalidBackgroundJobError):
+        service.transition_task(
+            grant,
+            transition_id=uuid4(),
+            expected_state=TaskState.IMPLEMENTING,
+            kind=TaskTransitionKind.BEGIN_VALIDATION,
+            reason_code="BEGIN_VALIDATION",
+            evidence_ids=(evidence_id,),
+        )
+
+
 def test_sqlite_concurrent_claims_yield_exactly_one_lease(
     job_harness: JobHarness,
 ) -> None:
