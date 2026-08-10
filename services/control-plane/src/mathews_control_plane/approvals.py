@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
@@ -59,6 +61,7 @@ APPROVAL_EVENT_SCHEMA_VERSION = 1
 MAX_APPROVAL_LIFETIME = timedelta(days=30)
 MAX_APPROVAL_EVIDENCE_REFERENCES = 100
 MAX_RETRY_HISTORY_ENTRIES = 100
+MAX_APPROVAL_DECISION_BYTES = 4 * 1024
 _UNINITIALIZED_FINGERPRINT = "0" * 64
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
@@ -148,6 +151,10 @@ class ApprovalPreconditionError(ApprovalError):
     """The approved operation no longer satisfies its captured preconditions."""
 
 
+class ApprovalRecentPasswordRequiredError(ApprovalError):
+    """The requested human decision requires recent password verification."""
+
+
 class ApprovalTaskSummary(BaseModel):
     id: UUID
     summary: str
@@ -189,6 +196,9 @@ class RuleInboxItem(BaseModel):
     lineage_key: str
     permitted_action: str
     risk_class: str
+    scope: dict[str, object]
+    matcher: dict[str, object]
+    evidence_requirements: list[str]
 
 
 class ApprovalInboxResponse(BaseModel):
@@ -790,6 +800,34 @@ def _stored_string_list(
     return [cast(str, item).strip() for item in value]
 
 
+def _candidate_evidence_ids(
+    session: Session,
+    task: Task,
+    candidate: RuleCandidate,
+) -> tuple[UUID, ...]:
+    try:
+        values = tuple(UUID(cast(str, value)) for value in candidate.cited_evidence_ids)
+    except (TypeError, ValueError):
+        raise ApprovalConflictError("stored rule candidate evidence is invalid") from None
+    if (
+        not values
+        or len(values) > MAX_APPROVAL_EVIDENCE_REFERENCES
+        or len(set(values)) != len(values)
+    ):
+        raise ApprovalConflictError("stored rule candidate evidence is invalid")
+    records = session.scalars(
+        select(EvidenceRecord).where(
+            EvidenceRecord.id.in_(values),
+            EvidenceRecord.task_id == task.id,
+            EvidenceRecord.owner_id == task.owner_id,
+            EvidenceRecord.deleted_at.is_(None),
+        )
+    ).all()
+    if len(records) != len(values):
+        raise ApprovalConflictError("rule candidate evidence is unavailable")
+    return values
+
+
 def _approval_principal(authentication: AuthenticatedSession) -> str:
     if authentication.user_id != _LOCAL_USER_ID:
         raise ApprovalNotFoundError("approval inbox is unavailable")
@@ -873,12 +911,22 @@ def _durable_preconditions_are_current(
         candidate = session.scalar(
             select(RuleCandidate).where(RuleCandidate.id == request.subject_id).with_for_update()
         )
-        return bool(
+        if not (
             candidate is not None
             and candidate.task_id == task.id
             and candidate.status is RuleCandidateStatus.EVALUATED
             and candidate.evaluation_result is not None
-        )
+        ):
+            return False
+        try:
+            cited_evidence_ids = _candidate_evidence_ids(
+                session,
+                task,
+                candidate,
+            )
+        except ApprovalConflictError:
+            return False
+        return set(cited_evidence_ids).issubset(_stored_evidence_ids(request))
     if (
         request_type is ApprovalRequestType.RETRY_LIMIT
         and blocked_operation is not None
@@ -989,6 +1037,8 @@ class ApprovalService:
         authentication: AuthenticatedSession,
     ) -> ApprovalInboxResponse:
         owner_id = _approval_principal(authentication)
+        while len(self.expire_due(limit=100)) == 100:
+            pass
         now = _as_utc(self._clock())
         with self._factory() as session:
             rows = session.execute(
@@ -1067,16 +1117,20 @@ class ApprovalService:
                     )
                 )
                 if candidate is None:
-                    raise ApprovalConflictError("evaluated rule candidate is unavailable")
-                rule = _evaluated_review_rule(candidate)
+                    _LOGGER.warning(
+                        "Skipped unavailable rule candidate for approval %s",
+                        request.id,
+                    )
+                    continue
                 try:
-                    cited_evidence_ids = [
-                        UUID(cast(str, value)) for value in candidate.cited_evidence_ids
-                    ]
-                except (TypeError, ValueError):
-                    raise ApprovalConflictError(
-                        "stored rule candidate evidence is invalid"
-                    ) from None
+                    rule = _evaluated_review_rule(candidate)
+                    cited_evidence_ids = list(_candidate_evidence_ids(session, task, candidate))
+                except ApprovalConflictError:
+                    _LOGGER.warning(
+                        "Skipped invalid rule candidate for approval %s",
+                        request.id,
+                    )
+                    continue
                 rule_candidates.append(
                     RuleInboxItem(
                         candidate_id=candidate.id,
@@ -1093,6 +1147,9 @@ class ApprovalService:
                         lineage_key=rule.lineage_key,
                         permitted_action=rule.permitted_action,
                         risk_class=rule.risk_class,
+                        scope=rule.scope,
+                        matcher=rule.matcher,
+                        evidence_requirements=rule.evidence_requirements,
                     )
                 )
             return ApprovalInboxResponse(
@@ -1302,6 +1359,7 @@ class ApprovalService:
         actor_id: str,
         evidence_ids: Sequence[UUID] = (),
         expected_owner_id: str | None = None,
+        recent_password_verified: bool | None = None,
     ) -> ApprovalDecisionResult:
         normalized_actor = _required_identifier(
             actor_id,
@@ -1429,6 +1487,20 @@ class ApprovalService:
                     effective_decision,
                     decision_id=decision_id,
                 )
+                if (
+                    recent_password_verified is False
+                    and effective_decision is not ApprovalDecision.EXPIRE
+                    and (
+                        (
+                            request_type is ApprovalRequestType.REVIEW_RULE
+                            and effective_decision is ApprovalDecision.APPROVE
+                        )
+                        or transition_kind in {TaskTransitionKind.CANCEL, TaskTransitionKind.FAIL}
+                    )
+                ):
+                    raise ApprovalRecentPasswordRequiredError(
+                        "recent password authentication required"
+                    )
                 if (
                     request_type is ApprovalRequestType.BRIEF
                     and effective_decision is ApprovalDecision.APPROVE
@@ -1621,6 +1693,7 @@ class ApprovalService:
                 or candidate.evaluation_result is None
             ):
                 raise ApprovalNotFoundError("evaluated rule candidate is unavailable")
+            _candidate_evidence_ids(session, task, candidate)
 
     def _project_subject_decision(
         self,
@@ -1698,22 +1771,48 @@ class ApprovalService:
         approved_at: datetime,
     ) -> None:
         definition = _evaluated_review_rule(candidate)
+        cited_evidence_ids = _candidate_evidence_ids(session, task, candidate)
+        if not set(cited_evidence_ids).issubset(_stored_evidence_ids(request)):
+            raise ApprovalConflictError("rule candidate evidence is not bound to the approval")
         predecessor = session.scalar(
             select(ReviewRule)
-            .where(ReviewRule.lineage_key == definition.lineage_key)
+            .where(
+                ReviewRule.lineage_key == definition.lineage_key,
+                ReviewRule.owner_id == task.owner_id,
+            )
             .order_by(ReviewRule.version.desc())
             .limit(1)
             .with_for_update()
         )
         active = session.scalar(
             select(PolicyVersion)
-            .where(PolicyVersion.lineage_key == self._active_policy_lineage)
+            .where(
+                PolicyVersion.lineage_key == self._active_policy_lineage,
+                PolicyVersion.owner_id == task.owner_id,
+                PolicyVersion.approved_at <= approved_at,
+            )
             .order_by(PolicyVersion.version.desc())
             .limit(1)
             .with_for_update()
         )
         if active is None:
             raise ApprovalConflictError("active approval policy is unavailable")
+        next_rule_version = (
+            session.scalar(
+                select(func.max(ReviewRule.version)).where(
+                    ReviewRule.lineage_key == definition.lineage_key
+                )
+            )
+            or 0
+        ) + 1
+        next_policy_version = (
+            session.scalar(
+                select(func.max(PolicyVersion.version)).where(
+                    PolicyVersion.lineage_key == self._active_policy_lineage
+                )
+            )
+            or 0
+        ) + 1
         context = {
             "owner_id": task.owner_id,
             "actor_id": actor_id,
@@ -1725,7 +1824,7 @@ class ApprovalService:
         }
         rule = ReviewRule(
             lineage_key=definition.lineage_key,
-            version=1 if predecessor is None else predecessor.version + 1,
+            version=next_rule_version,
             predecessor_id=None if predecessor is None else predecessor.id,
             candidate_id=candidate.id,
             approval_request_id=request.id,
@@ -1740,7 +1839,7 @@ class ApprovalService:
             provenance={
                 "approval_request_id": str(request.id),
                 "candidate_id": str(candidate.id),
-                "cited_evidence_ids": list(candidate.cited_evidence_ids),
+                "cited_evidence_ids": [str(value) for value in cited_evidence_ids],
                 "evaluation_fingerprint": _fingerprint(
                     cast(Mapping[str, object], candidate.evaluation_result)
                 ),
@@ -1754,7 +1853,7 @@ class ApprovalService:
         session.flush()
         policy = PolicyVersion(
             lineage_key=active.lineage_key,
-            version=active.version + 1,
+            version=next_policy_version,
             predecessor_id=active.id,
             workflow_thresholds=active.workflow_thresholds,
             approved_by=actor_id,
@@ -1773,15 +1872,18 @@ class ApprovalService:
             .where(PolicyVersionReviewRule.policy_version_id == active.id)
             .order_by(PolicyVersionReviewRule.position)
         ).all()
-        kept_rule_ids = [
-            existing_rule.id
-            for _membership, existing_rule in active_rules
-            if existing_rule.lineage_key != definition.lineage_key
-        ]
-        for position, review_rule_id in enumerate(
-            (*kept_rule_ids, rule.id),
-            start=1,
-        ):
+        replacement_rule_ids: list[UUID] = []
+        replaced = False
+        for _membership, existing_rule in active_rules:
+            if existing_rule.lineage_key == definition.lineage_key:
+                if not replaced:
+                    replacement_rule_ids.append(rule.id)
+                    replaced = True
+                continue
+            replacement_rule_ids.append(existing_rule.id)
+        if not replaced:
+            replacement_rule_ids.append(rule.id)
+        for position, review_rule_id in enumerate(replacement_rule_ids, start=1):
             session.add(
                 PolicyVersionReviewRule(
                     policy_version_id=policy.id,
@@ -1837,6 +1939,91 @@ def _transition_event_id(session: Session, transition_id: UUID) -> UUID:
     return event_id
 
 
+class ApprovalBodyLimitMiddleware:
+    """Bound approval-decision JSON before request parsing buffers it."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        maximum_bytes: int = MAX_APPROVAL_DECISION_BYTES,
+    ) -> None:
+        self._app = app
+        self._maximum_bytes = maximum_bytes
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        path = scope.get("path", "")
+        bounded = (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and isinstance(path, str)
+            and path.startswith("/api/approvals/")
+            and path.endswith("/decisions")
+        )
+        if not bounded:
+            await self._app(scope, receive, send)
+            return
+        content_length = self._content_length(scope)
+        if content_length is not None and content_length > self._maximum_bytes:
+            await self._send_too_large(scope, receive, send)
+            return
+        received_bytes = 0
+        captured_messages: list[Message] = []
+        while True:
+            message = await receive()
+            captured_messages.append(message)
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            received_bytes += len(message.get("body", b""))
+            if received_bytes > self._maximum_bytes:
+                await self._send_too_large(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+        message_index = 0
+
+        async def replay_receive() -> Message:
+            nonlocal message_index
+            if message_index < len(captured_messages):
+                message = captured_messages[message_index]
+                message_index += 1
+                return message
+            return await receive()
+
+        await self._app(scope, replay_receive, send)
+
+    @staticmethod
+    def _content_length(scope: Scope) -> int | None:
+        for name, value in scope["headers"]:
+            if name.lower() != b"content-length":
+                continue
+            try:
+                return max(0, int(value))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    async def _send_too_large(
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        response = JSONResponse(
+            {"detail": "approval decision body too large"},
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+        await response(scope, receive, send)
+
+
 def create_approval_router(service: ApprovalService) -> APIRouter:
     router = APIRouter(prefix="/api/approvals", tags=["approvals"])
 
@@ -1877,7 +2064,10 @@ def create_approval_router(service: ApprovalService) -> APIRouter:
                 decision=decision,
                 actor_id=owner_id,
                 expected_owner_id=owner_id,
+                recent_password_verified=(authentication.recent_password_verified),
             )
+            if result.decision is ApprovalDecision.EXPIRE:
+                raise ApprovalConflictError("approval request expired")
         except ApprovalNotFoundError as error:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1892,6 +2082,11 @@ def create_approval_router(service: ApprovalService) -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="approval request changed",
+            ) from error
+        except ApprovalRecentPasswordRequiredError as error:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="recent password authentication required",
             ) from error
         return ApprovalDecisionResponse(
             request_id=result.request_id,

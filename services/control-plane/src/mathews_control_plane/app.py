@@ -11,7 +11,11 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 from mathews_control_plane import __version__
-from mathews_control_plane.approvals import ApprovalService, create_approval_router
+from mathews_control_plane.approvals import (
+    ApprovalBodyLimitMiddleware,
+    ApprovalService,
+    create_approval_router,
+)
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     CSRF_HEADER_NAME,
@@ -191,6 +195,7 @@ def create_app(
     application.add_middleware(AuthenticationBodyLimitMiddleware)
     application.add_middleware(EvidenceBodyLimitMiddleware)
     application.add_middleware(TaskBodyLimitMiddleware)
+    application.add_middleware(ApprovalBodyLimitMiddleware)
     # CORS is the outer layer so even authentication failures carry the exact
     # trusted-origin response headers expected by browser clients.
     application.add_middleware(

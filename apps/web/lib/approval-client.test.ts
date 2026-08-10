@@ -46,6 +46,9 @@ const rule = {
   lineage_key: "format-repair",
   permitted_action: "repair.format",
   risk_class: "low",
+  scope: { repository: "boppuh/mathews" },
+  matcher: { check: "formatter" },
+  evidence_requirements: ["formatter-output"],
 };
 
 afterEach(() => {

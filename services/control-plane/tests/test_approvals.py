@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,6 +14,7 @@ from mathews_control_plane.approvals import (
     ApprovalConflictError,
     ApprovalPreconditionError,
     ApprovalPreconditionEvaluator,
+    ApprovalRecentPasswordRequiredError,
     ApprovalRequestResult,
     ApprovalRetryAttempt,
     ApprovalService,
@@ -60,7 +62,7 @@ from starlette.testclient import TestClient
 
 _NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
 _ORIGIN = "http://localhost:3000"
-_PASSWORD = "correct horse battery staple"
+_PASSWORD = "correct horse battery staple"  # noqa: S105
 
 
 @dataclass(slots=True)
@@ -654,7 +656,8 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
         with_rule_candidate=True,
     )
     assert candidate_id is not None
-    service = _service(approval_harness, clock=[now])
+    service_clock = [now]
+    service = _service(approval_harness, clock=service_clock)
     request_id, _result = _request(
         service,
         task_id=task_id,
@@ -737,6 +740,9 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
                     "lineage_key": "format-repair",
                     "permitted_action": "repair.format",
                     "risk_class": "low",
+                    "scope": {"repository": "boppuh/mathews"},
+                    "matcher": {"check": "formatter"},
+                    "evidence_requirements": ["formatter-output"],
                 }
             ],
         }
@@ -746,6 +752,16 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
             headers={"Origin": _ORIGIN},
         )
         assert missing_csrf.status_code == 403
+        oversized = client.post(
+            f"/api/approvals/{request_id}/decisions",
+            content=b"x" * 4_097,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": _ORIGIN,
+                CSRF_HEADER_NAME: bound_csrf,
+            },
+        )
+        assert oversized.status_code == 413
         decided = client.post(
             f"/api/approvals/{request_id}/decisions",
             json={"decision": "APPROVE"},
@@ -763,8 +779,248 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
         assert audit is not None
         assert audit.event_type == "APPROVAL_DECIDED"
         assert audit.payload["approval_request_id"] == str(request_id)
+
+        expired_task_id, expired_evidence_id, _subject_id = _create_task(
+            approval_harness,
+            state=TaskState.REPAIRING,
+        )
+        expired_request_id, _result = _request(
+            service,
+            task_id=expired_task_id,
+            evidence_id=expired_evidence_id,
+            expected_state=TaskState.REPAIRING,
+            request_type=ApprovalRequestType.REVIEW_CONFLICT,
+            expires_at=now + timedelta(minutes=1),
+        )
+        service_clock[0] = now + timedelta(minutes=2)
+        assert client.get("/api/approvals/inbox").json() == {
+            "approvals": [],
+            "rule_candidates": [],
+        }
+        with approval_harness.factory() as session:
+            expired_task = session.get(Task, expired_task_id)
+            expired_request = session.get(ApprovalRequest, expired_request_id)
+        assert expired_task is not None and expired_request is not None
+        assert expired_task.state is TaskState.FAILED
+        assert expired_request.status is ApprovalStatus.EXPIRED
+
+        stale_task_id, stale_evidence_id, _subject_id = _create_task(
+            approval_harness,
+            state=TaskState.REPAIRING,
+        )
+        stale_request_id, _result = _request(
+            service,
+            task_id=stale_task_id,
+            evidence_id=stale_evidence_id,
+            expected_state=TaskState.REPAIRING,
+            request_type=ApprovalRequestType.REVIEW_CONFLICT,
+            expires_at=service_clock[0] + timedelta(minutes=1),
+        )
+        service_clock[0] += timedelta(minutes=2)
+        stale = client.post(
+            f"/api/approvals/{stale_request_id}/decisions",
+            json={"decision": "APPROVE"},
+            headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: bound_csrf},
+        )
+        assert stale.status_code == 409
+        with approval_harness.factory() as session:
+            stale_task = session.get(Task, stale_task_id)
+        assert stale_task is not None
+        assert stale_task.state is TaskState.FAILED
     finally:
         client.close()
+
+
+def test_policy_and_terminal_decisions_require_recent_password(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+
+    with pytest.raises(ApprovalRecentPasswordRequiredError):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+            recent_password_verified=False,
+        )
+
+    with approval_harness.factory() as session:
+        task = session.get(Task, task_id)
+        request = session.get(ApprovalRequest, request_id)
+        candidate = session.get(RuleCandidate, candidate_id)
+    assert task is not None and request is not None and candidate is not None
+    assert task.state is TaskState.ESCALATED
+    assert request.status is ApprovalStatus.PENDING
+    assert candidate.status is RuleCandidateStatus.EVALUATED
+
+
+def test_rule_promotion_rejects_changed_or_unbound_candidate_evidence(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+    with approval_harness.factory.begin() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+        assert candidate is not None
+        candidate.cited_evidence_ids = []
+
+    with pytest.raises(ApprovalPreconditionError):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+        )
+
+    with approval_harness.factory() as session:
+        request = session.get(ApprovalRequest, request_id)
+        rule_count = session.scalar(select(func.count(ReviewRule.id)))
+    assert request is not None
+    assert request.status is ApprovalStatus.PENDING
+    assert rule_count == 0
+
+
+def test_rule_promotion_uses_current_policy_and_preserves_lineage_position(
+    approval_harness: ApprovalHarness,
+) -> None:
+    service = _service(approval_harness)
+
+    def approve_candidate(lineage_key: str) -> tuple[UUID, UUID]:
+        task_id, evidence_id, candidate_id = _create_task(
+            approval_harness,
+            state=TaskState.REPAIRING,
+            with_rule_candidate=True,
+        )
+        assert candidate_id is not None
+        with approval_harness.factory.begin() as session:
+            candidate = session.get(RuleCandidate, candidate_id)
+            assert candidate is not None and candidate.evaluation_result is not None
+            candidate.evaluation_result = {
+                **candidate.evaluation_result,
+                "review_rule": {
+                    **cast(
+                        dict[str, object],
+                        candidate.evaluation_result["review_rule"],
+                    ),
+                    "lineage_key": lineage_key,
+                },
+            }
+        request_id, _result = _request(
+            service,
+            task_id=task_id,
+            evidence_id=evidence_id,
+            expected_state=TaskState.REPAIRING,
+            request_type=ApprovalRequestType.REVIEW_RULE,
+            subject_id=candidate_id,
+        )
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+        )
+        return task_id, candidate_id
+
+    approve_candidate("format-repair")
+    approve_candidate("lint-repair")
+    task_id, _candidate_id = approve_candidate("format-repair")
+
+    with approval_harness.factory() as session:
+        latest_policy = session.scalar(
+            select(PolicyVersion)
+            .where(PolicyVersion.owner_id == "local-user")
+            .order_by(PolicyVersion.version.desc())
+            .limit(1)
+        )
+        assert latest_policy is not None
+        lineages = session.scalars(
+            select(ReviewRule.lineage_key)
+            .join(
+                PolicyVersionReviewRule,
+                PolicyVersionReviewRule.review_rule_id == ReviewRule.id,
+            )
+            .where(PolicyVersionReviewRule.policy_version_id == latest_policy.id)
+            .order_by(PolicyVersionReviewRule.position)
+        ).all()
+        task = session.get(Task, task_id)
+    assert task is not None
+    assert lineages == ["format-repair", "lint-repair"]
+
+
+def test_rule_promotion_does_not_copy_a_future_policy(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    with approval_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        session.add(
+            PolicyVersion(
+                lineage_key="mvp",
+                version=2,
+                workflow_thresholds={"future": True},
+                approved_by="local-user",
+                approved_at=_NOW + timedelta(days=1),
+                owner_id="local-user",
+                actor_id="local-user",
+                root_correlation_id=task.root_correlation_id,
+            )
+        )
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+    service.decide(
+        request_id,
+        decision_id=uuid4(),
+        decision=ApprovalDecision.APPROVE,
+        actor_id="local-user",
+    )
+
+    with approval_harness.factory() as session:
+        policies = session.scalars(select(PolicyVersion).order_by(PolicyVersion.version)).all()
+    assert [policy.version for policy in policies] == [1, 2, 3]
+    assert policies[2].predecessor_id == policies[0].id
+    assert policies[2].rollback_policy_version_id == policies[0].id
+    assert policies[2].workflow_thresholds == {}
 
 
 def test_rule_candidate_rejection_records_decision_and_resumes(

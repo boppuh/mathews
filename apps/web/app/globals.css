@@ -1864,6 +1864,53 @@ section {
   color: #07120f;
 }
 
+.inbox-header > button:disabled,
+.decision-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.rule-definition {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.rule-definition > div {
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid rgb(91 179 255 / 24%);
+  border-radius: 0.55rem;
+  background: #0b1016;
+}
+
+.rule-definition > div:last-child {
+  grid-column: 1 / -1;
+}
+
+.rule-definition strong {
+  display: block;
+  margin-bottom: 0.5rem;
+  color: #9bd2ff;
+  font-size: 0.65rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.rule-definition pre,
+.rule-definition ul {
+  margin: 0;
+  color: #d8e0e9;
+  font-size: 0.68rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.rule-definition ul {
+  padding-left: 1.1rem;
+}
+
 .rule-safety-note {
   max-width: 48rem;
   margin: 0 0 1.25rem;
@@ -1956,6 +2003,10 @@ section {
   }
 
   .inbox-facts {
+    grid-template-columns: 1fr;
+  }
+
+  .rule-definition {
     grid-template-columns: 1fr;
   }
 

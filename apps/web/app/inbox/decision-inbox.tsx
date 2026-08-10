@@ -35,12 +35,12 @@ function timestamp(value: string): string {
   }).format(new Date(value));
 }
 
-function errorMessage(error: unknown): string {
+function errorMessage(error: unknown, fallback = "Unable to load the approval inbox."): string {
   if (error instanceof ApprovalRequestError) return error.message;
   if (error instanceof Error && error.message.startsWith("The control plane returned")) {
     return error.message;
   }
-  return "Unable to load the approval inbox.";
+  return fallback;
 }
 
 function EvidenceLinks({
@@ -72,7 +72,6 @@ export function DecisionInbox() {
   }
 
   const load = useCallback(async (signal?: AbortSignal, background = false) => {
-    if (!background) setState({ status: "loading" });
     try {
       const inbox = await inboxLoader.current?.load(signal);
       if (!inbox) return;
@@ -101,7 +100,7 @@ export function DecisionInbox() {
       await approvalClient.decide(requestId, decision);
       await load(undefined, true);
     } catch (error) {
-      setActionError(errorMessage(error));
+      setActionError(errorMessage(error, "Unable to record the decision."));
       if (error instanceof ApprovalRequestError && [404, 409].includes(error.status)) {
         await load(undefined, true);
       }
@@ -301,6 +300,24 @@ export function DecisionInbox() {
                       </dd>
                     </div>
                   </dl>
+                  <div className="rule-definition">
+                    <div>
+                      <strong>Exact scope</strong>
+                      <pre>{JSON.stringify(rule.scope, null, 2)}</pre>
+                    </div>
+                    <div>
+                      <strong>Exact matcher</strong>
+                      <pre>{JSON.stringify(rule.matcher, null, 2)}</pre>
+                    </div>
+                    <div>
+                      <strong>Evidence requirements</strong>
+                      <ul>
+                        {rule.evidence_requirements.map((requirement) => (
+                          <li key={requirement}>{requirement}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
                   <EvidenceLinks approval={approval} evidenceIds={rule.cited_evidence_ids} />
                   <div className="inbox-card-footer">
                     <Link href={rule.task.cockpit_path}>Open task</Link>

@@ -24,6 +24,13 @@ export type ApprovalRequestType =
   | "RETRY_LIMIT"
   | "REVIEW_CONFLICT"
   | "REVIEW_RULE";
+export type ApprovalJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | ApprovalJsonValue[]
+  | { [key: string]: ApprovalJsonValue };
 
 export interface ApprovalTask {
   id: string;
@@ -60,6 +67,9 @@ export interface RuleInboxItem {
   lineage_key: string;
   permitted_action: string;
   risk_class: string;
+  scope: { [key: string]: ApprovalJsonValue };
+  matcher: { [key: string]: ApprovalJsonValue };
+  evidence_requirements: string[];
 }
 
 export interface ApprovalInboxResponse {
@@ -122,6 +132,46 @@ function parseUuidList(value: unknown): string[] {
   }
   const parsed = value.map(parseUuid);
   if (new Set(parsed).size !== parsed.length) {
+    throw new Error("The control plane returned an invalid approval inbox.");
+  }
+  return parsed;
+}
+
+function parseJsonValue(value: unknown, depth = 0): ApprovalJsonValue {
+  if (depth > 10) {
+    throw new Error("The control plane returned an invalid approval inbox.");
+  }
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 100) {
+      throw new Error("The control plane returned an invalid approval inbox.");
+    }
+    return value.map((item) => parseJsonValue(item, depth + 1));
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value);
+    if (
+      entries.length === 0 ||
+      entries.length > 100 ||
+      entries.some(([key]) => key.length === 0 || key.length > 255)
+    ) {
+      throw new Error("The control plane returned an invalid approval inbox.");
+    }
+    return Object.fromEntries(entries.map(([key, item]) => [key, parseJsonValue(item, depth + 1)]));
+  }
+  throw new Error("The control plane returned an invalid approval inbox.");
+}
+
+function parseJsonObject(value: unknown): { [key: string]: ApprovalJsonValue } {
+  const parsed = parseJsonValue(value);
+  if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   return parsed;
@@ -243,6 +293,9 @@ function parseRule(value: unknown): RuleInboxItem {
     lineage_key: value.lineage_key,
     permitted_action: value.permitted_action,
     risk_class: value.risk_class,
+    scope: parseJsonObject(value.scope),
+    matcher: parseJsonObject(value.matcher),
+    evidence_requirements: parseStringList(value.evidence_requirements),
   };
 }
 
