@@ -303,7 +303,8 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
                   {github.ci_status.replaceAll("_", " ")}
                 </strong>
                 <small>
-                  {github.checks_passed} of {github.checks_total} checks passing
+                  {github.checks_passed} of {github.checks_total}{" "}
+                  {github.checks_total === 1 ? "check" : "checks"} passing
                 </small>
               </div>
               <div>
@@ -314,7 +315,8 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
                   {github.review_status.replaceAll("_", " ")}
                 </strong>
                 <small>
-                  {github.blocking_reviews} blocking · {github.review_comments} open comments
+                  {github.blocking_reviews} blocking · {github.review_comments} open{" "}
+                  {github.review_comments === 1 ? "comment" : "comments"}
                 </small>
               </div>
             </div>

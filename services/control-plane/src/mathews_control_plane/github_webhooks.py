@@ -21,6 +21,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from mathews_control_plane.api_paths import GITHUB_WEBHOOK_ENDPOINT
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
@@ -45,7 +46,6 @@ from mathews_control_plane.github_app import (
     GitHubWebhookVerifier,
 )
 
-GITHUB_WEBHOOK_ENDPOINT = "/api/github/webhooks"
 GITHUB_PR_BOUND_EVENT = "GITHUB_PR_BOUND"
 GITHUB_CHECK_UPDATED_EVENT = "GITHUB_CHECK_UPDATED"
 GITHUB_REVIEW_UPDATED_EVENT = "GITHUB_REVIEW_UPDATED"
@@ -778,36 +778,52 @@ def _normalize_update(event_name: str, payload: dict[str, object]) -> _WebhookUp
 
 
 def _correlation_candidates(session: Session, update: _WebhookUpdate) -> list[Task]:
-    candidates: list[Task] = []
-    for task in session.scalars(select(Task).where(Task.owner_id == _OWNER)):
-        binding = _latest_binding(session, task.id)
-        if binding is not None and _binding_matches(binding.payload, update, include_head=True):
-            candidates.append(task)
-    return candidates
+    return _binding_candidates(session, update, include_head=True)
 
 
 def _same_pr_different_head(session: Session, update: _WebhookUpdate) -> Task | None:
-    matches: list[Task] = []
-    for task in session.scalars(select(Task).where(Task.owner_id == _OWNER)):
-        binding = _latest_binding(session, task.id)
-        if binding is not None and _binding_matches(binding.payload, update, include_head=False):
-            matches.append(task)
+    matches = _binding_candidates(session, update, include_head=False)
     return matches[0] if len(matches) == 1 else None
 
 
-def _binding_matches(
-    payload: dict[str, object],
+def _binding_candidates(
+    session: Session,
     update: _WebhookUpdate,
     *,
     include_head: bool,
-) -> bool:
-    return (
-        payload.get("installation_id") == update.installation_id
-        and payload.get("repository_id") == update.repository_id
-        and payload.get("repository_key") == update.repository_key
-        and payload.get("pull_request_number") == update.pull_request_number
-        and payload.get("task_branch") == update.task_branch
-        and (not include_head or payload.get("head_sha") == update.head_sha)
+) -> list[Task]:
+    latest_binding_sequence = (
+        select(func.max(TaskEvent.sequence))
+        .where(
+            TaskEvent.task_id == Task.id,
+            TaskEvent.event_type == GITHUB_PR_BOUND_EVENT,
+        )
+        .correlate(Task)
+        .scalar_subquery()
+    )
+    filters = [
+        TaskEvent.payload["installation_id"].as_integer() == update.installation_id,
+        TaskEvent.payload["repository_id"].as_integer() == update.repository_id,
+        TaskEvent.payload["repository_key"].as_string() == update.repository_key,
+        TaskEvent.payload["pull_request_number"].as_integer()
+        == update.pull_request_number,
+        TaskEvent.payload["task_branch"].as_string() == update.task_branch,
+    ]
+    if include_head:
+        filters.append(TaskEvent.payload["head_sha"].as_string() == update.head_sha)
+    return list(
+        session.scalars(
+            select(Task)
+            .join(TaskEvent, TaskEvent.task_id == Task.id)
+            .where(
+                Task.owner_id == _OWNER,
+                TaskEvent.event_type == GITHUB_PR_BOUND_EVENT,
+                TaskEvent.sequence == latest_binding_sequence,
+                *filters,
+            )
+            .order_by(Task.id)
+            .limit(2)
+        )
     )
 
 
@@ -825,20 +841,17 @@ def _latest_resource_event(
     task_id: UUID,
     update: _WebhookUpdate,
 ) -> TaskEvent | None:
-    events = session.scalars(
+    return session.scalar(
         select(TaskEvent)
-        .where(TaskEvent.task_id == task_id, TaskEvent.event_type == update.event_type)
+        .where(
+            TaskEvent.task_id == task_id,
+            TaskEvent.event_type == update.event_type,
+            TaskEvent.payload["head_sha"].as_string() == update.head_sha,
+            TaskEvent.payload["resource_type"].as_string() == update.resource_type,
+            TaskEvent.payload["resource_id"].as_string() == update.resource_id,
+        )
         .order_by(TaskEvent.sequence.desc(), TaskEvent.id.desc())
-    )
-    return next(
-        (
-            event
-            for event in events
-            if event.payload.get("head_sha") == update.head_sha
-            and event.payload.get("resource_type") == update.resource_type
-            and event.payload.get("resource_id") == update.resource_id
-        ),
-        None,
+        .limit(1)
     )
 
 

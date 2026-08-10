@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from typing import Literal
 
@@ -171,16 +172,28 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
+        webhook_drain_task: asyncio.Task[None] | None = None
         if github_webhook_service is not None:
             webhook_batch_size = 100
-            while (
-                await run_in_threadpool(
+            for _pass in range(10):
+                processed = await run_in_threadpool(
                     github_webhook_service.process_pending,
                     limit=webhook_batch_size,
                 )
-                == webhook_batch_size
-            ):
-                pass
+                if processed < webhook_batch_size:
+                    break
+            else:
+                _LOGGER.warning("github webhook backlog remains after startup drain")
+
+            async def drain_github_webhooks() -> None:
+                while True:
+                    processed = await run_in_threadpool(
+                        github_webhook_service.process_pending,
+                        limit=webhook_batch_size,
+                    )
+                    await asyncio.sleep(0 if processed == webhook_batch_size else 1)
+
+            webhook_drain_task = asyncio.create_task(drain_github_webhooks())
         approval_batch_size = 100
         while (
             len(
@@ -211,7 +224,13 @@ def create_app(
             == batch_size
         ):
             pass
-        yield
+        try:
+            yield
+        finally:
+            if webhook_drain_task is not None:
+                webhook_drain_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await webhook_drain_task
 
     application = FastAPI(
         title="Mathews control plane",

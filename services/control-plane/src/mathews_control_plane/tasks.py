@@ -1018,16 +1018,21 @@ def _github_status(events: Sequence[TaskEvent]) -> TaskGitHubStatusResponse:
         None,
     )
     if binding is None:
-        return TaskGitHubStatusResponse(
-            linked=False,
-            ci_status="NOT_LINKED",
-            review_status="NOT_LINKED",
-            checks_total=0,
-            checks_passed=0,
-            blocking_reviews=0,
-            review_comments=0,
-        )
-    head_sha = cast(str, binding.payload.get("head_sha"))
+        return _unlinked_github_status()
+    head_sha = binding.payload.get("head_sha")
+    pull_request_number = binding.payload.get("pull_request_number")
+    task_branch = binding.payload.get("task_branch")
+    if (
+        not isinstance(head_sha, str)
+        or len(head_sha) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in head_sha)
+        or isinstance(pull_request_number, bool)
+        or not isinstance(pull_request_number, int)
+        or pull_request_number <= 0
+        or not isinstance(task_branch, str)
+        or not task_branch
+    ):
+        return _unlinked_github_status()
     latest: dict[tuple[object, object], TaskEvent] = {}
     for event in events:
         if event.event_type not in {
@@ -1075,17 +1080,21 @@ def _github_status(events: Sequence[TaskEvent]) -> TaskGitHubStatusResponse:
         review_status = "COMMENTED"
     else:
         review_status = "NOT_REVIEWED"
-    updated = [
-        datetime.fromisoformat(
-            cast(str, event.payload["source_updated_at"]).replace("Z", "+00:00")
-        )
-        for event in latest.values()
-        if isinstance(event.payload.get("source_updated_at"), str)
-    ]
+    updated: list[datetime] = []
+    for event in latest.values():
+        source_updated_at = event.payload.get("source_updated_at")
+        if not isinstance(source_updated_at, str):
+            continue
+        try:
+            updated.append(
+                datetime.fromisoformat(source_updated_at.replace("Z", "+00:00"))
+            )
+        except ValueError:
+            continue
     return TaskGitHubStatusResponse(
         linked=True,
-        pull_request_number=cast(int, binding.payload.get("pull_request_number")),
-        task_branch=cast(str, binding.payload.get("task_branch")),
+        pull_request_number=pull_request_number,
+        task_branch=task_branch,
         head_sha=head_sha,
         ci_status=ci_status,
         review_status=review_status,
@@ -1094,6 +1103,18 @@ def _github_status(events: Sequence[TaskEvent]) -> TaskGitHubStatusResponse:
         blocking_reviews=sum(state == "CHANGES_REQUESTED" for state in review_states),
         review_comments=open_comments,
         last_updated_at=max(updated, default=None),
+    )
+
+
+def _unlinked_github_status() -> TaskGitHubStatusResponse:
+    return TaskGitHubStatusResponse(
+        linked=False,
+        ci_status="NOT_LINKED",
+        review_status="NOT_LINKED",
+        checks_total=0,
+        checks_passed=0,
+        blocking_reviews=0,
+        review_comments=0,
     )
 
 

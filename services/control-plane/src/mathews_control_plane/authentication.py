@@ -24,6 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from mathews_control_plane.api_paths import GITHUB_WEBHOOK_ENDPOINT
 from mathews_control_plane.database import (
     AuthenticationState,
     AuthSession,
@@ -788,7 +789,7 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             ("POST", "/api/auth/login"),
         }
     )
-    _EXTERNAL_ENDPOINTS = frozenset({("POST", "/api/github/webhooks")})
+    _EXTERNAL_ENDPOINTS = frozenset({("POST", GITHUB_WEBHOOK_ENDPOINT)})
 
     def __init__(
         self,
