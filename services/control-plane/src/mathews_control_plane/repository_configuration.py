@@ -222,6 +222,8 @@ def create_repository_configuration(
 def get_latest_repository_configuration(
     session: Session,
     repository_key: str,
+    *,
+    for_update: bool = False,
 ) -> RepositoryConfigurationRecord | None:
     """Return the authoritative highest version, regardless of its readiness."""
 
@@ -230,13 +232,49 @@ def get_latest_repository_configuration(
         field="repository key",
         maximum=500,
     )
-    return session.scalar(_latest_query(normalized_repository_key))
+    return session.scalar(
+        _latest_query(normalized_repository_key, for_update=for_update)
+    )
 
 
 def repository_configuration_digest(configuration: RepositoryConfigurationRecord) -> str:
     """Hash the host/control-plane canonical execution-configuration payload."""
 
     return _validated_configuration(configuration).digest
+
+
+def validated_repository_configuration(
+    configuration: RepositoryConfigurationRecord,
+) -> ValidatedRepositoryConfiguration:
+    """Return the canonical shared configuration for a persisted version."""
+
+    return _validated_configuration(configuration)
+
+
+def get_repository_preflight_report(
+    session: Session,
+    artifact_store: ArtifactStore,
+    configuration: RepositoryConfigurationRecord,
+) -> ValidatedRepositoryPreflightReport | None:
+    """Return the attached completed report, or ``None`` for no active report."""
+
+    if configuration.preflight_evidence_id is None:
+        return None
+    evidence, payload = _load_attached_evidence(
+        session,
+        artifact_store,
+        configuration,
+        for_update=False,
+    )
+    if evidence.evidence_type == _PREFLIGHT_REQUEST_EVIDENCE_TYPE:
+        return None
+    repository_key, report = _decode_canonical_report(payload)
+    if repository_key != configuration.repository_key:
+        raise RepositoryPreflightNotReadyError(
+            "preflight evidence repository does not match the configuration"
+        )
+    _validated_report_binding(configuration, report)
+    return report
 
 
 def _validated_configuration(
@@ -434,6 +472,45 @@ def capture_preflight_report(
     )
 
 
+def clear_preflight_attempt(
+    session: Session,
+    artifact_store: ArtifactStore,
+    *,
+    attempt: RepositoryPreflightAttempt,
+) -> None:
+    """Detach an exact control-plane request that never produced a host report."""
+
+    configuration = session.scalar(
+        select(RepositoryConfigurationRecord)
+        .where(RepositoryConfigurationRecord.id == attempt.configuration_id)
+        .with_for_update()
+    )
+    if configuration is None:
+        raise RepositoryConfigurationNotFoundError("repository configuration not found")
+    latest = session.scalar(_latest_query(configuration.repository_key, for_update=True))
+    if latest is None or latest.id != configuration.id:
+        raise RepositoryPreflightBindingError(
+            "failed preflight attempt is not for the authoritative configuration"
+        )
+    if configuration.preflight_evidence_id != attempt.attempt_id:
+        raise RepositoryPreflightBindingError("failed preflight attempt is no longer active")
+    evidence, payload = _load_attached_evidence(session, artifact_store, configuration)
+    expected_binding = {
+        "attempt_id": str(attempt.attempt_id),
+        "configuration_id": str(attempt.configuration_id),
+        "repository_key": attempt.repository_key,
+        "configuration_version": attempt.configuration_version,
+        "configuration_digest": attempt.configuration_digest,
+    }
+    if (
+        evidence.evidence_type != _PREFLIGHT_REQUEST_EVIDENCE_TYPE
+        or _decode_preflight_request(payload) != expected_binding
+    ):
+        raise RepositoryPreflightBindingError("failed preflight attempt binding is invalid")
+    configuration.preflight_evidence_id = None
+    session.flush()
+
+
 def require_preflight_ready(
     session: Session,
     artifact_store: ArtifactStore,
@@ -585,16 +662,17 @@ def _load_attached_evidence(
     session: Session,
     artifact_store: ArtifactStore,
     configuration: RepositoryConfigurationRecord,
+    *,
+    for_update: bool = True,
 ) -> tuple[EvidenceRecord, bytes]:
     if configuration.preflight_evidence_id is None:
         raise RepositoryPreflightNotReadyError(
             "authoritative repository configuration has no preflight evidence"
         )
-    evidence = session.scalar(
-        select(EvidenceRecord)
-        .where(EvidenceRecord.id == configuration.preflight_evidence_id)
-        .with_for_update()
+    evidence_query = select(EvidenceRecord).where(
+        EvidenceRecord.id == configuration.preflight_evidence_id
     )
+    evidence = session.scalar(evidence_query.with_for_update() if for_update else evidence_query)
     valid_type_and_origin = evidence is not None and (
         (
             evidence.evidence_type == _PREFLIGHT_EVIDENCE_TYPE

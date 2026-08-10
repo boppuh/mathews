@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -35,11 +36,21 @@ from mathews_control_plane.evidence import (
     EvidenceService,
     create_evidence_router,
 )
+from mathews_control_plane.hermes_adapter import KeychainSecretProvider
+from mathews_control_plane.host_gateway import (
+    HostGatewayError,
+    configured_local_host_gateway,
+)
 from mathews_control_plane.reliability import (
     OwnedProcessTerminator,
     OwnedWorkspaceCleaner,
     ReconciliationAdapter,
     StartupRecoveryService,
+)
+from mathews_control_plane.repositories import (
+    RepositoryBodyLimitMiddleware,
+    RepositoryService,
+    create_repository_router,
 )
 from mathews_control_plane.settings import Settings, settings
 from mathews_control_plane.tasks import (
@@ -47,6 +58,8 @@ from mathews_control_plane.tasks import (
     TaskService,
     create_task_router,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class HealthResponse(BaseModel):
@@ -65,6 +78,7 @@ def create_app(
     evidence_service: EvidenceService | None = None,
     task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
+    repository_service: RepositoryService | None = None,
     startup_recovery_service: StartupRecoveryService | None = None,
     startup_recovery_adapters: Mapping[
         ReconciliationTargetKind,
@@ -104,6 +118,25 @@ def create_app(
         approval_service = ApprovalService(
             session_factory,
             artifact_store,
+        )
+    if repository_service is None:
+        host_gateway = None
+        if current_settings.automation_ready:
+            try:
+                host_gateway = configured_local_host_gateway(
+                    current_settings.require_automation_configuration(),
+                    secrets=KeychainSecretProvider(),
+                )
+            except HostGatewayError as error:
+                _LOGGER.warning(
+                    "repository host gateway is unavailable",
+                    extra={"host_gateway_code": error.code},
+                )
+                host_gateway = None
+        repository_service = RepositoryService(
+            session_factory,
+            artifact_store,
+            host_gateway=host_gateway,
         )
     if startup_recovery_service is None:
         startup_recovery_service = StartupRecoveryService(
@@ -159,11 +192,13 @@ def create_app(
     application.state.evidence_service = evidence_service
     application.state.task_service = task_service
     application.state.approval_service = approval_service
+    application.state.repository_service = repository_service
     application.state.startup_recovery_service = startup_recovery_service
     application.include_router(create_authentication_router(authentication_service))
     application.include_router(create_evidence_router(evidence_service))
     application.include_router(create_task_router(task_service))
     application.include_router(create_approval_router(approval_service))
+    application.include_router(create_repository_router(repository_service))
 
     @application.exception_handler(RequestValidationError)
     async def sanitized_validation_error(
@@ -196,6 +231,7 @@ def create_app(
     application.add_middleware(EvidenceBodyLimitMiddleware)
     application.add_middleware(TaskBodyLimitMiddleware)
     application.add_middleware(ApprovalBodyLimitMiddleware)
+    application.add_middleware(RepositoryBodyLimitMiddleware)
     # CORS is the outer layer so even authentication failures carry the exact
     # trusted-origin response headers expected by browser clients.
     application.add_middleware(

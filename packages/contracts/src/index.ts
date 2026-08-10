@@ -181,6 +181,82 @@ export interface CreateTaskRequest {
   request: string;
 }
 
+export type RepositoryJsonValue =
+  | boolean
+  | number
+  | string
+  | null
+  | RepositoryJsonValue[]
+  | { [key: string]: RepositoryJsonValue };
+
+export interface RepositorySecretStatus {
+  push_credential_configured: boolean;
+  e2e_test_account_configured: boolean;
+  additional_reference_count: number;
+}
+
+export interface RepositoryConfigurationProjection {
+  id: string;
+  repository_key: string;
+  version: number;
+  digest: string;
+  created_at: string;
+  actor_id: string;
+  repository_settings: Record<string, RepositoryJsonValue>;
+  git_settings: Record<string, RepositoryJsonValue>;
+  xcode_settings: Record<string, RepositoryJsonValue>;
+  operations: RepositoryJsonValue[];
+  e2e_assertions: RepositoryJsonValue[];
+  artifact_settings: Record<string, RepositoryJsonValue>;
+  prohibited_paths: RepositoryJsonValue[];
+  secrets: RepositorySecretStatus;
+}
+
+export interface RepositoryPreflightCheck {
+  code: string;
+  status: "PASSED" | "BLOCKED";
+  detail_code: string;
+}
+
+export interface RepositoryPreflightProjection {
+  status: "NOT_RUN" | "RUNNING" | "PASSED" | "BLOCKED";
+  attempt_id: string | null;
+  configuration_id: string | null;
+  configuration_version: number | null;
+  configuration_digest: string | null;
+  resolved_base_sha: string | null;
+  checks: RepositoryPreflightCheck[];
+}
+
+export interface RepositoryProjection {
+  repository_key: string;
+  configured: boolean;
+  mutation_blocked: boolean;
+  configuration: RepositoryConfigurationProjection | null;
+  preflight: RepositoryPreflightProjection;
+  host_available: boolean;
+}
+
+export interface RepositorySecretUpdates {
+  push_credential?: string;
+  e2e_test_account?: string;
+  additional?: string[];
+}
+
+export interface RepositoryConfigurationWriteRequest {
+  repository_key: string;
+  expected_configuration_version: number | null;
+  repository_settings: Record<string, RepositoryJsonValue>;
+  git_settings: Record<string, RepositoryJsonValue>;
+  xcode_settings: Record<string, RepositoryJsonValue>;
+  operations: RepositoryJsonValue[];
+  e2e_assertions: RepositoryJsonValue[];
+  artifact_settings: Record<string, RepositoryJsonValue>;
+  prohibited_paths: RepositoryJsonValue[];
+  secret_updates: RepositorySecretUpdates;
+  approve_sensitive_change: boolean;
+}
+
 export const TASK_STEERING_IMPACTS = ["ACCEPTANCE_CRITERIA", "PATHS", "RISK", "TESTS"] as const;
 
 export type TaskSteeringImpact = (typeof TASK_STEERING_IMPACTS)[number];

@@ -122,6 +122,9 @@ export function TaskWorkspace() {
           </p>
         </div>
         <div className="work-header-actions">
+          <Link href="/repository" className="inbox-link">
+            Repository readiness
+          </Link>
           <Link href="/inbox" className="inbox-link">
             Decision inbox →
           </Link>
