@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  evidenceClient,
+  evidenceDownloadUrl,
   LatestTaskDetailLoader,
   LatestTaskListLoader,
   TaskRequestError,
@@ -18,6 +20,20 @@ const task = {
   last_activity_at: "2026-07-30T12:00:00Z",
   blockers: [],
   cockpit_path: "/tasks/11111111-1111-4111-8111-111111111111",
+};
+
+const evidence = {
+  id: "33333333-3333-4333-8333-333333333333",
+  evidence_type: "test-log",
+  captured_at: "2026-07-30T12:00:00Z",
+  status: "AVAILABLE" as const,
+  category: "LOG" as const,
+  content_access: "AVAILABLE" as const,
+  correction_of_id: null,
+  corrected_by_id: null,
+  deletion_reason: null,
+  deleted_at: null,
+  download_path: "/api/evidence/33333333-3333-4333-8333-333333333333/download",
 };
 
 afterEach(() => {
@@ -87,6 +103,7 @@ describe("taskClient", () => {
         resume_state: null,
       },
       events: [],
+      acceptance_criteria: [],
       evidence: [],
       approvals: [],
     };
@@ -143,6 +160,74 @@ describe("taskClient", () => {
   });
 });
 
+describe("evidenceClient", () => {
+  it("loads and formats credentialed redacted JSON on demand", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ result: "passed" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(evidenceClient.content(evidence)).resolves.toEqual({
+      text: '{\n  "result": "passed"\n}',
+      mediaType: "application/json",
+    });
+    expect(evidenceDownloadUrl(evidence)).toBe(`http://localhost:8000${evidence.download_path}`);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://localhost:8000${evidence.download_path}`,
+      expect.objectContaining({ credentials: "include", method: "GET" }),
+    );
+  });
+
+  it("never requests restricted evidence or a mismatched download path", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      evidenceClient.content({ ...evidence, download_path: "/api/evidence/other/download" }),
+    ).rejects.toMatchObject({ status: 404, message: "This evidence content is unavailable." });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not expose download error bodies", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("sensitive backend detail", {
+          status: 404,
+          headers: { "Content-Type": "text/plain" },
+        }),
+      ),
+    );
+
+    await expect(evidenceClient.content(evidence)).rejects.toMatchObject({
+      status: 404,
+      message: "This evidence content is unavailable.",
+    });
+  });
+
+  it("rejects an oversized preview before reading its body", async () => {
+    const textSpy = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          "Content-Type": "text/plain",
+          "Content-Length": String(1024 * 1024 + 1),
+        }),
+        text: textSpy,
+      }),
+    );
+
+    await expect(evidenceClient.content(evidence)).rejects.toMatchObject({ status: 413 });
+    expect(textSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe("LatestTaskListLoader", () => {
   it("drops an older failure after a newer list request wins", async () => {
     let rejectOlder: ((error: Error) => void) | undefined;
@@ -186,6 +271,7 @@ describe("LatestTaskDetailLoader", () => {
       resume_state: null,
     },
     events: [],
+    acceptance_criteria: [],
     evidence: [],
     approvals: [],
   };

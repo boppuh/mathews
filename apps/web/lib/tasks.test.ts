@@ -72,12 +72,27 @@ describe("task cockpit parsing", () => {
         evidence_count: 1,
       },
     ],
+    acceptance_criteria: [
+      {
+        id: "criterion-1",
+        requirement: "The task can be inspected without leaving the cockpit.",
+        verification: "HUMAN_INSPECTION",
+        status: "PENDING",
+      },
+    ],
     evidence: [
       {
         id: "33333333-3333-4333-8333-333333333333",
         evidence_type: "task-request",
         captured_at: "2026-07-30T12:00:00Z",
         status: "AVAILABLE",
+        category: "OTHER",
+        content_access: "AVAILABLE",
+        correction_of_id: null,
+        corrected_by_id: null,
+        deletion_reason: null,
+        deleted_at: null,
+        download_path: "/api/evidence/33333333-3333-4333-8333-333333333333/download",
       },
     ],
     approvals: [
@@ -98,11 +113,37 @@ describe("task cockpit parsing", () => {
     expect(parseTaskEvent(cockpit.events[0])).toEqual(cockpit.events[0]);
   });
 
+  it("accepts a legacy deletion without a structured reason", () => {
+    const deletedEvidence = {
+      ...cockpit.evidence[0],
+      status: "DELETED",
+      content_access: "DELETED",
+      deleted_at: "2026-07-30T12:02:00Z",
+      download_path: null,
+    };
+
+    expect(parseTaskCockpit({ ...cockpit, evidence: [deletedEvidence] }).evidence).toEqual([
+      deletedEvidence,
+    ]);
+  });
+
   it.each([
     { ...cockpit, state_context: { ...cockpit.state_context, kind: "MERGED" } },
     { ...cockpit, events: [{ ...cockpit.events[0], sequence: 0 }] },
     { ...cockpit, events: [{ ...cockpit.events[0], kind: "RAW_OUTPUT" }] },
     { ...cockpit, evidence: [{ ...cockpit.evidence[0], evidence_type: "../secret" }] },
+    {
+      ...cockpit,
+      evidence: [{ ...cockpit.evidence[0], download_path: "https://example.com/secret" }],
+    },
+    {
+      ...cockpit,
+      evidence: [{ ...cockpit.evidence[0], status: "DELETED", content_access: "DELETED" }],
+    },
+    {
+      ...cockpit,
+      acceptance_criteria: [{ ...cockpit.acceptance_criteria[0], verification: "SHELL" }],
+    },
     { ...cockpit, approvals: [{ ...cockpit.approvals[0], status: "UNKNOWN" }] },
   ])("rejects unsafe cockpit projections", (value) => {
     expect(() => parseTaskCockpit(value)).toThrow("control plane returned");

@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 from uuid import UUID
 
 import pytest
@@ -31,7 +31,10 @@ from mathews_control_plane.domain_models import (
     ApprovalRequest,
     ApprovalRequestType,
     ApprovalStatus,
+    Brief,
+    EvidenceDeletionRequest,
     EvidenceRecord,
+    EvidenceTombstone,
     ReconciliationStatus,
     ReconciliationTarget,
     ReconciliationTargetKind,
@@ -40,7 +43,13 @@ from mathews_control_plane.domain_models import (
     TaskEventEvidenceReference,
     TaskState,
 )
-from mathews_control_plane.evidence import load_evidence
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+    load_evidence,
+)
 from mathews_control_plane.settings import Settings
 from mathews_control_plane.tasks import (
     MAX_TASK_EVENT_SEQUENCE,
@@ -58,6 +67,14 @@ from sqlalchemy import Engine, func, select
 _ORIGIN = "http://localhost:3000"
 _PASSWORD = "correct horse battery staple"
 _BASE_SHA = "A" * 40
+
+
+class _RecordContext(TypedDict):
+    owner_id: str
+    actor_id: str
+    root_correlation_id: UUID
+    causation_id: UUID
+    parent_correlation_id: UUID
 
 
 @dataclass(slots=True)
@@ -388,11 +405,189 @@ def test_cockpit_projects_durable_history_evidence_and_approvals_without_payload
     assert cockpit["events"][0]["evidence_count"] == 1
     assert cockpit["events"][1]["evidence_count"] == 0
     assert cockpit["events"][0]["occurred_at"].endswith("Z")
+    assert cockpit["acceptance_criteria"] == []
     assert len(cockpit["evidence"]) == 1
     assert cockpit["evidence"][0]["evidence_type"] == "task-request"
-    assert cockpit["evidence"][0]["status"] == "AVAILABLE"
+    assert cockpit["evidence"][0] == {
+        "id": cockpit["evidence"][0]["id"],
+        "evidence_type": "task-request",
+        "captured_at": cockpit["evidence"][0]["captured_at"],
+        "status": "AVAILABLE",
+        "category": "OTHER",
+        "content_access": "AVAILABLE",
+        "correction_of_id": None,
+        "corrected_by_id": None,
+        "deletion_reason": None,
+        "deleted_at": None,
+        "download_path": (
+            f"/api/evidence/{cockpit['evidence'][0]['id']}/download"
+        ),
+    }
     assert cockpit["approvals"][0]["type_label"] == "Brief approval"
     assert cockpit["approvals"][0]["status"] == "PENDING"
+
+
+def test_cockpit_projects_criteria_lineage_access_fences_and_tombstones(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    created = _create(task_harness, csrf_token, request="Inspect delivery evidence")
+    task_id = UUID(str(created["id"]))
+
+    with task_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        context: _RecordContext = {
+            "owner_id": task.owner_id,
+            "actor_id": "control-plane",
+            "root_correlation_id": task.root_correlation_id,
+            "causation_id": task.id,
+            "parent_correlation_id": task.id,
+        }
+        brief = Brief(
+            task_id=task.id,
+            version=1,
+            scope={"summary": "evidence views"},
+            exclusions=[],
+            acceptance_criteria=[
+                {
+                    "criterion_id": "criterion-1",
+                    "requirement": "Redacted logs are searchable on demand.",
+                    "verification": "HUMAN_INSPECTION",
+                },
+                {
+                    "criterion_id": "criterion-1",
+                    "requirement": "A stale duplicate must not break the cockpit.",
+                    "verification": "STATIC_CHECK",
+                },
+            ],
+            risks=[],
+            affected_flow={"id": "task-cockpit"},
+            test_plan=[],
+            **context,
+        )
+        session.add(brief)
+        session.flush()
+        task.accepted_brief_id = brief.id
+
+        original = capture_evidence(
+            session,
+            task_harness.store,
+            payload="first build failed",
+            media_type="text/plain; charset=utf-8",
+            source_kind=EvidenceSourceKind.TOOL_OPERATION,
+            evidence_type="xcodebuild-log",
+            origin="host-agent:xcodebuild",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+            task_id=task.id,
+            captured_at=task_harness.clock.now,
+            **context,
+        ).record
+        correction = capture_evidence(
+            session,
+            task_harness.store,
+            payload="corrected build result",
+            media_type="text/plain; charset=utf-8",
+            source_kind=EvidenceSourceKind.TOOL_OPERATION,
+            evidence_type="xcodebuild-log",
+            origin="host-agent:xcodebuild",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+            task_id=task.id,
+            correction_of_id=original.id,
+            captured_at=task_harness.clock.now + timedelta(seconds=1),
+            **context,
+        ).record
+        protected = capture_evidence(
+            session,
+            task_harness.store,
+            payload={"request": "GET /health", "status": 200},
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.TOOL_OPERATION,
+            evidence_type="network-trace",
+            origin="simulator:network",
+            access_classification=EvidenceAccessClass.RECENT_PASSWORD,
+            retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+            task_id=task.id,
+            captured_at=task_harness.clock.now + timedelta(seconds=2),
+            **context,
+        ).record
+        deleted = capture_evidence(
+            session,
+            task_harness.store,
+            payload="screenshot bytes represented safely",
+            media_type="text/plain; charset=utf-8",
+            source_kind=EvidenceSourceKind.RESULT,
+            evidence_type="simulator-screenshot",
+            origin="simulator:screen",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+            task_id=task.id,
+            captured_at=task_harness.clock.now + timedelta(seconds=3),
+            **context,
+        ).record
+        capture_evidence(
+            session,
+            task_harness.store,
+            payload="internal diagnostic",
+            media_type="text/plain; charset=utf-8",
+            source_kind=EvidenceSourceKind.TOOL_OPERATION,
+            evidence_type="private-debug-log",
+            origin="control-plane:internal",
+            access_classification=EvidenceAccessClass.INTERNAL,
+            retention_policy=EvidenceRetentionClass.AUDIT,
+            task_id=task.id,
+            captured_at=task_harness.clock.now + timedelta(seconds=4),
+            **context,
+        )
+        deletion_request = EvidenceDeletionRequest(
+            evidence_id=deleted.id,
+            reason_code="USER_REQUEST",
+            requested_at=task_harness.clock.now + timedelta(seconds=5),
+            **context,
+        )
+        session.add(deletion_request)
+        session.flush()
+        session.add(
+            EvidenceTombstone(
+                evidence_id=deleted.id,
+                deletion_request_id=deletion_request.id,
+                reason_code=deletion_request.reason_code,
+                deleted_at=task_harness.clock.now + timedelta(seconds=6),
+                removed_derivative_count=0,
+                **context,
+            )
+        )
+
+    task_harness.clock.advance(timedelta(minutes=6))
+    response = task_harness.client.get(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200, response.text
+    cockpit = response.json()
+    assert cockpit["acceptance_criteria"] == [
+        {
+            "id": "criterion-1",
+            "requirement": "Redacted logs are searchable on demand.",
+            "verification": "HUMAN_INSPECTION",
+            "status": "PENDING",
+        }
+    ]
+    by_id = {item["id"]: item for item in cockpit["evidence"]}
+    assert len(by_id) == 5
+    assert by_id[str(original.id)]["status"] == "SUPERSEDED"
+    assert by_id[str(original.id)]["category"] == "LOG"
+    assert by_id[str(original.id)]["corrected_by_id"] == str(correction.id)
+    assert by_id[str(correction.id)]["status"] == "CORRECTION"
+    assert by_id[str(correction.id)]["correction_of_id"] == str(original.id)
+    assert by_id[str(protected.id)]["category"] == "NETWORK"
+    assert by_id[str(protected.id)]["content_access"] == "RECENT_PASSWORD_REQUIRED"
+    assert by_id[str(protected.id)]["download_path"] is None
+    assert by_id[str(deleted.id)]["status"] == "DELETED"
+    assert by_id[str(deleted.id)]["category"] == "ARTIFACT"
+    assert by_id[str(deleted.id)]["deletion_reason"] == "USER_REQUEST"
+    assert by_id[str(deleted.id)]["deleted_at"].endswith("Z")
+    assert by_id[str(deleted.id)]["download_path"] is None
 
 
 @pytest.mark.parametrize(

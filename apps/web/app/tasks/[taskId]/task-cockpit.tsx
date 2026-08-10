@@ -11,6 +11,7 @@ import {
   taskEventStreamUrl,
 } from "../../../lib/task-client";
 import { parseTaskEvent, shortRevision } from "../../../lib/tasks";
+import { EvidenceWorkbench } from "./evidence-workbench";
 
 type CockpitState =
   | { status: "loading" }
@@ -31,14 +32,6 @@ function formatTimestamp(timestamp: string): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(timestamp));
-}
-
-function evidenceLabel(value: string): string {
-  return value
-    .split(/[-_.]/)
-    .filter(Boolean)
-    .map((part) => part[0]?.toUpperCase() + part.slice(1).toLowerCase())
-    .join(" ");
 }
 
 function failureMessage(error: unknown): string {
@@ -174,6 +167,20 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
     };
   }, [loadCockpit, readyTaskId, taskId]);
 
+  useEffect(() => {
+    if (readyTaskId !== taskId) {
+      return;
+    }
+    const controller = new AbortController();
+    const refreshInterval = window.setInterval(() => {
+      void loadCockpit(controller.signal, true);
+    }, 30_000);
+    return () => {
+      window.clearInterval(refreshInterval);
+      controller.abort();
+    };
+  }, [loadCockpit, readyTaskId, taskId]);
+
   if (state.status === "loading") {
     return (
       <main className="task-cockpit cockpit-centered" aria-busy="true">
@@ -205,7 +212,14 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
     );
   }
 
-  const { task, state_context: stateContext, events, evidence, approvals } = state.cockpit;
+  const {
+    task,
+    state_context: stateContext,
+    events,
+    acceptance_criteria: acceptanceCriteria,
+    evidence,
+    approvals,
+  } = state.cockpit;
   const visitedStates = new Set(
     events.flatMap((event) => [event.from_state, event.to_state]).filter(Boolean),
   );
@@ -220,6 +234,7 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
         <nav className="cockpit-nav" aria-label="Task cockpit sections">
           <a href="#timeline">Timeline</a>
           <a href="#activity">Activity</a>
+          <a href="#acceptance">Criteria</a>
           <a href="#evidence">Evidence</a>
           <a href="#decisions">Decisions</a>
         </nav>
@@ -368,38 +383,13 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
               <p className="approval-clear">No human decision requests recorded.</p>
             )}
           </section>
-
-          <section id="evidence" className="cockpit-panel" aria-labelledby="evidence-heading">
-            <div className="cockpit-section-heading">
-              <div>
-                <p className="eyebrow">Verification ledger</p>
-                <h2 id="evidence-heading">Evidence checklist</h2>
-              </div>
-              <span className="decision-count">{evidence.length}</span>
-            </div>
-            {evidence.length === 0 ? (
-              <p className="cockpit-empty">Evidence will appear as work is verified.</p>
-            ) : (
-              <ul className="evidence-checklist">
-                {evidence.map((record) => (
-                  <li key={record.id}>
-                    <span
-                      className={`evidence-status evidence-${record.status.toLowerCase()}`}
-                      aria-hidden="true"
-                    />
-                    <div>
-                      <strong>{evidenceLabel(record.evidence_type)}</strong>
-                      <small>
-                        {record.status.toLowerCase()} · {formatTimestamp(record.captured_at)}
-                      </small>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
         </aside>
       </div>
+      <EvidenceWorkbench
+        criteria={acceptanceCriteria}
+        evidence={evidence}
+        onRefresh={() => loadCockpit(undefined, true)}
+      />
     </main>
   );
 }

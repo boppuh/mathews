@@ -1,6 +1,7 @@
 import type {
   CreateTaskRequest,
   TaskCockpitResponse,
+  TaskEvidenceSummary,
   TaskListResponse,
   TaskSummary,
 } from "@mathews/contracts";
@@ -9,10 +10,24 @@ import { cookieValue, normalizeControlPlaneUrl } from "./auth";
 import { parseTaskCockpit, parseTaskList, parseTaskSummary } from "./tasks";
 
 const CSRF_COOKIE_NAME = "__Host-mathews-csrf";
+const MAX_EVIDENCE_CONTENT_BYTES = 1024 * 1024;
+const MAX_EVIDENCE_PREVIEW_CHARACTERS = 4 * 1024 * 1024;
 const controlPlaneUrl = normalizeControlPlaneUrl(process.env.NEXT_PUBLIC_CONTROL_PLANE_URL);
 
 export function taskEventStreamUrl(taskId: string): string {
   return `${controlPlaneUrl}/api/tasks/${encodeURIComponent(taskId)}/events`;
+}
+
+export interface EvidenceContent {
+  text: string;
+  mediaType: "application/json" | "text/plain";
+}
+
+export function evidenceDownloadUrl(record: TaskEvidenceSummary): string | null {
+  const expectedPath = `/api/evidence/${record.id}/download`;
+  return record.content_access === "AVAILABLE" && record.download_path === expectedPath
+    ? `${controlPlaneUrl}${expectedPath}`
+    : null;
 }
 
 export class TaskRequestError extends Error {
@@ -91,6 +106,53 @@ export const taskClient = {
       "Unable to load the task cockpit.",
     );
     return parseTaskCockpit(await response.json());
+  },
+};
+
+export const evidenceClient = {
+  async content(record: TaskEvidenceSummary, signal?: AbortSignal): Promise<EvidenceContent> {
+    const url = evidenceDownloadUrl(record);
+    if (!url) {
+      throw new TaskRequestError("This evidence content is unavailable.", 404);
+    }
+    const response = await fetch(url, {
+      method: "GET",
+      credentials: "include",
+      headers: { Accept: "application/json, text/plain" },
+      signal,
+    });
+    if (!response.ok) {
+      throw new TaskRequestError(
+        response.status === 401
+          ? "Your session expired. Refresh the page and sign in again."
+          : "This evidence content is unavailable.",
+        response.status,
+      );
+    }
+    const contentType = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim();
+    if (contentType !== "application/json" && contentType !== "text/plain") {
+      throw new TaskRequestError("This evidence format cannot be previewed safely.", 415);
+    }
+    const contentLength = Number(response.headers.get("Content-Length"));
+    if (Number.isFinite(contentLength) && contentLength > MAX_EVIDENCE_CONTENT_BYTES) {
+      throw new TaskRequestError("This evidence content is too large to preview.", 413);
+    }
+    const raw = await response.text();
+    if (new TextEncoder().encode(raw).byteLength > MAX_EVIDENCE_CONTENT_BYTES) {
+      throw new TaskRequestError("This evidence content is too large to preview.", 413);
+    }
+    let text = raw;
+    if (contentType === "application/json") {
+      try {
+        text = JSON.stringify(JSON.parse(raw), null, 2);
+      } catch {
+        throw new TaskRequestError("This evidence content is malformed.", 502);
+      }
+    }
+    if (text.length > MAX_EVIDENCE_PREVIEW_CHARACTERS) {
+      throw new TaskRequestError("This evidence content is too large to preview.", 413);
+    }
+    return { text, mediaType: contentType };
   },
 };
 
