@@ -38,6 +38,9 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
 )
+from mathews_control_plane.repository_configuration import (
+    repository_configuration_digest,
+)
 
 VALIDATION_EVIDENCE_EVENT_TYPE = "VALIDATION_EVIDENCE_COLLECTED"
 VALIDATION_EVIDENCE_SCHEMA_VERSION = 1
@@ -332,11 +335,17 @@ class ValidationEvidenceService:
         *,
         principal_id: str = "local-user",
         clock: Callable[[], datetime] | None = None,
+        configuration_digest: Callable[[RepositoryConfiguration], str] | None = None,
     ) -> None:
         self._factory = session_factory
         self._store = artifact_store
         self._principal_id = principal_id
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._configuration_digest = (
+            repository_configuration_digest
+            if configuration_digest is None
+            else configuration_digest
+        )
 
     def collect(self, collection: ValidationEvidenceCollection) -> ValidationEvidenceResult:
         now = _as_utc(self._clock())
@@ -394,12 +403,17 @@ class ValidationEvidenceService:
             operation_ids = _required_operation_ids(contract.required_operations)
             if {result.operation_id for result in collection.operation_results} != operation_ids:
                 raise ValidationEvidenceError("OPERATION_RESULTS_INCOMPLETE")
+            try:
+                configuration_digest = self._configuration_digest(configuration)
+            except ValueError:
+                raise ValidationEvidenceError("CONFIGURATION_BINDING_INVALID") from None
             for operation in collection.operation_results:
                 _validate_operation_binding(
                     operation,
                     collection=collection,
                     contract=contract,
                     configuration=configuration,
+                    configuration_digest=configuration_digest,
                     evidence_by_key=evidence_by_key,
                 )
 
@@ -690,6 +704,7 @@ def _validate_operation_binding(
     collection: ValidationEvidenceCollection,
     contract: ValidationContract,
     configuration: RepositoryConfiguration,
+    configuration_digest: str,
     evidence_by_key: Mapping[str, ValidationEvidenceItem],
 ) -> None:
     if (
@@ -697,7 +712,7 @@ def _validate_operation_binding(
         or result.tree_sha != collection.tree_sha
         or result.configuration_id != configuration.id
         or result.configuration_version != configuration.version
-        or result.configuration_digest != _bound_configuration_digest(configuration)
+        or result.configuration_digest != configuration_digest
         or result.validation_contract_version != contract.version
     ):
         raise ValidationEvidenceError("OPERATION_BINDING_MISMATCH")
@@ -765,32 +780,6 @@ def _simulator_target(
     if len(targets) > 1:
         raise ValidationEvidenceError("SIMULATOR_TARGET_AMBIGUOUS")
     return targets[0] if targets else None
-
-
-def _bound_configuration_digest(configuration: RepositoryConfiguration) -> str:
-    payload = {
-        "repository_key": configuration.repository_key,
-        "version": configuration.version,
-        "repository_settings": configuration.repository_settings,
-        "git_settings": configuration.git_settings,
-        "xcode_settings": configuration.xcode_settings,
-        "operations": configuration.operations,
-        "e2e_assertions": configuration.e2e_assertions,
-        "artifact_settings": configuration.artifact_settings,
-        "prohibited_paths": configuration.prohibited_paths,
-        "secret_references": configuration.secret_references,
-    }
-    try:
-        canonical = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode()
-    except (TypeError, ValueError):
-        raise ValidationEvidenceError("CONFIGURATION_BINDING_INVALID") from None
-    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
 def _validate_simulator_target(value: Mapping[str, object] | None) -> None:

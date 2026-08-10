@@ -38,13 +38,13 @@ from mathews_control_plane.validation_evidence import (
     ValidationEvidenceService,
     ValidationEvidenceType,
     ValidationOperationResult,
-    _bound_configuration_digest,
 )
 from sqlalchemy import func, select
 
 _NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 _COMMIT_SHA = "a" * 40
 _TREE_SHA = "b" * 40
+_CONFIGURATION_DIGEST = f"sha256:{'c' * 64}"
 
 
 def _context(root_id: UUID) -> dict[str, object]:
@@ -59,7 +59,7 @@ def _context(root_id: UUID) -> dict[str, object]:
     }
 
 
-def _seed(factory: SessionFactory) -> tuple[UUID, UUID, UUID, str]:
+def _seed(factory: SessionFactory) -> tuple[UUID, UUID, UUID]:
     root_id = uuid4()
     task_id = uuid4()
     with factory.begin() as session:
@@ -181,12 +181,7 @@ def _seed(factory: SessionFactory) -> tuple[UUID, UUID, UUID, str]:
         task.repository_configuration_id = configuration.id
         task.validation_contract_id = contract.id
         session.flush()
-        return (
-            task.id,
-            configuration.id,
-            contract.id,
-            _bound_configuration_digest(configuration),
-        )
+        return task.id, configuration.id, contract.id
 
 
 def _evidence() -> tuple[ValidationEvidenceItem, ...]:
@@ -309,29 +304,34 @@ def _collection(
 @pytest.fixture
 def validation_harness(
     tmp_path: Path,
-) -> Iterator[tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID, str]]:
+) -> Iterator[tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID]]:
     engine = create_database_engine(f"sqlite:///{tmp_path / 'validation.sqlite3'}")
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     store = ArtifactStore(tmp_path / "artifacts")
-    task_id, configuration_id, contract_id, configuration_digest = _seed(factory)
+    task_id, configuration_id, contract_id = _seed(factory)
     try:
-        yield factory, store, task_id, configuration_id, contract_id, configuration_digest
+        yield factory, store, task_id, configuration_id, contract_id
     finally:
         engine.dispose()
 
 
 def test_collects_typed_direct_evidence_and_projects_each_criterion(
-    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID, str],
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
 ) -> None:
-    factory, store, task_id, configuration_id, contract_id, digest = validation_harness
+    factory, store, task_id, configuration_id, contract_id = validation_harness
     collection = _collection(
         task_id,
         configuration_id,
         contract_id,
-        configuration_digest=digest,
+        configuration_digest=_CONFIGURATION_DIGEST,
     )
-    service = ValidationEvidenceService(factory, store, clock=lambda: _NOW)
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
 
     result = service.collect(collection)
 
@@ -387,17 +387,47 @@ def test_collects_typed_direct_evidence_and_projects_each_criterion(
 
 
 def test_rejects_mismatched_host_head_without_partial_records(
-    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID, str],
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
 ) -> None:
-    factory, store, task_id, configuration_id, contract_id, digest = validation_harness
+    factory, store, task_id, configuration_id, contract_id = validation_harness
     collection = _collection(
         task_id,
         configuration_id,
         contract_id,
         head_sha="e" * 40,
-        configuration_digest=digest,
+        configuration_digest=_CONFIGURATION_DIGEST,
     )
-    service = ValidationEvidenceService(factory, store, clock=lambda: _NOW)
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
+
+    with pytest.raises(ValidationEvidenceError, match="OPERATION_BINDING_MISMATCH"):
+        service.collect(collection)
+
+    with factory() as session:
+        assert session.scalar(select(func.count(ValidationRun.id))) == 0
+        assert session.scalar(select(func.count(EvidenceRecord.id))) == 0
+
+
+def test_rejects_digest_that_differs_from_authoritative_configuration(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: f"sha256:{'d' * 64}",
+    )
 
     with pytest.raises(ValidationEvidenceError, match="OPERATION_BINDING_MISMATCH"):
         service.collect(collection)
@@ -408,16 +438,21 @@ def test_rejects_mismatched_host_head_without_partial_records(
 
 
 def test_same_run_id_replays_without_duplicate_evidence(
-    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID, str],
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
 ) -> None:
-    factory, store, task_id, configuration_id, contract_id, digest = validation_harness
+    factory, store, task_id, configuration_id, contract_id = validation_harness
     collection = _collection(
         task_id,
         configuration_id,
         contract_id,
-        configuration_digest=digest,
+        configuration_digest=_CONFIGURATION_DIGEST,
     )
-    service = ValidationEvidenceService(factory, store, clock=lambda: _NOW)
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
 
     first = service.collect(collection)
     replay = service.collect(collection)
@@ -434,16 +469,21 @@ def test_same_run_id_replays_without_duplicate_evidence(
 
 
 def test_same_run_id_rejects_changed_evidence_metadata(
-    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID, str],
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
 ) -> None:
-    factory, store, task_id, configuration_id, contract_id, digest = validation_harness
+    factory, store, task_id, configuration_id, contract_id = validation_harness
     collection = _collection(
         task_id,
         configuration_id,
         contract_id,
-        configuration_digest=digest,
+        configuration_digest=_CONFIGURATION_DIGEST,
     )
-    service = ValidationEvidenceService(factory, store, clock=lambda: _NOW)
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
     service.collect(collection)
     changed_item = replace(
         collection.evidence[0],
