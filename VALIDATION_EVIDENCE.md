@@ -1,8 +1,9 @@
 # Validation evidence collection
 
 Task 5.2 introduces the durable collection boundary between configured host
-operations and validation decisioning. It records what happened; task 5.3 will
-decide whether the complete run passes, fails, or escalates.
+operations and validation decisioning. It records what happened; the Task 5.3
+decision service then determines whether that exact run passes, fails, blocks,
+or escalates.
 
 ## Exact binding
 
@@ -96,5 +97,7 @@ Criterion status is derived deterministically from its bound assertions:
 The persisted criterion record contains the typed assertion results, direct
 evidence UUIDs, validation-contract version, and exact candidate commit/tree.
 The task cockpit renders the same fields and links evidence UUIDs to the
-evidence ledger. A collected `ValidationRun` remains `PENDING` until task 5.3
-evaluates completeness and the contract's outcome rules.
+evidence ledger. A collected `ValidationRun` remains `PENDING` only until the
+lease-fenced worker invokes the decision service. The resulting immutable
+exact-SHA decision and fail-closed outcome rules are documented in
+[`VALIDATION_DECISIONING.md`](VALIDATION_DECISIONING.md).

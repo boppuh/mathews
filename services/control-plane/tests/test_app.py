@@ -5,16 +5,17 @@ def test_health() -> None:
     from mathews_control_plane.app import app
 
     client = TestClient(app)
-    assert any(
+    paths = {
         getattr(candidate, "path", None)
-        == "/api/validation-evidence/collections"
         for route in app.routes
         for candidate in getattr(
             getattr(route, "original_router", None),
             "routes",
             (route,),
         )
-    )
+    }
+    assert "/api/validation-evidence/collections" in paths
+    assert "/api/validation-decisions/{task_id}/{commit_sha}/{tree_sha}" in paths
     response = client.get("/health")
 
     assert response.status_code == 200
