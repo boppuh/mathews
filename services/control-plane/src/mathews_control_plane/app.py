@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -57,6 +58,8 @@ from mathews_control_plane.tasks import (
     TaskService,
     create_task_router,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class HealthResponse(BaseModel):
@@ -124,7 +127,11 @@ def create_app(
                     current_settings.require_automation_configuration(),
                     secrets=KeychainSecretProvider(),
                 )
-            except HostGatewayError:
+            except HostGatewayError as error:
+                _LOGGER.warning(
+                    "repository host gateway is unavailable",
+                    extra={"host_gateway_code": error.code},
+                )
                 host_gateway = None
         repository_service = RepositoryService(
             session_factory,

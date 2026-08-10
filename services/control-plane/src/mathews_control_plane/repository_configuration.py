@@ -260,7 +260,12 @@ def get_repository_preflight_report(
 
     if configuration.preflight_evidence_id is None:
         return None
-    evidence, payload = _load_attached_evidence(session, artifact_store, configuration)
+    evidence, payload = _load_attached_evidence(
+        session,
+        artifact_store,
+        configuration,
+        for_update=False,
+    )
     if evidence.evidence_type == _PREFLIGHT_REQUEST_EVIDENCE_TYPE:
         return None
     repository_key, report = _decode_canonical_report(payload)
@@ -618,16 +623,17 @@ def _load_attached_evidence(
     session: Session,
     artifact_store: ArtifactStore,
     configuration: RepositoryConfigurationRecord,
+    *,
+    for_update: bool = True,
 ) -> tuple[EvidenceRecord, bytes]:
     if configuration.preflight_evidence_id is None:
         raise RepositoryPreflightNotReadyError(
             "authoritative repository configuration has no preflight evidence"
         )
-    evidence = session.scalar(
-        select(EvidenceRecord)
-        .where(EvidenceRecord.id == configuration.preflight_evidence_id)
-        .with_for_update()
+    evidence_query = select(EvidenceRecord).where(
+        EvidenceRecord.id == configuration.preflight_evidence_id
     )
+    evidence = session.scalar(evidence_query.with_for_update() if for_update else evidence_query)
     valid_type_and_origin = evidence is not None and (
         (
             evidence.evidence_type == _PREFLIGHT_EVIDENCE_TYPE

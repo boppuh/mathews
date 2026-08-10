@@ -89,4 +89,18 @@ describe("repositoryClient", () => {
       new RepositoryRequestError("The local host is unavailable, so preflight could not run.", 503),
     );
   });
+
+  it("rejects a protected request when the CSRF cookie is missing", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+
+    await expect(repositoryClient.preflight()).rejects.toEqual(
+      new RepositoryRequestError(
+        "The security token is missing. Refresh the page and try again.",
+        0,
+      ),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

@@ -8,7 +8,7 @@ import type {
 } from "@mathews/contracts";
 import Link from "next/link";
 import type { FormEvent } from "react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AuthRequestError, authClient } from "../../lib/auth-client";
 import { formatConfigurationJson } from "../../lib/repositories";
@@ -89,7 +89,12 @@ function draftFrom(configuration: RepositoryConfigurationProjection | null): Dra
 }
 
 function parseObject(value: string, label: string): Record<string, RepositoryJsonValue> {
-  const parsed: unknown = JSON.parse(value);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error(`${label} must contain valid JSON.`);
+  }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error(`${label} must be a JSON object.`);
   }
@@ -97,7 +102,12 @@ function parseObject(value: string, label: string): Record<string, RepositoryJso
 }
 
 function parseArray(value: string, label: string): RepositoryJsonValue[] {
-  const parsed: unknown = JSON.parse(value);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error(`${label} must contain valid JSON.`);
+  }
   if (!Array.isArray(parsed)) throw new Error(`${label} must be a JSON list.`);
   return parsed as RepositoryJsonValue[];
 }
@@ -126,7 +136,7 @@ function writeRequest(
       ...(draft.e2eTestAccount ? { e2e_test_account: draft.e2eTestAccount.trim() } : {}),
       ...(additional.length > 0 ? { additional } : {}),
     },
-    approve_sensitive_change: true,
+    approve_sensitive_change: false,
   };
 }
 
@@ -136,6 +146,15 @@ function textValue(value: RepositoryJsonValue | undefined): string {
 
 function objectValue(value: RepositoryJsonValue | undefined): Record<string, RepositoryJsonValue> {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+}
+
+function configurationItemKey(
+  kind: "operation" | "assertion",
+  identifier: RepositoryJsonValue | undefined,
+  item: Record<string, RepositoryJsonValue>,
+): string {
+  const stableIdentifier = typeof identifier === "string" ? identifier : "missing";
+  return `${kind}:${stableIdentifier}:${JSON.stringify(item)}`;
 }
 
 function shortDigest(value: string): string {
@@ -213,7 +232,7 @@ function ConfigurationSummary({
               {configuration.operations.map((operation) => {
                 const item = objectValue(operation);
                 return (
-                  <li key={textValue(item.operation_id)}>
+                  <li key={configurationItemKey("operation", item.operation_id, item)}>
                     <strong>{textValue(item.kind).replaceAll("_", " ")}</strong>
                     <span>{textValue(item.operation_id)}</span>
                     <small>{String(item.timeout_seconds ?? "?")} seconds</small>
@@ -258,7 +277,7 @@ function ConfigurationSummary({
               {configuration.e2e_assertions.map((assertion) => {
                 const item = objectValue(assertion);
                 return (
-                  <div key={textValue(item.assertion_id)}>
+                  <div key={configurationItemKey("assertion", item.assertion_id, item)}>
                     <strong>{textValue(item.assertion_id)}</strong>
                     <span>{textValue(item.kind).replaceAll("_", " ")}</span>
                     <small>{textValue(item.role).replaceAll("_", " ")}</small>
@@ -322,6 +341,9 @@ export function RepositoryWorkspace() {
   );
   const [approved, setApproved] = useState(false);
   const [password, setPassword] = useState("");
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const pendingRef = useRef(pending);
+  pendingRef.current = pending;
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -342,6 +364,60 @@ export function RepositoryWorkspace() {
     void load(controller.signal);
     return () => controller.abort();
   }, [load]);
+
+  useEffect(() => {
+    if (!confirmationOpen) return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previousFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialog.focus();
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        if (pendingRef.current !== null) return;
+        event.preventDefault();
+        setConfirmationOpen(false);
+        setSaveCandidate(null);
+        setApproved(false);
+        setPassword("");
+        setActionError(null);
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(
+        dialogRef.current.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialogRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (
+        event.shiftKey &&
+        (document.activeElement === first || document.activeElement === dialog)
+      ) {
+        event.preventDefault();
+        last.focus();
+      } else if (
+        !event.shiftKey &&
+        (document.activeElement === last || document.activeElement === dialog)
+      ) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      previousFocus?.focus();
+    };
+  }, [confirmationOpen]);
 
   function update(field: keyof Draft, value: string) {
     setDraft((current) => ({ ...current, [field]: value }));
@@ -376,7 +452,10 @@ export function RepositoryWorkspace() {
     setActionError(null);
     try {
       await authClient.reauthenticate(password);
-      const repository = await repositoryClient.save(saveCandidate);
+      const repository = await repositoryClient.save({
+        ...saveCandidate,
+        approve_sensitive_change: approved,
+      });
       setState({ status: "ready", repository });
       setDraft(draftFrom(repository.configuration));
       setConfirmationOpen(false);
@@ -682,14 +761,17 @@ export function RepositoryWorkspace() {
       {confirmationOpen ? (
         <div className="confirmation-backdrop" role="presentation">
           <section
+            ref={dialogRef}
+            tabIndex={-1}
             className="confirmation-dialog"
             role="dialog"
             aria-modal="true"
             aria-labelledby="confirm-heading"
+            aria-describedby="confirm-description"
           >
             <p className="eyebrow">Protected change</p>
             <h2 id="confirm-heading">Approve a new execution boundary</h2>
-            <p>
+            <p id="confirm-description">
               This configuration controls repository access, Git identity, Xcode execution, tests,
               artifacts, and prohibited paths.
             </p>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -38,10 +39,15 @@ from mathews_control_plane.database import (
 )
 from mathews_control_plane.domain_models import RepositoryConfiguration
 from mathews_control_plane.host_gateway import HostGatewayError
-from mathews_control_plane.repositories import RepositoryService
+from mathews_control_plane.repositories import (
+    MAX_REPOSITORY_BODY_BYTES,
+    RepositoryBodyLimitMiddleware,
+    RepositoryService,
+)
 from mathews_control_plane.settings import Settings
 from pydantic import SecretStr
 from sqlalchemy import Engine, delete, select
+from starlette.types import Message, Receive, Scope, Send
 from test_repository_configuration import _configuration
 
 _ORIGIN = "http://localhost:3000"
@@ -190,6 +196,7 @@ def test_repository_projection_requires_auth_and_never_returns_secret_references
     serialized = response.text
     assert payload["configured"] is True
     assert payload["mutation_blocked"] is True
+    assert payload["preflight"]["status"] == "NOT_RUN"
     assert payload["configuration"]["secrets"] == {
         "push_credential_configured": True,
         "e2e_test_account_configured": True,
@@ -347,7 +354,7 @@ def test_oversized_repository_write_is_rejected_before_decoding(
 
     response = repository_harness.client.post(
         "/api/repository/versions",
-        content=b"x" * (512 * 1024 + 1),
+        content=b"x" * (MAX_REPOSITORY_BODY_BYTES + 1),
         headers={**headers, "Content-Type": "application/json"},
     )
 
@@ -355,3 +362,43 @@ def test_oversized_repository_write_is_rejected_before_decoding(
     assert response.headers["Cache-Control"] == "no-store"
     with repository_harness.factory() as session:
         assert len(session.scalars(select(RepositoryConfiguration)).all()) == 1
+
+
+def test_repository_body_buffer_rejects_excessive_empty_chunks() -> None:
+    downstream_called = False
+    sent: list[Message] = []
+
+    async def downstream(_scope: Scope, _receive: Receive, _send: Send) -> None:
+        nonlocal downstream_called
+        downstream_called = True
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": True}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    middleware = RepositoryBodyLimitMiddleware(downstream)
+    scope = cast(
+        Scope,
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "scheme": "https",
+            "method": "POST",
+            "path": "/api/repository/versions",
+            "raw_path": b"/api/repository/versions",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("127.0.0.1", 1),
+            "server": ("localhost", 443),
+        },
+    )
+
+    asyncio.run(middleware(scope, receive, send))
+
+    assert downstream_called is False
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    assert start["status"] == 413

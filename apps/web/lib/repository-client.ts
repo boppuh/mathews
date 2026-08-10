@@ -60,7 +60,7 @@ export const repositoryClient = {
     );
   },
 
-  save(body: RepositoryConfigurationWriteRequest): Promise<RepositoryProjection> {
+  async save(body: RepositoryConfigurationWriteRequest): Promise<RepositoryProjection> {
     return request(
       "/api/repository/versions",
       { method: "POST", headers: csrfHeaders(), body: JSON.stringify(body) },
@@ -68,7 +68,7 @@ export const repositoryClient = {
     );
   },
 
-  preflight(): Promise<RepositoryProjection> {
+  async preflight(): Promise<RepositoryProjection> {
     return request(
       "/api/repository/preflights",
       { method: "POST", headers: csrfHeaders(), body: "{}" },

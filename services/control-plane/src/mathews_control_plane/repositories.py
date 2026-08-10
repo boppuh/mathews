@@ -35,7 +35,7 @@ from mathews_control_plane.authentication import (
     AuthenticatedSession,
     require_authenticated_session,
 )
-from mathews_control_plane.database import SessionFactory
+from mathews_control_plane.database import LocalUser, SessionFactory
 from mathews_control_plane.domain_models import (
     RepositoryConfiguration as RepositoryConfigurationRecord,
 )
@@ -56,6 +56,7 @@ from mathews_control_plane.repository_configuration import (
 
 ALLOWED_REPOSITORY_KEY = "boppuh/mathews"
 MAX_REPOSITORY_BODY_BYTES = 512 * 1024
+_MAX_REPOSITORY_BODY_CHUNKS = 4096
 _OWNER_ID = "local-user"
 _USER_ID = 1
 _PREFLIGHT_LIFETIME = timedelta(seconds=30)
@@ -201,10 +202,10 @@ class RepositoryService:
             raise PermissionError("recent password authentication is required")
 
         with self._factory() as session, session.begin():
-            # Serialize writers and re-read after any lock wait so omitted
-            # secrets never merge from a superseded version.
-            get_latest_repository_configuration(session, self._repository_key, for_update=True)
-            latest = get_latest_repository_configuration(session, self._repository_key)
+            _lock_repository_writer(session)
+            latest = get_latest_repository_configuration(
+                session, self._repository_key, for_update=True
+            )
             expected_version = body.expected_configuration_version
             if (latest is None and expected_version is not None) or (
                 latest is not None and expected_version != latest.version
@@ -358,12 +359,14 @@ class RepositoryService:
             )
         try:
             report = get_repository_preflight_report(session, self._artifact_store, configuration)
-            preflight = (
-                RepositoryPreflightProjection(status="RUNNING")
-                if report is None and configuration.preflight_evidence_id is not None
-                else RepositoryPreflightProjection(status="NOT_RUN")
-                if report is None
-                else RepositoryPreflightProjection(
+            if report is None:
+                preflight = RepositoryPreflightProjection(
+                    status=(
+                        "RUNNING" if configuration.preflight_evidence_id is not None else "NOT_RUN"
+                    )
+                )
+            else:
+                preflight = RepositoryPreflightProjection(
                     status=report.status.value,
                     attempt_id=report.attempt_id,
                     configuration_id=report.configuration_id,
@@ -379,7 +382,6 @@ class RepositoryService:
                         for check in report.checks
                     ],
                 )
-            )
         except RepositoryPreflightNotReadyError:
             preflight = RepositoryPreflightProjection(status="BLOCKED")
         projection = _configuration_projection(configuration)
@@ -463,6 +465,16 @@ def _materialize_configuration(
     }
 
 
+def _lock_repository_writer(session: Session) -> None:
+    """Serialize all version writers, including the first configuration insert."""
+
+    if session.get_bind().dialect.name == "sqlite":
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    owner = session.get(LocalUser, _USER_ID, with_for_update=True)
+    if owner is None:
+        raise PermissionError("repository configuration is unavailable")
+
+
 def _configuration_projection(
     configuration: RepositoryConfigurationRecord,
 ) -> RepositoryConfigurationProjection:
@@ -537,15 +549,15 @@ def create_repository_router(service: RepositoryService) -> APIRouter:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="recent password authentication and explicit approval are required",
             ) from None
-        except (ValueError, SharedRepositoryConfigurationError):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="repository configuration is invalid",
-            ) from None
         except RepositoryConfigurationConflictError:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="repository configuration changed; reload and try again",
+            ) from None
+        except (ValueError, SharedRepositoryConfigurationError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="repository configuration is invalid",
             ) from None
 
     @router.post("/preflights", response_model=RepositoryProjection)
@@ -587,14 +599,21 @@ class RepositoryBodyLimitMiddleware:
             return
 
         received_bytes = 0
+        received_chunks = 0
         captured_messages: list[Message] = []
         while True:
             message = await receive()
-            captured_messages.append(message)
             if message["type"] == "http.disconnect":
+                captured_messages.append(message)
                 break
             if message["type"] != "http.request":
+                captured_messages.append(message)
                 continue
+            received_chunks += 1
+            if received_chunks > _MAX_REPOSITORY_BODY_CHUNKS:
+                await self._send_too_large(scope, receive, send)
+                return
+            captured_messages.append(message)
             received_bytes += len(message.get("body", b""))
             if received_bytes > MAX_REPOSITORY_BODY_BYTES:
                 await self._send_too_large(scope, receive, send)
