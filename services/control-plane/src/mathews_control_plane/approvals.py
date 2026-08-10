@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -62,6 +63,11 @@ MAX_APPROVAL_LIFETIME = timedelta(days=30)
 MAX_APPROVAL_EVIDENCE_REFERENCES = 100
 MAX_RETRY_HISTORY_ENTRIES = 100
 MAX_APPROVAL_DECISION_BYTES = 4 * 1024
+MAX_RULE_PROPOSED_CHARACTERS = 10_000
+MAX_RULE_RECURRENCE_CHARACTERS = 2_000
+MAX_INBOX_JSON_DEPTH = 10
+MAX_INBOX_JSON_COLLECTION_ITEMS = 100
+MAX_INBOX_JSON_KEY_CHARACTERS = 255
 _UNINITIALIZED_FINGERPRINT = "0" * 64
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
@@ -162,6 +168,17 @@ class ApprovalTaskSummary(BaseModel):
     cockpit_path: str
 
 
+class BriefInboxItem(BaseModel):
+    id: UUID
+    version: int
+    scope: dict[str, object]
+    exclusions: list[object]
+    acceptance_criteria: list[object]
+    risks: list[object]
+    affected_flow: dict[str, object]
+    test_plan: list[object]
+
+
 class ApprovalInboxItem(BaseModel):
     id: UUID
     task: ApprovalTaskSummary
@@ -181,6 +198,9 @@ class ApprovalInboxItem(BaseModel):
     expires_at: datetime | None = None
     operation_name: str | None = None
     operation_fingerprint: str | None = None
+    operation_idempotency_key: str | None = None
+    operation_checkpoint_evidence_id: UUID | None = None
+    brief: BriefInboxItem | None = None
     supporting_evidence_ids: list[UUID]
     actionable: bool = True
     unavailable_reason: Literal["RULE_CANDIDATE_UNAVAILABLE"] | None = None
@@ -567,6 +587,7 @@ def _precondition_identity(
     subject_id: UUID | None,
     blocked_operation: BlockedOperation | None,
     retry_history: Sequence[ApprovalRetryAttempt],
+    subject_fingerprint: str | None,
 ) -> dict[str, object]:
     return {
         "blocked_operation": (None if blocked_operation is None else blocked_operation.to_dict()),
@@ -575,6 +596,7 @@ def _precondition_identity(
         "resume_state": (None if resume_state is None else resume_state.value),
         "retry_history": [entry.to_dict() for entry in retry_history],
         "subject_id": None if subject_id is None else str(subject_id),
+        "subject_fingerprint": subject_fingerprint,
         "subject_type": subject_type,
         "task_id": str(task_id),
     }
@@ -721,6 +743,32 @@ def _stored_blocked_operation(
     return BlockedOperation.from_dict(request.blocked_operation)
 
 
+def _validate_inbox_json(value: object, *, depth: int = 0) -> None:
+    if depth > MAX_INBOX_JSON_DEPTH:
+        raise ApprovalConflictError("evaluated rule candidate is invalid")
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ApprovalConflictError("evaluated rule candidate is invalid")
+        return
+    if isinstance(value, list):
+        if len(value) > MAX_INBOX_JSON_COLLECTION_ITEMS:
+            raise ApprovalConflictError("evaluated rule candidate is invalid")
+        for item in value:
+            _validate_inbox_json(item, depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        if not value or len(value) > MAX_INBOX_JSON_COLLECTION_ITEMS:
+            raise ApprovalConflictError("evaluated rule candidate is invalid")
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > MAX_INBOX_JSON_KEY_CHARACTERS:
+                raise ApprovalConflictError("evaluated rule candidate is invalid")
+            _validate_inbox_json(item, depth=depth + 1)
+        return
+    raise ApprovalConflictError("evaluated rule candidate is invalid")
+
+
 def _evaluated_review_rule(candidate: RuleCandidate) -> _EvaluatedReviewRule:
     evaluation = candidate.evaluation_result
     if (
@@ -774,6 +822,8 @@ def _evaluated_review_rule(candidate: RuleCandidate) -> _EvaluatedReviewRule:
             field="review rule risk class",
             maximum=100,
         )
+        _validate_inbox_json(scope)
+        _validate_inbox_json(matcher)
         _fingerprint({"matcher": matcher, "scope": scope})
     except (TypeError, InvalidApprovalError):
         raise ApprovalConflictError("evaluated rule candidate is invalid") from None
@@ -830,6 +880,83 @@ def _candidate_evidence_ids(
     return values
 
 
+def _validated_rule_candidate(
+    session: Session,
+    task: Task,
+    candidate: RuleCandidate,
+) -> tuple[_EvaluatedReviewRule, tuple[UUID, ...], str]:
+    if (
+        not isinstance(candidate.proposed_rule, str)
+        or not candidate.proposed_rule.strip()
+        or len(candidate.proposed_rule) > MAX_RULE_PROPOSED_CHARACTERS
+        or not isinstance(candidate.recurrence_assessment, str)
+        or not candidate.recurrence_assessment.strip()
+        or len(candidate.recurrence_assessment) > MAX_RULE_RECURRENCE_CHARACTERS
+        or not isinstance(candidate.severity_assessment, str)
+        or not candidate.severity_assessment.strip()
+        or len(candidate.severity_assessment) > 100
+    ):
+        raise ApprovalConflictError("evaluated rule candidate is invalid")
+    false_positive_risks = _stored_string_list(
+        candidate.false_positive_risks,
+        field="rule candidate risks",
+    )
+    rule = _evaluated_review_rule(candidate)
+    cited_evidence_ids = _candidate_evidence_ids(session, task, candidate)
+    try:
+        fingerprint = _fingerprint(
+            {
+                "candidate_id": str(candidate.id),
+                "cited_evidence_ids": [str(value) for value in cited_evidence_ids],
+                "false_positive_risks": false_positive_risks,
+                "proposed_rule": candidate.proposed_rule,
+                "recurrence_assessment": candidate.recurrence_assessment,
+                "review_rule": {
+                    "evidence_requirements": rule.evidence_requirements,
+                    "lineage_key": rule.lineage_key,
+                    "matcher": rule.matcher,
+                    "permitted_action": rule.permitted_action,
+                    "risk_class": rule.risk_class,
+                    "scope": rule.scope,
+                },
+                "severity_assessment": candidate.severity_assessment,
+            }
+        )
+    except InvalidApprovalError:
+        raise ApprovalConflictError("evaluated rule candidate is invalid") from None
+    return rule, cited_evidence_ids, fingerprint
+
+
+def _brief_fingerprint(brief: Brief) -> str:
+    try:
+        for value in (
+            brief.scope,
+            brief.exclusions,
+            brief.acceptance_criteria,
+            brief.risks,
+            brief.affected_flow,
+            brief.test_plan,
+        ):
+            _validate_inbox_json(value)
+        return _fingerprint(
+            {
+                "acceptance_criteria": brief.acceptance_criteria,
+                "affected_flow": brief.affected_flow,
+                "exclusions": brief.exclusions,
+                "id": str(brief.id),
+                "predecessor_id": (
+                    None if brief.predecessor_id is None else str(brief.predecessor_id)
+                ),
+                "risks": brief.risks,
+                "scope": brief.scope,
+                "test_plan": brief.test_plan,
+                "version": brief.version,
+            }
+        )
+    except (ApprovalConflictError, InvalidApprovalError):
+        raise ApprovalConflictError("stored brief is invalid") from None
+
+
 def _approval_principal(authentication: AuthenticatedSession) -> str:
     if authentication.user_id != _LOCAL_USER_ID:
         raise ApprovalNotFoundError("approval inbox is unavailable")
@@ -851,6 +978,42 @@ def _durable_preconditions_are_current(
         blocked_operation=blocked_operation,
         retry_history=retry_history,
     )
+    stored_evidence_ids = _stored_evidence_ids(request)
+    brief: Brief | None = None
+    candidate: RuleCandidate | None = None
+    subject_fingerprint: str | None = None
+    if request_type is ApprovalRequestType.BRIEF:
+        brief = session.scalar(
+            select(Brief).where(Brief.id == request.subject_id).with_for_update()
+        )
+        if brief is None or brief.task_id != task.id or brief.owner_id != task.owner_id:
+            return False
+        try:
+            subject_fingerprint = _brief_fingerprint(brief)
+        except ApprovalConflictError:
+            return False
+    elif request_type is ApprovalRequestType.REVIEW_RULE:
+        candidate = session.scalar(
+            select(RuleCandidate).where(RuleCandidate.id == request.subject_id).with_for_update()
+        )
+        if not (
+            candidate is not None
+            and candidate.task_id == task.id
+            and candidate.owner_id == task.owner_id
+            and candidate.status is RuleCandidateStatus.EVALUATED
+            and candidate.evaluation_result is not None
+        ):
+            return False
+        try:
+            _rule, cited_evidence_ids, subject_fingerprint = _validated_rule_candidate(
+                session,
+                task,
+                candidate,
+            )
+        except ApprovalConflictError:
+            return False
+        if not set(cited_evidence_ids).issubset(stored_evidence_ids):
+            return False
     precondition_fingerprint = _fingerprint(
         _precondition_identity(
             task_id=task.id,
@@ -863,6 +1026,7 @@ def _durable_preconditions_are_current(
             subject_id=subject_id,
             blocked_operation=blocked_operation,
             retry_history=retry_history,
+            subject_fingerprint=subject_fingerprint,
         )
     )
     options = _REQUEST_OPTIONS[request_type]
@@ -872,7 +1036,7 @@ def _durable_preconditions_are_current(
         precondition_fingerprint=precondition_fingerprint,
         reason_code=_required_reason_code(request.reason),
         options=options,
-        evidence_ids=_stored_evidence_ids(request),
+        evidence_ids=stored_evidence_ids,
         expires_at=request.expires_at,
     )
     if (
@@ -886,9 +1050,6 @@ def _durable_preconditions_are_current(
             select(BriefApprovalDecision)
             .where(BriefApprovalDecision.id == task.brief_approval_decision_id)
             .with_for_update()
-        )
-        brief = session.scalar(
-            select(Brief).where(Brief.id == request.subject_id).with_for_update()
         )
         return bool(
             TaskState(task.state) is TaskState.BRIEF_PENDING_APPROVAL
@@ -910,25 +1071,7 @@ def _durable_preconditions_are_current(
     ):
         return False
     if request_type is ApprovalRequestType.REVIEW_RULE:
-        candidate = session.scalar(
-            select(RuleCandidate).where(RuleCandidate.id == request.subject_id).with_for_update()
-        )
-        if not (
-            candidate is not None
-            and candidate.task_id == task.id
-            and candidate.status is RuleCandidateStatus.EVALUATED
-            and candidate.evaluation_result is not None
-        ):
-            return False
-        try:
-            cited_evidence_ids = _candidate_evidence_ids(
-                session,
-                task,
-                candidate,
-            )
-        except ApprovalConflictError:
-            return False
-        return set(cited_evidence_ids).issubset(_stored_evidence_ids(request))
+        return candidate is not None
     if (
         request_type is ApprovalRequestType.RETRY_LIMIT
         and blocked_operation is not None
@@ -1079,6 +1222,28 @@ class ApprovalService:
                     repository=task.repository,
                     cockpit_path=f"/tasks/{task.id}",
                 )
+                brief_item: BriefInboxItem | None = None
+                if request_type is ApprovalRequestType.BRIEF:
+                    brief = session.scalar(
+                        select(Brief).where(
+                            Brief.id == request.subject_id,
+                            Brief.task_id == task.id,
+                            Brief.owner_id == owner_id,
+                        )
+                    )
+                    if brief is None:
+                        raise ApprovalConflictError("exact brief approval subject is unavailable")
+                    _brief_fingerprint(brief)
+                    brief_item = BriefInboxItem(
+                        id=brief.id,
+                        version=brief.version,
+                        scope=brief.scope,
+                        exclusions=brief.exclusions,
+                        acceptance_criteria=brief.acceptance_criteria,
+                        risks=brief.risks,
+                        affected_flow=brief.affected_flow,
+                        test_plan=brief.test_plan,
+                    )
                 approval_item = ApprovalInboxItem(
                     id=request.id,
                     task=task_summary,
@@ -1100,6 +1265,15 @@ class ApprovalService:
                     operation_fingerprint=(
                         None if blocked_operation is None else blocked_operation.input_fingerprint
                     ),
+                    operation_idempotency_key=(
+                        None if blocked_operation is None else blocked_operation.idempotency_key
+                    ),
+                    operation_checkpoint_evidence_id=(
+                        None
+                        if blocked_operation is None
+                        else blocked_operation.checkpoint_evidence_id
+                    ),
+                    brief=brief_item,
                     supporting_evidence_ids=evidence_ids,
                 )
                 approvals.append(approval_item)
@@ -1122,8 +1296,16 @@ class ApprovalService:
                     approval_item.unavailable_reason = "RULE_CANDIDATE_UNAVAILABLE"
                     continue
                 try:
-                    rule = _evaluated_review_rule(candidate)
-                    cited_evidence_ids = list(_candidate_evidence_ids(session, task, candidate))
+                    rule, stored_cited_evidence_ids, _candidate_fingerprint = (
+                        _validated_rule_candidate(session, task, candidate)
+                    )
+                    cited_evidence_ids = list(stored_cited_evidence_ids)
+                    if not set(cited_evidence_ids).issubset(evidence_ids):
+                        raise ApprovalConflictError(
+                            "rule candidate evidence is not bound to the approval"
+                        )
+                    if not _durable_preconditions_are_current(session, task, request):
+                        raise ApprovalConflictError("rule candidate changed after escalation")
                 except ApprovalConflictError:
                     _LOGGER.warning(
                         "Skipped invalid rule candidate for approval %s",
@@ -1197,26 +1379,7 @@ class ApprovalService:
             retry_history=normalized_retry_history,
         )
         resume_state = None if request_type is ApprovalRequestType.BRIEF else expected_state
-        precondition_fingerprint = _fingerprint(
-            _precondition_identity(
-                task_id=task_id,
-                request_type=request_type,
-                requesting_state=expected_state,
-                resume_state=resume_state,
-                subject_type=normalized_subject_type,
-                subject_id=normalized_subject_id,
-                blocked_operation=blocked_operation,
-                retry_history=normalized_retry_history,
-            )
-        )
         options = _REQUEST_OPTIONS[request_type]
-        request_fingerprint = _request_fingerprint(
-            precondition_fingerprint=precondition_fingerprint,
-            reason_code=normalized_reason,
-            options=options,
-            evidence_ids=normalized_evidence_ids,
-            expires_at=normalized_expiry,
-        )
         try:
             with self._factory() as session, session.begin():
                 _begin_serialized(session)
@@ -1224,6 +1387,34 @@ class ApprovalService:
                 if task is None:
                     raise ApprovalNotFoundError("task is unavailable")
                 existing = session.get(ApprovalRequest, request_id)
+                subject_fingerprint = self._validate_exact_subject(
+                    session,
+                    task,
+                    request_type=request_type,
+                    subject_id=normalized_subject_id,
+                    evidence_ids=normalized_evidence_ids,
+                    require_actionable=existing is None,
+                )
+                precondition_fingerprint = _fingerprint(
+                    _precondition_identity(
+                        task_id=task_id,
+                        request_type=request_type,
+                        requesting_state=expected_state,
+                        resume_state=resume_state,
+                        subject_type=normalized_subject_type,
+                        subject_id=normalized_subject_id,
+                        blocked_operation=blocked_operation,
+                        retry_history=normalized_retry_history,
+                        subject_fingerprint=subject_fingerprint,
+                    )
+                )
+                request_fingerprint = _request_fingerprint(
+                    precondition_fingerprint=precondition_fingerprint,
+                    reason_code=normalized_reason,
+                    options=options,
+                    evidence_ids=normalized_evidence_ids,
+                    expires_at=normalized_expiry,
+                )
                 if existing is not None:
                     if (
                         existing.task_id != task_id
@@ -1262,12 +1453,6 @@ class ApprovalService:
                     is not None
                 ):
                     raise ApprovalConflictError("task already has a pending approval")
-                self._validate_exact_subject(
-                    session,
-                    task,
-                    request_type=request_type,
-                    subject_id=normalized_subject_id,
-                )
                 expected_policy_version_id: UUID | None = None
                 if request_type is ApprovalRequestType.BRIEF:
                     exact_decision = session.scalar(
@@ -1664,7 +1849,9 @@ class ApprovalService:
         *,
         request_type: ApprovalRequestType,
         subject_id: UUID | None,
-    ) -> None:
+        evidence_ids: Sequence[UUID],
+        require_actionable: bool = True,
+    ) -> str | None:
         if request_type is ApprovalRequestType.BRIEF:
             brief = session.scalar(select(Brief).where(Brief.id == subject_id).with_for_update())
             decision = session.scalar(
@@ -1675,14 +1862,16 @@ class ApprovalService:
             if (
                 brief is None
                 or brief.task_id != task.id
+                or brief.owner_id != task.owner_id
                 or task.accepted_brief_id != subject_id
                 or decision is None
                 or decision.task_id != task.id
                 or decision.brief_id != subject_id
                 or decision.disposition is not BriefDecisionDisposition.HUMAN_APPROVAL_REQUIRED
-                or decision.human_response is not None
+                or (require_actionable and decision.human_response is not None)
             ):
                 raise ApprovalNotFoundError("exact brief approval subject is unavailable")
+            return _brief_fingerprint(brief)
         elif request_type is ApprovalRequestType.REVIEW_RULE:
             candidate = session.scalar(
                 select(RuleCandidate).where(RuleCandidate.id == subject_id).with_for_update()
@@ -1690,11 +1879,20 @@ class ApprovalService:
             if (
                 candidate is None
                 or candidate.task_id != task.id
-                or candidate.status is not RuleCandidateStatus.EVALUATED
+                or candidate.owner_id != task.owner_id
+                or (require_actionable and candidate.status is not RuleCandidateStatus.EVALUATED)
                 or candidate.evaluation_result is None
             ):
                 raise ApprovalNotFoundError("evaluated rule candidate is unavailable")
-            _candidate_evidence_ids(session, task, candidate)
+            _rule, cited_evidence_ids, fingerprint = _validated_rule_candidate(
+                session,
+                task,
+                candidate,
+            )
+            if not set(cited_evidence_ids).issubset(evidence_ids):
+                raise ApprovalConflictError("rule candidate evidence must support the approval")
+            return fingerprint
+        return None
 
     def _project_subject_decision(
         self,
@@ -1740,6 +1938,7 @@ class ApprovalService:
             if (
                 candidate is None
                 or candidate.task_id != task.id
+                or candidate.owner_id != task.owner_id
                 or candidate.status is not RuleCandidateStatus.EVALUATED
                 or candidate.evaluation_result is None
             ):

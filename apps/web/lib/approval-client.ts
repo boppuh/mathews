@@ -39,6 +39,17 @@ export interface ApprovalTask {
   cockpit_path: string;
 }
 
+export interface BriefInboxItem {
+  id: string;
+  version: number;
+  scope: { [key: string]: ApprovalJsonValue };
+  exclusions: ApprovalJsonValue[];
+  acceptance_criteria: ApprovalJsonValue[];
+  risks: ApprovalJsonValue[];
+  affected_flow: { [key: string]: ApprovalJsonValue };
+  test_plan: ApprovalJsonValue[];
+}
+
 export interface ApprovalInboxItem {
   id: string;
   task: ApprovalTask;
@@ -52,6 +63,9 @@ export interface ApprovalInboxItem {
   expires_at: string | null;
   operation_name: string | null;
   operation_fingerprint: string | null;
+  operation_idempotency_key: string | null;
+  operation_checkpoint_evidence_id: string | null;
+  brief: BriefInboxItem | null;
   supporting_evidence_ids: string[];
   actionable: boolean;
   unavailable_reason: "RULE_CANDIDATE_UNAVAILABLE" | null;
@@ -179,6 +193,30 @@ function parseJsonObject(value: unknown): { [key: string]: ApprovalJsonValue } {
   return parsed;
 }
 
+function parseJsonArray(value: unknown): ApprovalJsonValue[] {
+  const parsed = parseJsonValue(value);
+  if (!Array.isArray(parsed)) {
+    throw new Error("The control plane returned an invalid approval inbox.");
+  }
+  return parsed;
+}
+
+function parseBrief(value: unknown): BriefInboxItem {
+  if (!isRecord(value) || !Number.isInteger(value.version) || Number(value.version) < 1) {
+    throw new Error("The control plane returned an invalid approval inbox.");
+  }
+  return {
+    id: parseUuid(value.id),
+    version: value.version as number,
+    scope: parseJsonObject(value.scope),
+    exclusions: parseJsonArray(value.exclusions),
+    acceptance_criteria: parseJsonArray(value.acceptance_criteria),
+    risks: parseJsonArray(value.risks),
+    affected_flow: parseJsonObject(value.affected_flow),
+    test_plan: parseJsonArray(value.test_plan),
+  };
+}
+
 function parseTask(value: unknown): ApprovalTask {
   if (!isRecord(value)) {
     throw new Error("The control plane returned an invalid approval inbox.");
@@ -245,12 +283,21 @@ function parseApproval(value: unknown): ApprovalInboxItem {
       value.operation_name === null ||
       (isBoundedString(value.operation_name, 255) &&
         typeof value.operation_fingerprint === "string" &&
-        FINGERPRINT_PATTERN.test(value.operation_fingerprint))
+        FINGERPRINT_PATTERN.test(value.operation_fingerprint) &&
+        isBoundedString(value.operation_idempotency_key, 255) &&
+        (value.operation_checkpoint_evidence_id === null ||
+          (typeof value.operation_checkpoint_evidence_id === "string" &&
+            UUID_PATTERN.test(value.operation_checkpoint_evidence_id))))
     )
   ) {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
-  if (value.operation_name === null && value.operation_fingerprint !== null) {
+  if (
+    value.operation_name === null &&
+    (value.operation_fingerprint !== null ||
+      value.operation_idempotency_key !== null ||
+      value.operation_checkpoint_evidence_id !== null)
+  ) {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   if (
@@ -260,6 +307,9 @@ function parseApproval(value: unknown): ApprovalInboxItem {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   const requestType = value.request_type as ApprovalRequestType;
+  if ((requestType === "BRIEF") !== (value.brief !== null)) {
+    throw new Error("The control plane returned an invalid approval inbox.");
+  }
   const options = value.options as ApprovalDecision[];
   if (options.join(":") !== expectedOptions[requestType].join(":")) {
     throw new Error("The control plane returned an invalid approval inbox.");
@@ -277,6 +327,9 @@ function parseApproval(value: unknown): ApprovalInboxItem {
     expires_at: value.expires_at,
     operation_name: value.operation_name,
     operation_fingerprint: value.operation_fingerprint as string | null,
+    operation_idempotency_key: value.operation_idempotency_key as string | null,
+    operation_checkpoint_evidence_id: value.operation_checkpoint_evidence_id as string | null,
+    brief: value.brief === null ? null : parseBrief(value.brief),
     supporting_evidence_ids: parseUuidList(value.supporting_evidence_ids),
     actionable: value.actionable,
     unavailable_reason: value.unavailable_reason,

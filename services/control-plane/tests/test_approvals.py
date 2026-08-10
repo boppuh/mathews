@@ -294,6 +294,22 @@ def test_exact_brief_approval_is_audited_idempotent_and_resumes(
         subject_id=brief_id,
         request_id=request_id,
     )
+    inbox = service.inbox(
+        AuthenticatedSession(
+            session_id=uuid4(),
+            user_id=1,
+            csrf_token_digest=b"test",
+            expires_at=_NOW + timedelta(hours=1),
+            absolute_expires_at=_NOW + timedelta(hours=1),
+            reauthenticated_until=_NOW + timedelta(hours=1),
+            evaluated_at=_NOW,
+            recent_password_verified=True,
+        )
+    )
+    assert len(inbox.approvals) == 1
+    assert inbox.approvals[0].brief is not None
+    assert inbox.approvals[0].brief.id == brief_id
+    assert inbox.approvals[0].brief.scope == {"summary": "approval work"}
     decision_id = uuid4()
     decision = service.decide(
         request_id,
@@ -307,12 +323,24 @@ def test_exact_brief_approval_is_audited_idempotent_and_resumes(
         decision=ApprovalDecision.APPROVE,
         actor_id="local-user",
     )
+    _, completed_request_replay = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.BRIEFING,
+        request_type=ApprovalRequestType.BRIEF,
+        subject_id=brief_id,
+        request_id=request_id,
+    )
 
     assert first.task_state is TaskState.BRIEF_PENDING_APPROVAL
     assert replay == replace(first, replayed=True)
     assert decision.task_state is TaskState.IMPLEMENTING
     assert decision.status is ApprovalStatus.APPROVED
     assert decision_replay == replace(decision, replayed=True)
+    assert completed_request_replay.status is ApprovalStatus.APPROVED
+    assert completed_request_replay.task_state is TaskState.IMPLEMENTING
+    assert completed_request_replay.replayed is True
     with approval_harness.factory() as session:
         task = session.get(Task, task_id)
         request = session.get(ApprovalRequest, request_id)
@@ -720,6 +748,9 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
                     "expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
                     "operation_name": "host.mutate",
                     "operation_fingerprint": "a" * 64,
+                    "operation_idempotency_key": "approval-operation-1",
+                    "operation_checkpoint_evidence_id": None,
+                    "brief": None,
                     "supporting_evidence_ids": [str(evidence_id)],
                     "actionable": True,
                     "unavailable_reason": None,
@@ -926,6 +957,77 @@ def test_rule_promotion_rejects_changed_or_unbound_candidate_evidence(
     assert inbox.approvals[0].id == request_id
     assert inbox.approvals[0].actionable is False
     assert inbox.approvals[0].unavailable_reason == "RULE_CANDIDATE_UNAVAILABLE"
+
+
+def test_rule_approval_is_bound_to_the_evaluated_definition(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+    with approval_harness.factory.begin() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+        assert candidate is not None and candidate.evaluation_result is not None
+        candidate.evaluation_result = {
+            **candidate.evaluation_result,
+            "review_rule": {
+                **cast(dict[str, object], candidate.evaluation_result["review_rule"]),
+                "matcher": {"check": "different-check"},
+            },
+        }
+
+    with pytest.raises(ApprovalPreconditionError):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+        )
+
+
+def test_invalid_rule_candidate_is_rejected_before_task_escalation(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    with approval_harness.factory.begin() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+        assert candidate is not None
+        candidate.proposed_rule = "x" * 10_001
+    service = _service(approval_harness)
+
+    with pytest.raises(ApprovalConflictError):
+        _request(
+            service,
+            task_id=task_id,
+            evidence_id=evidence_id,
+            expected_state=TaskState.REPAIRING,
+            request_type=ApprovalRequestType.REVIEW_RULE,
+            subject_id=candidate_id,
+        )
+
+    with approval_harness.factory() as session:
+        task = session.get(Task, task_id)
+        request_count = session.scalar(select(func.count(ApprovalRequest.id)))
+    assert task is not None
+    assert task.state is TaskState.REPAIRING
+    assert request_count == 0
 
 
 def test_rule_promotion_uses_current_policy_and_preserves_lineage_position(

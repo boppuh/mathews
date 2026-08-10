@@ -1671,6 +1671,52 @@ section {
   color: var(--danger);
 }
 
+.inbox-reauthentication {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1fr) minmax(12rem, 18rem) auto auto;
+  align-items: end;
+  gap: 0.75rem;
+  margin-top: 2rem;
+  padding: 1rem;
+  border: 1px solid rgb(255 201 120 / 35%);
+  border-radius: 0.65rem;
+  background: rgb(255 201 120 / 7%);
+}
+
+.inbox-reauthentication p,
+.inbox-reauthentication label {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.inbox-reauthentication label {
+  display: grid;
+}
+
+.inbox-reauthentication input,
+.inbox-reauthentication button {
+  min-height: 2.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: #0b1016;
+  color: var(--text);
+}
+
+.inbox-reauthentication input {
+  padding: 0.55rem 0.65rem;
+}
+
+.inbox-reauthentication button {
+  padding: 0.55rem 0.75rem;
+  font-weight: 750;
+}
+
+.inbox-reauthentication .inbox-action-error {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
 .inbox-unavailable {
   margin: 0;
   padding: 0.75rem;
@@ -1819,9 +1865,23 @@ section {
   text-transform: uppercase;
 }
 
+.bounded-operation > span {
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 .bounded-operation code,
 .bounded-operation small {
   overflow-wrap: anywhere;
+}
+
+@media (max-width: 840px) {
+  .inbox-reauthentication {
+    grid-template-columns: 1fr;
+  }
 }
 
 .bounded-operation small {

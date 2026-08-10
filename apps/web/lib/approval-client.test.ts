@@ -31,6 +31,9 @@ const approval = {
   expires_at: "2026-08-10T13:00:00Z",
   operation_name: "host.mutate",
   operation_fingerprint: "a".repeat(64),
+  operation_idempotency_key: "approval-operation-1",
+  operation_checkpoint_evidence_id: null,
+  brief: null,
   supporting_evidence_ids: [evidenceId],
   actionable: true,
   unavailable_reason: null,
@@ -87,6 +90,41 @@ describe("parseApprovalInbox", () => {
         rule_candidates: [rule],
       }),
     ).toThrow("invalid approval inbox");
+    expect(() =>
+      parseApprovalInbox({
+        approvals: [{ ...approval, operation_idempotency_key: null }],
+        rule_candidates: [rule],
+      }),
+    ).toThrow("invalid approval inbox");
+  });
+
+  it("accepts the complete exact brief", () => {
+    const briefApproval = {
+      ...approval,
+      request_type: "BRIEF",
+      type_label: "Brief approval",
+      options: ["APPROVE", "REQUEST_REVISION", "CANCEL"],
+      requesting_state: "BRIEFING",
+      resume_state: null,
+      operation_name: null,
+      operation_fingerprint: null,
+      operation_idempotency_key: null,
+      operation_checkpoint_evidence_id: null,
+      brief: {
+        id: candidateId,
+        version: 2,
+        scope: { repository: "boppuh/mathews" },
+        exclusions: [],
+        acceptance_criteria: [{ id: "approval" }],
+        risks: [],
+        affected_flow: { id: "primary" },
+        test_plan: [{ id: "check" }],
+      },
+    };
+    expect(parseApprovalInbox({ approvals: [briefApproval], rule_candidates: [] })).toEqual({
+      approvals: [briefApproval],
+      rule_candidates: [],
+    });
   });
 });
 

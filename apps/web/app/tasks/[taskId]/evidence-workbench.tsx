@@ -342,6 +342,21 @@ export function EvidenceWorkbench({
             .includes(normalizedQuery)),
     );
   }, [category, evidence, query]);
+  useEffect(() => {
+    if (evidence.length === 0) return;
+    let anchor: string;
+    try {
+      anchor = decodeURIComponent(window.location.hash.slice(1));
+    } catch {
+      return;
+    }
+    if (!anchor.startsWith("evidence-") || anchor === "evidence-") return;
+    setCategory("ALL");
+    setQuery("");
+    window.requestAnimationFrame(() => {
+      document.getElementById(anchor)?.scrollIntoView({ block: "center" });
+    });
+  }, [evidence]);
   const revealEvidence = (evidenceId: string) => {
     if (!evidenceId) {
       return;

@@ -1,8 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
-
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   type ApprovalDecision,
   type ApprovalInboxItem,
@@ -11,6 +10,7 @@ import {
   approvalClient,
   LatestApprovalInboxLoader,
 } from "../../lib/approval-client";
+import { AuthRequestError, authClient } from "../../lib/auth-client";
 import { stageLabel } from "../../lib/stages";
 
 type InboxState =
@@ -54,7 +54,7 @@ function EvidenceLinks({
     <div className="inbox-evidence">
       <span>Evidence</span>
       {evidenceIds.map((id) => (
-        <Link href={`${approval.task.cockpit_path}#evidence`} key={id}>
+        <Link href={`${approval.task.cockpit_path}#evidence-${id}`} key={id}>
           {id.slice(0, 8)}
         </Link>
       ))}
@@ -66,6 +66,12 @@ export function DecisionInbox() {
   const [state, setState] = useState<InboxState>({ status: "loading" });
   const [pendingRequest, setPendingRequest] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [reauthentication, setReauthentication] = useState<{
+    requestId: string;
+    decision: ApprovalDecision;
+  } | null>(null);
+  const [password, setPassword] = useState("");
+  const [reauthenticationError, setReauthenticationError] = useState<string | null>(null);
   const inboxLoader = useRef<LatestApprovalInboxLoader | null>(null);
   if (inboxLoader.current === null) {
     inboxLoader.current = new LatestApprovalInboxLoader();
@@ -93,18 +99,48 @@ export function DecisionInbox() {
     };
   }, [load]);
 
-  async function decide(requestId: string, decision: ApprovalDecision) {
+  async function decide(
+    requestId: string,
+    decision: ApprovalDecision,
+    afterReauthentication = false,
+  ) {
     setPendingRequest(requestId);
     setActionError(null);
     try {
       await approvalClient.decide(requestId, decision);
       await load(undefined, true);
     } catch (error) {
+      if (!afterReauthentication && error instanceof ApprovalRequestError && error.status === 403) {
+        setReauthentication({ requestId, decision });
+        setActionError(null);
+        return;
+      }
       setActionError(errorMessage(error, "Unable to record the decision."));
       if (error instanceof ApprovalRequestError && [404, 409].includes(error.status)) {
         await load(undefined, true);
       }
     } finally {
+      setPendingRequest(null);
+    }
+  }
+
+  async function reauthenticate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!reauthentication || !password || pendingRequest !== null) return;
+    const target = reauthentication;
+    setPendingRequest(target.requestId);
+    setReauthenticationError(null);
+    try {
+      await authClient.reauthenticate(password);
+      setPassword("");
+      setReauthentication(null);
+      setPendingRequest(null);
+      await decide(target.requestId, target.decision, true);
+    } catch (error) {
+      setPassword("");
+      setReauthenticationError(
+        error instanceof AuthRequestError ? error.message : "Unable to verify your password.",
+      );
       setPendingRequest(null);
     }
   }
@@ -179,6 +215,48 @@ export function DecisionInbox() {
         </p>
       ) : null}
 
+      {reauthentication ? (
+        <form className="inbox-reauthentication" onSubmit={reauthenticate}>
+          <div>
+            <strong>Confirm this protected decision</strong>
+            <p>
+              Re-enter your password to continue with{" "}
+              {decisionLabels[reauthentication.decision].toLowerCase()}.
+            </p>
+          </div>
+          <label htmlFor="inbox-reauthentication-password">Password</label>
+          <input
+            id="inbox-reauthentication-password"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(event) => setPassword(event.currentTarget.value)}
+            disabled={pendingRequest !== null}
+            required
+          />
+          <button type="submit" disabled={!password || pendingRequest !== null}>
+            {pendingRequest ? "Verifying…" : "Verify and continue"}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={pendingRequest !== null}
+            onClick={() => {
+              setPassword("");
+              setReauthentication(null);
+              setReauthenticationError(null);
+            }}
+          >
+            Keep pending
+          </button>
+          {reauthenticationError ? (
+            <p className="inbox-action-error" role="alert">
+              {reauthenticationError}
+            </p>
+          ) : null}
+        </form>
+      ) : null}
+
       <section className="inbox-section" aria-labelledby="approval-inbox-heading">
         <div className="inbox-section-heading">
           <div>
@@ -223,9 +301,58 @@ export function DecisionInbox() {
                 </dl>
                 {approval.operation_name ? (
                   <div className="bounded-operation">
-                    <strong>Exact bounded operation</strong>
+                    <strong>Bound operation identity</strong>
+                    <span>Operation</span>
                     <code>{approval.operation_name}</code>
-                    <small>Input {approval.operation_fingerprint?.slice(0, 12)}</small>
+                    <span>Idempotency key</span>
+                    <code>{approval.operation_idempotency_key}</code>
+                    <span>Complete input fingerprint (SHA-256)</span>
+                    <code>{approval.operation_fingerprint}</code>
+                    {approval.operation_checkpoint_evidence_id ? (
+                      <small>
+                        Human-readable checkpoint:{" "}
+                        <Link
+                          href={`${approval.task.cockpit_path}#evidence-${approval.operation_checkpoint_evidence_id}`}
+                        >
+                          {approval.operation_checkpoint_evidence_id}
+                        </Link>
+                      </small>
+                    ) : (
+                      <small>No checkpoint evidence was captured for this operation.</small>
+                    )}
+                    <small>
+                      The complete fingerprint binds the operation inputs without exposing secret
+                      values. Inspect the checkpoint evidence before deciding.
+                    </small>
+                  </div>
+                ) : null}
+                {approval.brief ? (
+                  <div className="rule-definition brief-definition">
+                    <strong>Exact brief · version {approval.brief.version}</strong>
+                    <div>
+                      <strong>Scope</strong>
+                      <pre>{JSON.stringify(approval.brief.scope, null, 2)}</pre>
+                    </div>
+                    <div>
+                      <strong>Exclusions</strong>
+                      <pre>{JSON.stringify(approval.brief.exclusions, null, 2)}</pre>
+                    </div>
+                    <div>
+                      <strong>Acceptance criteria</strong>
+                      <pre>{JSON.stringify(approval.brief.acceptance_criteria, null, 2)}</pre>
+                    </div>
+                    <div>
+                      <strong>Risks</strong>
+                      <pre>{JSON.stringify(approval.brief.risks, null, 2)}</pre>
+                    </div>
+                    <div>
+                      <strong>Affected flow</strong>
+                      <pre>{JSON.stringify(approval.brief.affected_flow, null, 2)}</pre>
+                    </div>
+                    <div>
+                      <strong>Test plan</strong>
+                      <pre>{JSON.stringify(approval.brief.test_plan, null, 2)}</pre>
+                    </div>
                   </div>
                 ) : null}
                 <EvidenceLinks approval={approval} />
@@ -238,19 +365,20 @@ export function DecisionInbox() {
                 <div className="inbox-card-footer">
                   <Link href={approval.task.cockpit_path}>Open task</Link>
                   <div className="decision-actions">
-                    {approval.actionable
-                      ? approval.options.map((option) => (
-                          <button
-                            className={option === "APPROVE" || option === "RETRY" ? "primary" : ""}
-                            disabled={pendingRequest !== null}
-                            key={option}
-                            onClick={() => void decide(approval.id, option)}
-                            type="button"
-                          >
-                            {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}
-                          </button>
-                        ))
-                      : null}
+                    {(approval.actionable
+                      ? approval.options
+                      : approval.options.filter((option) => option === "CANCEL")
+                    ).map((option) => (
+                      <button
+                        className={option === "APPROVE" || option === "RETRY" ? "primary" : ""}
+                        disabled={pendingRequest !== null}
+                        key={option}
+                        onClick={() => void decide(approval.id, option)}
+                        type="button"
+                      >
+                        {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}
+                      </button>
+                    ))}
                   </div>
                 </div>
               </article>
