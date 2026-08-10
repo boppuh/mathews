@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from mathews_control_plane.approvals import ApprovalConflictError
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     AuthenticatedSession,
@@ -986,7 +987,12 @@ class ValidationDecisioner(Protocol):
 
 
 class ValidationRepairScheduler(Protocol):
-    def schedule(self, validation_run_id: UUID) -> RepairScheduleResult: ...
+    def schedule(
+        self,
+        validation_run_id: UUID,
+        *,
+        decision: ValidationDecisionResult | None = None,
+    ) -> RepairScheduleResult: ...
 
 
 class HostValidationArtifactVerifier:
@@ -1316,19 +1322,12 @@ class ValidationEvidenceJobHandler:
                 "decision_evidence_id": str(decision.decision_evidence_id),
             }
             if decision.outcome is ValidationOutcome.FAILED:
-                repair = self._repair_scheduler.schedule(result.validation_run_id)
                 checkpoint.update(
-                    {
-                        "repair_status": repair.status.value,
-                        "repair_job_id": (
-                            None if repair.job_id is None else str(repair.job_id)
-                        ),
-                        "repair_approval_request_id": (
-                            None
-                            if repair.approval_request_id is None
-                            else str(repair.approval_request_id)
-                        ),
-                    }
+                    _repair_schedule_checkpoint(
+                        self._repair_scheduler,
+                        result.validation_run_id,
+                        decision,
+                    )
                 )
             return checkpoint
         except ValidationEvidenceError as error:
@@ -1341,6 +1340,39 @@ class ValidationEvidenceJobHandler:
             raise TerminalBackgroundJobError(error.code) from None
         except RepairLoopError as error:
             raise TerminalBackgroundJobError(error.code) from None
+
+
+def _repair_schedule_checkpoint(
+    scheduler: ValidationRepairScheduler,
+    validation_run_id: UUID,
+    decision: ValidationDecisionResult,
+) -> dict[str, object]:
+    try:
+        repair = scheduler.schedule(validation_run_id, decision=decision)
+    except RepairLoopError as error:
+        return {
+            "repair_status": "UNSCHEDULED",
+            "repair_reason_code": error.code,
+        }
+    except ApprovalConflictError:
+        return {
+            "repair_status": "ESCALATED",
+            "repair_reason_code": "REPAIR_APPROVAL_CONFLICT",
+        }
+    except BackgroundJobConflictError:
+        return {
+            "repair_status": "UNSCHEDULED",
+            "repair_reason_code": "REPAIR_JOB_CONFLICT",
+        }
+    return {
+        "repair_status": repair.status.value,
+        "repair_job_id": None if repair.job_id is None else str(repair.job_id),
+        "repair_approval_request_id": (
+            None
+            if repair.approval_request_id is None
+            else str(repair.approval_request_id)
+        ),
+    }
 
 
 def _require_current_validation_attempt(

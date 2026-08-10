@@ -20,9 +20,10 @@ from mathews_configuration import (
     OperationKind,
     TaskLeaseHostAuthority,
 )
-from mathews_control_plane.approvals import ApprovalService
+from mathews_control_plane.approvals import ApprovalConflictError, ApprovalService
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.background_jobs import (
+    BackgroundJobConflictError,
     BackgroundJobLeaseLostError,
     BackgroundJobService,
     JobLeaseGrant,
@@ -57,10 +58,18 @@ from mathews_control_plane.domain_models import (
     ValidationOutcome,
     ValidationRun,
 )
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+)
 from mathews_control_plane.repair_loop import (
     VALIDATION_REPAIR_JOB_TYPE,
     VALIDATION_RERUN_REQUESTED_EVENT_TYPE,
     RepairJobHandler,
+    RepairLoopError,
+    RepairScheduleResult,
     RepairScheduleStatus,
     ValidationRepairService,
 )
@@ -785,6 +794,70 @@ def test_repair_budget_exhaustion_creates_resumable_retry_decision(
         assert task.state is TaskState.FAILED
 
 
+def test_consumed_retry_decision_does_not_authorize_an_equivalent_failure(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    first_run = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        first_run.validation_run_id
+    )
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.retry_count = 2
+
+    service = ValidationRepairService(factory, store, clock=lambda: _NOW)
+    first_escalation = service.schedule(first_run.validation_run_id)
+    assert first_escalation.approval_request_id is not None
+    retry_decision_id = uuid4()
+    ApprovalService(factory, store, clock=lambda: _NOW).decide(
+        first_escalation.approval_request_id,
+        decision_id=retry_decision_id,
+        decision=ApprovalDecision.RETRY,
+        actor_id="local-user",
+    )
+    approved_retry = service.schedule(first_run.validation_run_id)
+    assert approved_retry.job_id is not None
+
+    next_run = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        next_run.validation_run_id
+    )
+    next_escalation = service.schedule(next_run.validation_run_id)
+
+    assert next_escalation.status is RepairScheduleStatus.ESCALATED
+    assert next_escalation.approval_request_id is not None
+    assert next_escalation.approval_request_id != first_escalation.approval_request_id
+    with factory() as session:
+        repair_jobs = tuple(
+            session.scalars(
+                select(BackgroundJob).where(
+                    BackgroundJob.task_id == task_id,
+                    BackgroundJob.job_type == VALIDATION_REPAIR_JOB_TYPE,
+                )
+            )
+        )
+        assert len(repair_jobs) == 1
+        assert repair_jobs[0].input_payload["retry_approval_decision_id"] == str(
+            retry_decision_id
+        )
+
+
 def test_equivalent_failure_escalates_instead_of_looping(
     validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
 ) -> None:
@@ -806,9 +879,22 @@ def test_equivalent_failure_escalates_instead_of_looping(
     with factory.begin() as session:
         prior = session.get(BackgroundJob, first.job_id)
         assert prior is not None
+        prior_decision_id = UUID(cast(str, prior.input_payload["decision_evidence_id"]))
+        prior_manifest_id = UUID(cast(str, prior.input_payload["manifest_evidence_id"]))
+        checkpoint = session.scalar(
+            select(EvidenceRecord)
+            .where(
+                EvidenceRecord.task_id == task_id,
+                EvidenceRecord.id.not_in((prior_decision_id, prior_manifest_id)),
+            )
+            .order_by(EvidenceRecord.created_at, EvidenceRecord.id)
+            .limit(1)
+        )
+        assert checkpoint is not None
         prior.input_payload = {
             **prior.input_payload,
             "validation_run_id": str(uuid4()),
+            "decision_evidence_id": str(checkpoint.id),
         }
 
     repeated = service.schedule(collected.validation_run_id)
@@ -820,9 +906,93 @@ def test_equivalent_failure_escalates_instead_of_looping(
         task = session.get(Task, task_id)
         assert request is not None
         assert request.reason == "EQUIVALENT_VALIDATION_FAILURE"
+        assert str(checkpoint.id) in request.supporting_evidence_ids
         assert task is not None
         assert task.state is TaskState.ESCALATED
         assert task.escalation_resume_state is TaskState.VALIDATING
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_reason"),
+    (
+        (RepairLoopError("REPAIR_CONTEXT_STALE"), "UNSCHEDULED", "REPAIR_CONTEXT_STALE"),
+        (
+            ApprovalConflictError("pending approval"),
+            "ESCALATED",
+            "REPAIR_APPROVAL_CONFLICT",
+        ),
+        (
+            BackgroundJobConflictError("job conflict"),
+            "UNSCHEDULED",
+            "REPAIR_JOB_CONFLICT",
+        ),
+    ),
+)
+def test_repair_scheduling_failure_preserves_the_validation_checkpoint(
+    error: Exception,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    decision = cast(ValidationDecisionResult, SimpleNamespace())
+
+    class FailingScheduler:
+        def schedule(
+            self,
+            validation_run_id: UUID,
+            *,
+            decision: ValidationDecisionResult | None = None,
+        ) -> RepairScheduleResult:
+            assert validation_run_id == _VALIDATION_ATTEMPT_ID
+            assert decision is not None
+            raise error
+
+    checkpoint = validation_evidence_module._repair_schedule_checkpoint(
+        FailingScheduler(),
+        _VALIDATION_ATTEMPT_ID,
+        decision,
+    )
+
+    assert checkpoint == {
+        "repair_status": expected_status,
+        "repair_reason_code": expected_reason,
+    }
+
+
+def test_repair_evidence_replay_compares_redacted_canonical_content(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, _configuration_id, _contract_id = validation_harness
+    payload = {"password": "sensitive", "status": "recorded"}
+    with factory.begin() as session:
+        captured = capture_evidence(
+            session,
+            store,
+            payload=payload,
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.RESULT,
+            evidence_type="validation-repair-test",
+            origin="test:repair-loop",
+            access_classification=EvidenceAccessClass.INTERNAL,
+            retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+            owner_id="local-user",
+            actor_id="control-plane",
+            root_correlation_id=uuid4(),
+            task_id=task_id,
+            captured_at=_NOW,
+        )
+        record_id = captured.record.id
+
+    with factory() as session:
+        record = session.get(EvidenceRecord, record_id)
+        assert record is not None
+        repair_loop_module._require_evidence_payload(
+            session,
+            store,
+            record,
+            payload,
+            task_id=task_id,
+            evidence_type="validation-repair-test",
+        )
 
 
 def test_repair_job_commits_new_candidate_and_requests_the_complete_contract(

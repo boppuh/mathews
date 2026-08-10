@@ -64,6 +64,7 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
     load_evidence,
+    redact_evidence_content,
 )
 from mathews_control_plane.hermes_adapter import HermesJobInput, HermesJobPrompt
 from mathews_control_plane.host_gateway import (
@@ -83,6 +84,7 @@ from mathews_control_plane.task_state_machine import (
 from mathews_control_plane.validation_decisioning import (
     VALIDATION_DECIDED_EVENT_TYPE,
     ValidationDecisionError,
+    ValidationDecisionResult,
     ValidationDecisionService,
 )
 
@@ -150,11 +152,15 @@ class RepairHostGateway(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _RepairContext:
-    task: Task
-    run: ValidationRun
-    contract: ValidationContract
-    configuration: RepositoryConfiguration
-    policy: PolicyVersion
+    task_id: UUID
+    task_retry_count: int
+    validation_run_id: UUID
+    failed_commit_sha: str
+    failed_tree_sha: str
+    validation_contract_id: UUID
+    validation_contract_version: int
+    repository_configuration_id: UUID
+    repository_configuration_version: int
     decision_evidence_id: UUID
     manifest_evidence_id: UUID
     failure_fingerprint: str
@@ -204,11 +210,19 @@ class ValidationRepairService:
             clock=self._clock,
         )
 
-    def schedule(self, validation_run_id: UUID) -> RepairScheduleResult:
-        try:
-            decision = self._decisions.decide(validation_run_id)
-        except ValidationDecisionError as error:
-            raise RepairLoopError(error.code) from None
+    def schedule(
+        self,
+        validation_run_id: UUID,
+        *,
+        decision: ValidationDecisionResult | None = None,
+    ) -> RepairScheduleResult:
+        if decision is None:
+            try:
+                decision = self._decisions.decide(validation_run_id)
+            except ValidationDecisionError as error:
+                raise RepairLoopError(error.code) from None
+        elif decision.validation_run_id != validation_run_id:
+            raise RepairLoopError("VALIDATION_DECISION_RUN_MISMATCH")
         if decision.outcome is not ValidationOutcome.FAILED or not decision.is_current:
             raise RepairLoopError("VALIDATION_FAILURE_NOT_REPAIRABLE")
         now = _as_utc(self._clock())
@@ -220,7 +234,10 @@ class ValidationRepairService:
                 principal_id="local-user",
                 now=now,
             )
-            prior_jobs = _repair_jobs(session, context.task.id)
+            task = session.get(Task, context.task_id)
+            if task is None:
+                raise RepairLoopError("TASK_UNAVAILABLE")
+            prior_jobs = _repair_jobs(session, context.task_id)
             same_run = next(
                 (
                     job
@@ -238,10 +255,10 @@ class ValidationRepairService:
             )
             retry_approval_id = _human_retry_authorization(
                 session,
-                context.task,
+                task,
                 context.failure_fingerprint,
             )
-            exhausted = context.task.retry_count >= context.max_attempts
+            exhausted = context.task_retry_count >= context.max_attempts
         if same_run is None and (equivalent or exhausted) and retry_approval_id is None:
             return self._escalate(
                 context,
@@ -254,7 +271,7 @@ class ValidationRepairService:
                 now=now,
             )
         prompt = self._prompts.compile(
-            context.task.id,
+            context.task_id,
             role=PromptRole.IMPLEMENTER,
             evidence_ids=(
                 context.decision_evidence_id,
@@ -262,15 +279,15 @@ class ValidationRepairService:
             ),
         )
         job_input = RepairJobInput(
-            validation_run_id=context.run.id,
-            task_id=context.task.id,
+            validation_run_id=context.validation_run_id,
+            task_id=context.task_id,
             failure_fingerprint=context.failure_fingerprint,
-            failed_commit_sha=context.run.commit_sha,
-            failed_tree_sha=context.run.tree_sha,
-            validation_contract_id=context.contract.id,
-            validation_contract_version=context.contract.version,
-            repository_configuration_id=context.configuration.id,
-            repository_configuration_version=context.configuration.version,
+            failed_commit_sha=context.failed_commit_sha,
+            failed_tree_sha=context.failed_tree_sha,
+            validation_contract_id=context.validation_contract_id,
+            validation_contract_version=context.validation_contract_version,
+            repository_configuration_id=context.repository_configuration_id,
+            repository_configuration_version=context.repository_configuration_version,
             decision_evidence_id=context.decision_evidence_id,
             manifest_evidence_id=context.manifest_evidence_id,
             retry_approval_decision_id=retry_approval_id,
@@ -286,22 +303,22 @@ class ValidationRepairService:
             ),
         )
         scheduled = self._jobs.schedule(
-            task_id=context.task.id,
+            task_id=context.task_id,
             job_type=VALIDATION_REPAIR_JOB_TYPE,
-            idempotency_key=f"validation-repair:{context.run.id}",
+            idempotency_key=f"validation-repair:{context.validation_run_id}",
             input_payload=job_input.model_dump(mode="json"),
             task_validator=lambda session, task: _validate_repair_schedule(
                 session,
                 task,
-                validation_run_id=context.run.id,
+                validation_run_id=context.validation_run_id,
                 failure_fingerprint=context.failure_fingerprint,
                 max_attempts=context.max_attempts,
                 retry_approval_decision_id=retry_approval_id,
             ),
         )
         return RepairScheduleResult(
-            validation_run_id=context.run.id,
-            task_id=context.task.id,
+            validation_run_id=context.validation_run_id,
+            task_id=context.task_id,
             status=RepairScheduleStatus.SCHEDULED,
             failure_fingerprint=context.failure_fingerprint,
             job_id=scheduled.job_id,
@@ -326,7 +343,7 @@ class ValidationRepairService:
                     else "EQUIVALENT_VALIDATION_FAILURE"
                 ),
                 occurred_at=_as_utc(job.created_at),
-                checkpoint_evidence_id=_payload_uuid(
+                checkpoint_evidence_id=_mapping_uuid(
                     job.input_payload,
                     "decision_evidence_id",
                 ),
@@ -342,12 +359,25 @@ class ValidationRepairService:
                     checkpoint_evidence_id=context.decision_evidence_id,
                 ),
             )
+        evidence_ids = tuple(
+            dict.fromkeys(
+                (
+                    context.decision_evidence_id,
+                    context.manifest_evidence_id,
+                    *(
+                        attempt.checkpoint_evidence_id
+                        for attempt in history
+                        if attempt.checkpoint_evidence_id is not None
+                    ),
+                )
+            )
+        )
         request_id = uuid5(
             NAMESPACE_URL,
-            f"mathews:validation-repair-approval:{context.run.id}:{reason_code}",
+            f"mathews:validation-repair-approval:{context.validation_run_id}:{reason_code}",
         )
         result: ApprovalRequestResult = self._approvals.request(
-            context.task.id,
+            context.task_id,
             request_id=request_id,
             expected_state=TaskState.VALIDATING,
             request_type=ApprovalRequestType.RETRY_LIMIT,
@@ -356,20 +386,17 @@ class ValidationRepairService:
             subject_id=None,
             blocked_operation=BlockedOperation(
                 operation_name="validation.repair",
-                idempotency_key=f"validation-repair:{context.run.id}",
+                idempotency_key=f"validation-repair:{context.validation_run_id}",
                 input_fingerprint=context.failure_fingerprint,
                 checkpoint_evidence_id=context.decision_evidence_id,
             ),
             retry_history=history,
-            evidence_ids=(
-                context.decision_evidence_id,
-                context.manifest_evidence_id,
-            ),
+            evidence_ids=evidence_ids,
             expires_at=now + timedelta(seconds=context.approval_lifetime_seconds),
         )
         return RepairScheduleResult(
-            validation_run_id=context.run.id,
-            task_id=context.task.id,
+            validation_run_id=context.validation_run_id,
+            task_id=context.task_id,
             status=RepairScheduleStatus.ESCALATED,
             failure_fingerprint=context.failure_fingerprint,
             approval_request_id=result.request_id,
@@ -950,11 +977,15 @@ def _repair_context(
             raise RepairLoopError("REPAIR_EVIDENCE_UNAVAILABLE") from None
     max_attempts, approval_lifetime = _repair_policy(policy)
     return _RepairContext(
-        task=task,
-        run=run,
-        contract=contract,
-        configuration=configuration,
-        policy=policy,
+        task_id=task.id,
+        task_retry_count=task.retry_count,
+        validation_run_id=run.id,
+        failed_commit_sha=run.commit_sha,
+        failed_tree_sha=run.tree_sha,
+        validation_contract_id=contract.id,
+        validation_contract_version=contract.version,
+        repository_configuration_id=configuration.id,
+        repository_configuration_version=configuration.version,
         decision_evidence_id=decision_evidence_id,
         manifest_evidence_id=manifest.id,
         failure_fingerprint=_failure_fingerprint(run),
@@ -992,8 +1023,8 @@ def _failure_fingerprint(run: ValidationRun) -> str:
             str(value.get("operation_id")),
             bool(value.get("passed")),
             bool(value.get("repository_state_valid")),
-            value.get("exit_status"),
-            value.get("cancellation_status"),
+            str(value.get("exit_status")),
+            str(value.get("cancellation_status")),
         )
         for value in run.operation_results
         if isinstance(value, Mapping) and value.get("passed") is not True
@@ -1183,14 +1214,17 @@ def _require_evidence_payload(
     evidence_type: str,
 ) -> None:
     try:
-        content = load_evidence(session, store, record).content
+        content_bytes = load_evidence(session, store, record).content_bytes
     except EvidenceError:
         raise RepairLoopError("REPAIR_EVIDENCE_UNAVAILABLE") from None
+    expected_bytes = redact_evidence_content(
+        payload,
+        media_type="application/json",
+    ).canonical_bytes
     if (
         record.task_id != task_id
         or record.evidence_type != evidence_type
-        or not isinstance(content, Mapping)
-        or dict(content) != dict(payload)
+        or content_bytes != expected_bytes
     ):
         raise RepairLoopError("REPAIR_EVIDENCE_CONFLICT")
 
@@ -1201,10 +1235,6 @@ def _mapping_uuid(value: Mapping[str, object], key: str) -> UUID | None:
         return UUID(raw) if isinstance(raw, str) else None
     except ValueError:
         return None
-
-
-def _payload_uuid(value: Mapping[str, object], key: str) -> UUID | None:
-    return _mapping_uuid(value, key)
 
 
 def _task_retry_count(factory: SessionFactory, task_id: UUID) -> int:

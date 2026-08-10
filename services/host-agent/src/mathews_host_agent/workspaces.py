@@ -458,6 +458,8 @@ class GitWorkspaceLifecycle:
             before = self._git_boundary_state(ownership, configuration)
             if before["head_sha"] != expected_head_sha:
                 raise WorkspaceLifecycleError("HEAD_MISMATCH")
+            # This legacy code now rejects heads matching neither the frozen base
+            # nor the current host-owned candidate.
             if expected_head_sha not in {
                 ownership.base_sha,
                 ownership.candidate_head_sha,
@@ -552,10 +554,12 @@ class GitWorkspaceLifecycle:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
             if after["head_sha"] != candidate_head_sha:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            candidate_changed_paths = self._candidate_history_paths(ownership)
+            self._assert_paths_allowed(candidate_changed_paths, configuration)
             return {
                 **after,
                 "committed": True,
-                "changed_paths": list(staged_paths),
+                "changed_paths": list(candidate_changed_paths),
             }
 
     def push_candidate(

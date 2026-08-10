@@ -691,6 +691,7 @@ def test_repair_replaces_the_host_owned_candidate_with_a_new_clean_commit(
     )
     first_head = cast(str, first["head_sha"])
     (workspace / "feature.txt").write_text("repaired candidate\n")
+    (workspace / "repair-note.txt").write_text("repair evidence\n")
 
     repaired = lifecycle.commit_candidate(
         authority,
@@ -701,10 +702,13 @@ def test_repair_replaces_the_host_owned_candidate_with_a_new_clean_commit(
 
     assert repaired["head_sha"] not in {base, first_head}
     assert repaired["parent_shas"] == [base]
-    assert repaired["changed_paths"] == ["feature.txt"]
+    assert repaired["changed_paths"] == ["feature.txt", "repair-note.txt"]
     assert repaired["clean"] is True
     assert _git(workspace, "show", f"{repaired['head_sha']}:feature.txt") == (
         "repaired candidate"
+    )
+    assert _git(workspace, "show", f"{repaired['head_sha']}:repair-note.txt") == (
+        "repair evidence"
     )
 
 
