@@ -43,12 +43,18 @@ from mathews_control_plane.domain_models import (
     RepositoryConfiguration,
     Task,
     TaskEvent,
+    TaskEventEvidenceReference,
     TaskState,
     ValidationContract,
     ValidationOutcome,
     ValidationRun,
 )
 from mathews_control_plane.tasks import _acceptance_criteria_response
+from mathews_control_plane.validation_decisioning import (
+    VALIDATION_DECIDED_EVENT_TYPE,
+    ValidationDecisionResult,
+    ValidationDecisionService,
+)
 from mathews_control_plane.validation_evidence import (
     LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,
     VALIDATION_EVIDENCE_JOB_TYPE,
@@ -384,6 +390,216 @@ def validation_harness(
         yield factory, store, task_id, configuration_id, contract_id
     finally:
         engine.dispose()
+
+
+def _with_final_assertion_status(
+    collection: ValidationEvidenceCollection,
+    assertion_status: AssertionResultStatus,
+) -> ValidationEvidenceCollection:
+    final = collection.assertion_results[-1]
+    return replace(
+        collection,
+        assertion_results=(
+            *collection.assertion_results[:-1],
+            replace(
+                final,
+                status=assertion_status,
+                result_code=f"NETWORK_ASSERTION_{assertion_status.value}",
+            ),
+        ),
+    )
+
+
+def _collect_for_decision(
+    factory: SessionFactory,
+    store: ArtifactStore,
+    task_id: UUID,
+    configuration_id: UUID,
+    contract_id: UUID,
+    *,
+    assertion_status: AssertionResultStatus,
+) -> ValidationEvidenceResult:
+    collection = _with_final_assertion_status(
+        _collection(
+            task_id,
+            configuration_id,
+            contract_id,
+            configuration_digest=_CONFIGURATION_DIGEST,
+        ),
+        assertion_status,
+    )
+    return ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    ).collect(collection, artifact_verifier=_accept_artifact)
+
+
+def test_decides_pass_once_and_queries_the_exact_candidate(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.PASSED,
+    )
+    service = ValidationDecisionService(factory, store, clock=lambda: _NOW)
+
+    decided = service.decide(collected.validation_run_id)
+    replayed = service.decide(collected.validation_run_id)
+    exact = service.get_exact(
+        task_id,
+        commit_sha=_COMMIT_SHA,
+        tree_sha=_TREE_SHA,
+    )
+
+    assert decided.outcome is ValidationOutcome.PASSED
+    assert decided.reason_code == "ALL_REQUIRED_VALIDATION_PASSED"
+    assert decided.is_current is True
+    assert decided.replayed is False
+    assert replayed.decision_evidence_id == decided.decision_evidence_id
+    assert replayed.replayed is True
+    assert exact.validation_run_id == decided.validation_run_id
+    assert exact.is_current is True
+    assert exact.replayed is False
+    with factory() as session:
+        run = session.get(ValidationRun, collected.validation_run_id)
+        assert run is not None
+        assert run.outcome is ValidationOutcome.PASSED
+        events = tuple(
+            session.scalars(
+                select(TaskEvent).where(
+                    TaskEvent.task_id == task_id,
+                    TaskEvent.event_type == VALIDATION_DECIDED_EVENT_TYPE,
+                )
+            )
+        )
+        assert len(events) == 1
+        assert (
+            session.scalar(
+                select(func.count(TaskEventEvidenceReference.id)).where(
+                    TaskEventEvidenceReference.task_event_id == events[0].id
+                )
+            )
+            == 1
+        )
+
+
+@pytest.mark.parametrize(
+    ("assertion_status", "expected_outcome", "expected_reason"),
+    (
+        (
+            AssertionResultStatus.FAILED,
+            ValidationOutcome.FAILED,
+            "REQUIRED_VALIDATION_FAILED",
+        ),
+        (
+            AssertionResultStatus.BLOCKED,
+            ValidationOutcome.ESCALATED,
+            "VALIDATION_REQUIRES_DECISION",
+        ),
+    ),
+)
+def test_decides_failure_and_escalation_from_stored_results(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+    assertion_status: AssertionResultStatus,
+    expected_outcome: ValidationOutcome,
+    expected_reason: str,
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=assertion_status,
+    )
+
+    decided = ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        collected.validation_run_id
+    )
+
+    assert decided.outcome is expected_outcome
+    assert decided.reason_code == expected_reason
+
+
+def test_missing_required_evidence_escalates_instead_of_passing(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.PASSED,
+    )
+    with factory() as session:
+        record = session.scalar(
+            select(EvidenceRecord).where(
+                EvidenceRecord.validation_run_id == collected.validation_run_id,
+                EvidenceRecord.evidence_type == "validation-unit-test-output",
+            )
+        )
+        assert record is not None
+        address = record.content_address
+        assert address is not None
+    assert store.delete_bytes(address) is True
+
+    decided = ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        collected.validation_run_id
+    )
+
+    assert decided.outcome is ValidationOutcome.ESCALATED
+    assert decided.reason_code == "EVIDENCE_UNAVAILABLE"
+
+
+def test_candidate_change_invalidates_a_pending_pass_decision(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.PASSED,
+    )
+    with factory.begin() as session:
+        attempt = session.scalar(
+            select(TaskEvent).where(
+                TaskEvent.task_id == task_id,
+                TaskEvent.transition_id == _VALIDATION_ATTEMPT_ID,
+            )
+        )
+        assert attempt is not None
+        attempt.payload = {
+            **attempt.payload,
+            "validation_candidate": {
+                "commit_sha": "e" * 40,
+                "tree_sha": "f" * 40,
+            },
+        }
+
+    service = ValidationDecisionService(factory, store, clock=lambda: _NOW)
+    decided = service.decide(collected.validation_run_id)
+    exact = service.get_exact(
+        task_id,
+        commit_sha=_COMMIT_SHA,
+        tree_sha=_TREE_SHA,
+    )
+
+    assert decided.outcome is ValidationOutcome.BLOCKED
+    assert decided.reason_code == "VALIDATION_BINDING_STALE"
+    assert exact.is_current is False
 
 
 def test_collects_typed_direct_evidence_and_projects_each_criterion(
@@ -977,8 +1193,8 @@ def test_handler_renews_lease_before_each_artifact_verification(
             lease_grant_supplier: Callable[[], JobLeaseGrant] | None = None,
         ) -> ValidationEvidenceResult:
             assert lease_grant_supplier is not None
-            artifact_verifier(submitted.evidence[0])
-            artifact_verifier(submitted.evidence[1])
+            for artifact in submitted.evidence:
+                artifact_verifier(artifact)
             return ValidationEvidenceResult(
                 validation_run_id=submitted.run_id,
                 task_id=submitted.task_id,
@@ -987,6 +1203,33 @@ def test_handler_renews_lease_before_each_artifact_verification(
                 tree_sha=submitted.tree_sha,
                 evidence_ids=(),
                 criterion_results=(),
+                replayed=False,
+            )
+
+    class RecordingDecisioner:
+        def decide(
+            self,
+            validation_run_id: UUID,
+            *,
+            lease_grant_supplier: Callable[[], JobLeaseGrant] | None = None,
+        ) -> ValidationDecisionResult:
+            assert lease_grant_supplier is not None
+            assert lease_grant_supplier() is context.grant
+            return ValidationDecisionResult(
+                validation_run_id=validation_run_id,
+                task_id=task_id,
+                validation_attempt_id=_VALIDATION_ATTEMPT_ID,
+                validation_contract_id=contract_id,
+                validation_contract_version=4,
+                repository_configuration_id=configuration_id,
+                repository_configuration_version=3,
+                commit_sha=_COMMIT_SHA,
+                tree_sha=_TREE_SHA,
+                outcome=ValidationOutcome.PASSED,
+                reason_code="ALL_REQUIRED_VALIDATION_PASSED",
+                decision_evidence_id=uuid4(),
+                decided_at=_NOW,
+                is_current=True,
                 replayed=False,
             )
 
@@ -1018,13 +1261,22 @@ def test_handler_renews_lease_before_each_artifact_verification(
 
     host = RecordingHost()
     context = RecordingContext()
-    handler = ValidationEvidenceJobHandler(factory, store, host)
-    handler._collector = cast(ValidationEvidenceService, RecordingCollector())
+    handler = ValidationEvidenceJobHandler(
+        factory,
+        store,
+        host,
+        collector=RecordingCollector(),
+        decision_service=RecordingDecisioner(),
+    )
 
-    handler(cast(LeasedJobContext, context))
+    checkpoint = handler(cast(LeasedJobContext, context))
 
-    assert context.heartbeats == [timedelta(seconds=30), timedelta(seconds=30)]
-    assert host.expires_at_ms[1] > host.expires_at_ms[0]
+    assert context.heartbeats == [
+        timedelta(seconds=30)
+        for _ in range(len(collection.evidence) + 1)
+    ]
+    assert host.expires_at_ms == sorted(host.expires_at_ms)
+    assert checkpoint["outcome"] == "PASSED"
 
 
 def test_same_run_id_replays_without_duplicate_evidence(

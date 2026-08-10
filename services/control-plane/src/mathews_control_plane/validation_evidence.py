@@ -78,6 +78,11 @@ from mathews_control_plane.repository_configuration import (
     repository_configuration_digest,
     validated_repository_configuration,
 )
+from mathews_control_plane.validation_decisioning import (
+    ValidationDecisionError,
+    ValidationDecisionResult,
+    ValidationDecisionService,
+)
 
 VALIDATION_EVIDENCE_EVENT_TYPE = "VALIDATION_EVIDENCE_COLLECTED"
 LEGACY_VALIDATION_EVIDENCE_JOB_TYPE = "validation-evidence"
@@ -954,6 +959,27 @@ class ValidationHostGateway(Protocol):
     def execute(self, request: HostRequestMessage) -> HostResponseMessage: ...
 
 
+class ValidationEvidenceCollector(Protocol):
+    def precheck(self, collection: ValidationEvidenceCollection) -> None: ...
+
+    def collect(
+        self,
+        collection: ValidationEvidenceCollection,
+        *,
+        artifact_verifier: Callable[[ValidationEvidenceItem], None],
+        lease_grant_supplier: Callable[[], JobLeaseGrant] | None = None,
+    ) -> ValidationEvidenceResult: ...
+
+
+class ValidationDecisioner(Protocol):
+    def decide(
+        self,
+        validation_run_id: UUID,
+        *,
+        lease_grant_supplier: Callable[[], JobLeaseGrant] | None = None,
+    ) -> ValidationDecisionResult: ...
+
+
 class HostValidationArtifactVerifier:
     """Verify host artifacts through the authenticated task-lease boundary."""
 
@@ -1195,14 +1221,29 @@ class ValidationEvidenceJobHandler:
         host_gateway: ValidationHostGateway,
         *,
         clock: Callable[[], datetime] | None = None,
+        collector: ValidationEvidenceCollector | None = None,
+        decision_service: ValidationDecisioner | None = None,
     ) -> None:
         self._factory = factory
         self._host = host_gateway
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._collector = ValidationEvidenceService(
-            factory,
-            artifact_store,
-            clock=self._clock,
+        self._collector = (
+            ValidationEvidenceService(
+                factory,
+                artifact_store,
+                clock=self._clock,
+            )
+            if collector is None
+            else collector
+        )
+        self._decision_service = (
+            ValidationDecisionService(
+                factory,
+                artifact_store,
+                clock=self._clock,
+            )
+            if decision_service is None
+            else decision_service
         )
 
     def __call__(self, context: LeasedJobContext) -> dict[str, object]:
@@ -1241,13 +1282,25 @@ class ValidationEvidenceJobHandler:
                 artifact_verifier=verifier.verify,
                 lease_grant_supplier=lambda: context.grant,
             )
+            context.heartbeat(timedelta(seconds=30))
+            decision = self._decision_service.decide(
+                result.validation_run_id,
+                lease_grant_supplier=lambda: context.grant,
+            )
             return {
                 "validation_run_id": str(result.validation_run_id),
                 "commit_sha": result.commit_sha,
                 "tree_sha": result.tree_sha,
                 "replayed": result.replayed,
+                "outcome": decision.outcome.value,
+                "reason_code": decision.reason_code,
+                "decision_evidence_id": str(decision.decision_evidence_id),
             }
         except ValidationEvidenceError as error:
+            if error.code == "TASK_VALIDATION_PAUSED":
+                raise PausedBackgroundJobError(error.code) from None
+            raise TerminalBackgroundJobError(error.code) from None
+        except ValidationDecisionError as error:
             if error.code == "TASK_VALIDATION_PAUSED":
                 raise PausedBackgroundJobError(error.code) from None
             raise TerminalBackgroundJobError(error.code) from None
