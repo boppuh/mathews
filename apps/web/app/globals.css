@@ -1812,6 +1812,64 @@ section {
   align-items: start;
 }
 
+.github-status-panel {
+  scroll-margin-top: 1rem;
+  margin-top: 1rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid rgb(112 225 200 / 24%);
+  border-radius: 1rem;
+  background: linear-gradient(135deg, rgb(21 27 36 / 94%), rgb(15 28 31 / 88%));
+}
+
+.github-pr-number {
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.github-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.github-status-grid > div {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.7rem;
+  background: rgb(10 15 21 / 58%);
+}
+
+.github-status-grid span,
+.github-status-grid small,
+.github-binding {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.github-state {
+  color: #ffc978;
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.github-state-passed,
+.github-state-approved {
+  color: var(--accent);
+}
+
+.github-state-failed,
+.github-state-changes_requested {
+  color: var(--danger);
+}
+
+.github-binding {
+  margin: 0.8rem 0 0;
+}
+
 .cockpit-grid section,
 .cockpit-sidebar {
   margin-top: 0;
@@ -2822,6 +2880,10 @@ section {
   }
 
   .cockpit-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .github-status-grid {
     grid-template-columns: 1fr;
   }
 

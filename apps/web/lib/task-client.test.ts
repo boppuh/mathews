@@ -106,6 +106,19 @@ describe("taskClient", () => {
       acceptance_criteria: [],
       evidence: [],
       approvals: [],
+      github: {
+        linked: false,
+        pull_request_number: null,
+        task_branch: null,
+        head_sha: null,
+        ci_status: "NOT_LINKED",
+        review_status: "NOT_LINKED",
+        checks_total: 0,
+        checks_passed: 0,
+        blocking_reviews: 0,
+        review_comments: 0,
+        last_updated_at: null,
+      },
     };
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify(cockpit), {
@@ -337,6 +350,19 @@ describe("LatestTaskDetailLoader", () => {
     acceptance_criteria: [],
     evidence: [],
     approvals: [],
+    github: {
+      linked: false,
+      pull_request_number: null,
+      task_branch: null,
+      head_sha: null,
+      ci_status: "NOT_LINKED" as const,
+      review_status: "NOT_LINKED" as const,
+      checks_total: 0,
+      checks_passed: 0,
+      blocking_reviews: 0,
+      review_comments: 0,
+      last_updated_at: null,
+    },
   };
 
   it("drops an older cockpit response after a newer route wins", async () => {

@@ -23,6 +23,7 @@ from mathews_control_plane.database import (
     create_session_factory,
 )
 from mathews_control_plane.domain_models import ReconciliationTargetKind
+from mathews_control_plane.github_webhooks import GitHubWebhookJobHandler
 from mathews_control_plane.hermes_adapter import (
     HermesHttpRuntime,
     HermesRunJobHandler,
@@ -78,7 +79,8 @@ def build_worker(
                 store,
                 runtime,
                 tool_execution,
-            )
+            ),
+            "github-webhook": GitHubWebhookJobHandler(),
         }
     else:
         handler_registry = dict(handlers)

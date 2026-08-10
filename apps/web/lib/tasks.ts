@@ -12,6 +12,8 @@ import {
   TASK_EVIDENCE_CATEGORIES,
   TASK_EVIDENCE_CONTENT_ACCESS,
   TASK_EVIDENCE_STATUSES,
+  TASK_GITHUB_CI_STATUSES,
+  TASK_GITHUB_REVIEW_STATUSES,
   TASK_STATE_CONTEXT_KINDS,
   TASK_STATES,
   TASK_STEERING_IMPACTS,
@@ -27,6 +29,9 @@ import {
   type TaskEvidenceContentAccess,
   type TaskEvidenceStatus,
   type TaskEvidenceSummary,
+  type TaskGitHubCiStatus,
+  type TaskGitHubReviewStatus,
+  type TaskGitHubStatus,
   type TaskListResponse,
   type TaskState,
   type TaskStateContext,
@@ -41,6 +46,8 @@ const taskStates = new Set<string>(TASK_STATES);
 const blockerCodes = new Set<string>(TASK_BLOCKER_CODES);
 const stateContextKinds = new Set<string>(TASK_STATE_CONTEXT_KINDS);
 const eventKinds = new Set<string>(TASK_EVENT_KINDS);
+const githubCiStatuses = new Set<string>(TASK_GITHUB_CI_STATUSES);
+const githubReviewStatuses = new Set<string>(TASK_GITHUB_REVIEW_STATUSES);
 const evidenceStatuses = new Set<string>(TASK_EVIDENCE_STATUSES);
 const evidenceCategories = new Set<string>(TASK_EVIDENCE_CATEGORIES);
 const evidenceContentAccess = new Set<string>(TASK_EVIDENCE_CONTENT_ACCESS);
@@ -397,13 +404,70 @@ function parseApproval(value: unknown): TaskApprovalSummary {
   };
 }
 
+function parseGitHubStatus(value: unknown): TaskGitHubStatus {
+  if (
+    !isRecord(value) ||
+    typeof value.linked !== "boolean" ||
+    typeof value.ci_status !== "string" ||
+    !githubCiStatuses.has(value.ci_status) ||
+    typeof value.review_status !== "string" ||
+    !githubReviewStatuses.has(value.review_status) ||
+    !(value.last_updated_at === null || isTimestamp(value.last_updated_at))
+  ) {
+    throw new Error("The control plane returned invalid GitHub task status.");
+  }
+  const counts = [
+    value.checks_total,
+    value.checks_passed,
+    value.blocking_reviews,
+    value.review_comments,
+  ];
+  if (counts.some((count) => !Number.isSafeInteger(count) || Number(count) < 0)) {
+    throw new Error("The control plane returned invalid GitHub task status.");
+  }
+  if (
+    value.linked !== (value.ci_status !== "NOT_LINKED") ||
+    value.linked !== (value.review_status !== "NOT_LINKED") ||
+    (value.linked &&
+      (!Number.isSafeInteger(value.pull_request_number) ||
+        Number(value.pull_request_number) < 1 ||
+        typeof value.task_branch !== "string" ||
+        value.task_branch.length === 0 ||
+        typeof value.head_sha !== "string" ||
+        !GIT_OBJECT_ID_PATTERN.test(value.head_sha))) ||
+    (!value.linked &&
+      (value.pull_request_number !== null ||
+        value.task_branch !== null ||
+        value.head_sha !== null ||
+        counts.some((count) => count !== 0) ||
+        value.last_updated_at !== null)) ||
+    Number(value.checks_passed) > Number(value.checks_total)
+  ) {
+    throw new Error("The control plane returned inconsistent GitHub task status.");
+  }
+  return {
+    linked: value.linked,
+    pull_request_number: value.pull_request_number as number | null,
+    task_branch: value.task_branch as string | null,
+    head_sha: value.head_sha as string | null,
+    ci_status: value.ci_status as TaskGitHubCiStatus,
+    review_status: value.review_status as TaskGitHubReviewStatus,
+    checks_total: Number(value.checks_total),
+    checks_passed: Number(value.checks_passed),
+    blocking_reviews: Number(value.blocking_reviews),
+    review_comments: Number(value.review_comments),
+    last_updated_at: value.last_updated_at,
+  };
+}
+
 export function parseTaskCockpit(value: unknown): TaskCockpitResponse {
   if (
     !isRecord(value) ||
     !Array.isArray(value.events) ||
     !Array.isArray(value.acceptance_criteria) ||
     !Array.isArray(value.evidence) ||
-    !Array.isArray(value.approvals)
+    !Array.isArray(value.approvals) ||
+    !isRecord(value.github)
   ) {
     throw new Error("The control plane returned an invalid task cockpit.");
   }
@@ -428,6 +492,7 @@ export function parseTaskCockpit(value: unknown): TaskCockpitResponse {
     acceptance_criteria: acceptanceCriteria,
     evidence: value.evidence.map(parseEvidence),
     approvals: value.approvals.map(parseApproval),
+    github: parseGitHubStatus(value.github),
   };
 }
 

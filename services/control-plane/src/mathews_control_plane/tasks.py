@@ -48,6 +48,13 @@ from mathews_control_plane.domain_models import (
     TaskState,
 )
 from mathews_control_plane.evidence import redact_evidence_content
+from mathews_control_plane.github_webhooks import (
+    GITHUB_CHECK_UPDATED_EVENT,
+    GITHUB_PR_BOUND_EVENT,
+    GITHUB_PR_HEAD_CHANGED_EVENT,
+    GITHUB_PULL_REQUEST_UPDATED_EVENT,
+    GITHUB_REVIEW_UPDATED_EVENT,
+)
 from mathews_control_plane.reliability import (
     CancellationService,
     ReliabilityConflictError,
@@ -299,6 +306,26 @@ class TaskApprovalResponse(BaseModel):
     expires_at: datetime | None = None
 
 
+class TaskGitHubStatusResponse(BaseModel):
+    linked: bool
+    pull_request_number: int | None = None
+    task_branch: str | None = None
+    head_sha: str | None = None
+    ci_status: Literal["NOT_LINKED", "NOT_RUN", "PENDING", "PASSED", "FAILED"]
+    review_status: Literal[
+        "NOT_LINKED",
+        "NOT_REVIEWED",
+        "COMMENTED",
+        "APPROVED",
+        "CHANGES_REQUESTED",
+    ]
+    checks_total: int = Field(ge=0)
+    checks_passed: int = Field(ge=0)
+    blocking_reviews: int = Field(ge=0)
+    review_comments: int = Field(ge=0)
+    last_updated_at: datetime | None = None
+
+
 class TaskCockpitResponse(BaseModel):
     task: TaskSummaryResponse
     state_context: TaskStateContextResponse
@@ -306,6 +333,7 @@ class TaskCockpitResponse(BaseModel):
     acceptance_criteria: list[TaskAcceptanceCriterionResponse]
     evidence: list[TaskEvidenceResponse]
     approvals: list[TaskApprovalResponse]
+    github: TaskGitHubStatusResponse
 
 
 class TaskNotFoundError(RuntimeError):
@@ -614,6 +642,7 @@ class TaskService:
                     for record in evidence
                 ],
                 approvals=[_approval_response(request) for request in approvals],
+                github=_github_status(events),
             )
 
     def events_after(
@@ -984,6 +1013,152 @@ def _state_label(state: TaskState) -> str:
     )
 
 
+def _github_status(events: Sequence[TaskEvent]) -> TaskGitHubStatusResponse:
+    binding = next(
+        (event for event in reversed(events) if event.event_type == GITHUB_PR_BOUND_EVENT),
+        None,
+    )
+    if binding is None:
+        return _unlinked_github_status()
+    head_sha = binding.payload.get("head_sha")
+    pull_request_number = binding.payload.get("pull_request_number")
+    task_branch = binding.payload.get("task_branch")
+    required_checks = binding.payload.get("required_checks")
+    if (
+        not isinstance(head_sha, str)
+        or len(head_sha) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in head_sha)
+        or isinstance(pull_request_number, bool)
+        or not isinstance(pull_request_number, int)
+        or pull_request_number <= 0
+        or not isinstance(task_branch, str)
+        or not task_branch
+        or not isinstance(required_checks, list)
+        or not required_checks
+        or any(not isinstance(check, str) or not check for check in required_checks)
+        or len(required_checks) != len(set(required_checks))
+    ):
+        return _unlinked_github_status()
+    head_change = next(
+        (
+            event
+            for event in reversed(events)
+            if event.sequence > binding.sequence
+            and event.event_type == GITHUB_PR_HEAD_CHANGED_EVENT
+            and event.payload.get("pull_request_number") == pull_request_number
+            and event.payload.get("task_branch") == task_branch
+        ),
+        None,
+    )
+    projection_start = binding.sequence
+    if head_change is not None and isinstance(head_change.payload.get("head_sha"), str):
+        head_sha = cast(str, head_change.payload["head_sha"])
+        projection_start = head_change.sequence
+    latest: dict[tuple[object, object], TaskEvent] = {}
+    for event in events:
+        if event.event_type not in {
+            GITHUB_CHECK_UPDATED_EVENT,
+            GITHUB_REVIEW_UPDATED_EVENT,
+            GITHUB_PULL_REQUEST_UPDATED_EVENT,
+            GITHUB_PR_HEAD_CHANGED_EVENT,
+        } or (
+            event.sequence < projection_start
+            or event.payload.get("head_sha") != head_sha
+            or event.payload.get("pull_request_number") != pull_request_number
+            or event.payload.get("task_branch") != task_branch
+        ):
+            continue
+        latest[
+            (event.payload.get("resource_type"), event.payload.get("resource_id"))
+        ] = event
+    latest_checks_by_name: dict[str, TaskEvent] = {}
+    for (resource_type, _resource_id), event in latest.items():
+        label = event.payload.get("resource_label")
+        if resource_type == "check_run" and isinstance(label, str):
+            latest_checks_by_name[label] = event
+    checks = [
+        latest_checks_by_name[check]
+        for check in cast(list[str], required_checks)
+        if check in latest_checks_by_name
+    ]
+    reviews = [
+        event
+        for (resource_type, _resource_id), event in latest.items()
+        if resource_type == "review"
+    ]
+    comments = [
+        event
+        for (resource_type, _resource_id), event in latest.items()
+        if resource_type == "review_comment"
+    ]
+    review_threads = [
+        event
+        for (resource_type, _resource_id), event in latest.items()
+        if resource_type == "review_thread"
+    ]
+    check_states = [str(event.payload.get("state")) for event in checks]
+    if not checks:
+        ci_status: Literal["NOT_RUN", "PENDING", "PASSED", "FAILED"] = "NOT_RUN"
+    elif any(state in {"FAILED", "CANCELLED"} for state in check_states):
+        ci_status = "FAILED"
+    elif len(checks) < len(required_checks) or any(
+        state in {"QUEUED", "IN_PROGRESS"} for state in check_states
+    ):
+        ci_status = "PENDING"
+    else:
+        ci_status = "PASSED"
+    review_states = [str(event.payload.get("state")) for event in reviews]
+    open_comments = sum(
+        event.payload.get("state") == "OPEN" for event in review_threads
+    )
+    if "CHANGES_REQUESTED" in review_states:
+        review_status: Literal[
+            "NOT_REVIEWED", "COMMENTED", "APPROVED", "CHANGES_REQUESTED"
+        ] = "CHANGES_REQUESTED"
+    elif "APPROVED" in review_states:
+        review_status = "APPROVED"
+    elif reviews or comments or open_comments:
+        review_status = "COMMENTED"
+    else:
+        review_status = "NOT_REVIEWED"
+    updated: list[datetime] = []
+    for event in latest.values():
+        source_updated_at = event.payload.get("source_updated_at")
+        if not isinstance(source_updated_at, str):
+            continue
+        try:
+            updated.append(
+                datetime.fromisoformat(source_updated_at.replace("Z", "+00:00"))
+            )
+        except ValueError:
+            continue
+    return TaskGitHubStatusResponse(
+        linked=True,
+        pull_request_number=pull_request_number,
+        task_branch=task_branch,
+        head_sha=head_sha,
+        ci_status=ci_status,
+        review_status=review_status,
+        checks_total=len(required_checks),
+        checks_passed=sum(state in {"PASSED", "NEUTRAL"} for state in check_states),
+        blocking_reviews=sum(state == "CHANGES_REQUESTED" for state in review_states),
+        review_comments=open_comments,
+        last_updated_at=max(updated, default=None),
+    )
+
+
+def _unlinked_github_status() -> TaskGitHubStatusResponse:
+    return TaskGitHubStatusResponse(
+        linked=False,
+        ci_status="NOT_LINKED",
+        review_status="NOT_LINKED",
+        checks_total=0,
+        checks_passed=0,
+        blocking_reviews=0,
+        review_comments=0,
+    )
+
+
 def _event_response(
     event: TaskEvent,
     *,
@@ -1034,6 +1209,21 @@ def _event_response(
     elif event.event_type == "APPROVAL_DECIDED":
         kind = "APPROVAL"
         summary = "A human approval decision was recorded."
+    elif event.event_type == GITHUB_PR_BOUND_EVENT:
+        kind = "ACTIVITY"
+        summary = "Pull request linked to this task."
+    elif event.event_type == GITHUB_CHECK_UPDATED_EVENT:
+        kind = "ACTIVITY"
+        summary = f"GitHub check is {str(event.payload.get('state', 'updated')).lower()}."
+    elif event.event_type == GITHUB_REVIEW_UPDATED_EVENT:
+        kind = "ACTIVITY"
+        summary = "GitHub review activity was recorded."
+    elif event.event_type == GITHUB_PULL_REQUEST_UPDATED_EVENT:
+        kind = "ACTIVITY"
+        summary = "Pull request state was updated."
+    elif event.event_type == GITHUB_PR_HEAD_CHANGED_EVENT:
+        kind = "ACTIVITY"
+        summary = "Pull request head changed; prior GitHub status was invalidated."
     else:
         kind = "ACTIVITY"
         summary = "Task activity was recorded."

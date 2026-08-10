@@ -116,4 +116,5 @@ def test_webhook_event_manifest_is_exact() -> None:
         "pull_request",
         "pull_request_review",
         "pull_request_review_comment",
+        "pull_request_review_thread",
     )

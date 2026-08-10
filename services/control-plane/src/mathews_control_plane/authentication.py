@@ -24,6 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from mathews_control_plane.api_paths import GITHUB_WEBHOOK_ENDPOINT
 from mathews_control_plane.database import (
     AuthenticationState,
     AuthSession,
@@ -788,6 +789,7 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             ("POST", "/api/auth/login"),
         }
     )
+    _EXTERNAL_ENDPOINTS = frozenset({("POST", GITHUB_WEBHOOK_ENDPOINT)})
 
     def __init__(
         self,
@@ -806,6 +808,12 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         call_next: RequestResponseEndpoint,
     ) -> Response:
         endpoint = (request.method, request.url.path)
+        if endpoint in self._EXTERNAL_ENDPOINTS:
+            external_response = await call_next(request)
+            return self._prevent_authentication_caching(
+                external_response,
+                enabled=True,
+            )
         is_authentication_endpoint = request.url.path.startswith("/api/auth/")
         is_protected_endpoint = endpoint not in self._PUBLIC_ENDPOINTS
         no_store = is_authentication_endpoint or is_protected_endpoint
