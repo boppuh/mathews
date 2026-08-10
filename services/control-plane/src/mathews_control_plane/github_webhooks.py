@@ -706,7 +706,7 @@ def _normalize_update(event_name: str, payload: dict[str, object]) -> _WebhookUp
         )
 
     pull_request = _mapping(payload, "pull_request")
-    pr_number = _positive_int(payload, "number")
+    pr_number = _positive_int(pull_request, "number")
     head = _mapping(pull_request, "head")
     branch = _required_branch(_required_string(head, "ref", 255))
     sha = _required_sha(_required_string(head, "sha", 64))
@@ -894,7 +894,17 @@ def _best_effort_identity(payload: dict[str, object]) -> tuple[str, str, int | N
     pr = payload.get("pull_request")
     head = pr.get("head") if isinstance(pr, dict) else None
     sha = head.get("sha") if isinstance(head, dict) else None
-    number = payload.get("number")
+    number = pr.get("number") if isinstance(pr, dict) else None
+    check_run = payload.get("check_run")
+    if isinstance(check_run, dict):
+        sha = check_run.get("head_sha")
+        pull_requests = check_run.get("pull_requests")
+        if (
+            isinstance(pull_requests, list)
+            and len(pull_requests) == 1
+            and isinstance(pull_requests[0], dict)
+        ):
+            number = pull_requests[0].get("number")
     return (
         str(installation_id)[:255],
         str(repository_id)[:255],

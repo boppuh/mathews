@@ -168,8 +168,8 @@ def _review_payload(*, state: str = "changes_requested") -> dict[str, object]:
         "action": "submitted",
         "installation": {"id": 202},
         "repository": {"id": 303, "full_name": "boppuh/mathews"},
-        "number": 42,
         "pull_request": {
+            "number": 42,
             "head": {"ref": "codex/task-6-3", "sha": _HEAD_SHA},
         },
         "review": {
