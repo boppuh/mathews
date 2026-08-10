@@ -12,6 +12,7 @@ import {
 } from "../../../lib/task-client";
 import { parseTaskEvent, shortRevision } from "../../../lib/tasks";
 import { EvidenceWorkbench } from "./evidence-workbench";
+import { TaskControls } from "./task-controls";
 
 type CockpitState =
   | { status: "loading" }
@@ -234,6 +235,7 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
         <nav className="cockpit-nav" aria-label="Task cockpit sections">
           <Link href="/inbox">Decision inbox</Link>
           <a href="#timeline">Timeline</a>
+          <a href="#controls">Controls</a>
           <a href="#activity">Activity</a>
           <a href="#acceptance">Criteria</a>
           <a href="#evidence">Evidence</a>
@@ -277,6 +279,8 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
         </div>
         <p>{stateContext.detail}</p>
       </section>
+
+      <TaskControls task={task} onRefresh={() => loadCockpit(undefined, true)} />
 
       <section id="timeline" className="cockpit-section" aria-labelledby="timeline-heading">
         <div className="cockpit-section-heading">

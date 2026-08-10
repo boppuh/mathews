@@ -122,6 +122,69 @@ describe("taskClient", () => {
     expect(init).toMatchObject({ credentials: "include", method: "GET" });
   });
 
+  it("records steering with CSRF and parses the durable result", async () => {
+    const body = {
+      steering_id: "22222222-2222-4222-8222-222222222222",
+      expected_state: "IMPLEMENTING" as const,
+      message: "Also cover the retry screen.",
+      impacts: ["PATHS" as const],
+    };
+    const result = {
+      ...body,
+      task_id: task.id,
+      classification: "SCOPE_CHANGE",
+      task_state: "BRIEFING",
+      evidence_id: "33333333-3333-4333-8333-333333333333",
+      request_evidence_id: "44444444-4444-4444-8444-444444444444",
+      event_id: "55555555-5555-4555-8555-555555555555",
+      invalidated_brief_id: null,
+      invalidated_validation_contract_id: null,
+      revoked_lease_count: 0,
+      revoked_tool_grant_count: 0,
+      replayed: false,
+    };
+    delete (result as Partial<typeof result>).expected_state;
+    delete (result as Partial<typeof result>).message;
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(result), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "__Host-mathews-csrf=csrf-token" });
+
+    await expect(taskClient.steer(task.id, body)).resolves.toEqual(result);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`http://localhost:8000/api/tasks/${task.id}/steering`);
+    expect(init).toMatchObject({ method: "POST", credentials: "include" });
+    expect(JSON.parse(String(init.body))).toEqual(body);
+  });
+
+  it("identifies cancellation reauthentication without exposing server detail", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail: "private server detail" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    vi.stubGlobal("document", { cookie: "__Host-mathews-csrf=csrf-token" });
+
+    await expect(
+      taskClient.cancel(task.id, {
+        cancellation_id: "88888888-8888-4888-8888-888888888888",
+        expected_state: "IMPLEMENTING",
+        reason_code: "USER_REQUEST",
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: "Re-enter your password to cancel this task.",
+    });
+  });
+
   it.each([
     [401, "Your session expired"],
     [404, "task is unavailable"],

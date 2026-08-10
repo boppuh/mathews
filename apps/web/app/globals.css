@@ -916,6 +916,138 @@ section {
   font-size: 0.75rem;
 }
 
+.task-control-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(18rem, 0.55fr);
+  gap: 1rem;
+}
+
+.steering-form,
+.cancellation-control {
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+  padding: clamp(1.25rem, 3vw, 1.75rem);
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: rgb(21 27 36 / 88%);
+}
+
+.steering-form h3,
+.cancellation-control h3 {
+  margin: 0 0 0.45rem;
+  font-size: 1rem;
+}
+
+.steering-form p,
+.cancellation-control p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+
+.steering-form > label,
+.task-cancel-reauthentication label,
+.steering-form legend {
+  color: #c7d3df;
+  font-size: 0.72rem;
+  font-weight: 720;
+}
+
+.steering-form textarea,
+.task-cancel-reauthentication input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  background: #0f141c;
+  color: var(--foreground);
+  font: inherit;
+}
+
+.steering-form textarea {
+  min-height: 7rem;
+  padding: 0.85rem;
+  resize: vertical;
+}
+
+.task-cancel-reauthentication input {
+  padding: 0.75rem;
+}
+
+.steering-form textarea:focus,
+.task-cancel-reauthentication input:focus {
+  border-color: var(--accent);
+  outline: 2px solid rgb(112 225 200 / 18%);
+}
+
+.steering-form fieldset {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.steering-form legend {
+  grid-column: 1 / -1;
+  margin-bottom: 0.55rem;
+}
+
+.steering-form fieldset label {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: #0f141c;
+  color: #c7d3df;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.steering-form input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.steering-form button,
+.cancellation-control button {
+  justify-self: start;
+}
+
+.steering-form .task-control-notice {
+  color: var(--accent);
+}
+
+.cancellation-control {
+  border-color: rgb(255 157 157 / 25%);
+}
+
+.cancellation-control button.danger {
+  border-color: rgb(255 157 157 / 45%);
+  background: rgb(255 157 157 / 12%);
+  color: var(--danger);
+}
+
+.task-cancel-confirmation,
+.task-cancel-reauthentication {
+  display: grid;
+  gap: 0.8rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgb(255 157 157 / 25%);
+}
+
+.task-cancel-confirmation strong {
+  color: var(--danger);
+}
+
+.task-control-muted {
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
 .cockpit-timeline {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -2007,6 +2139,10 @@ section {
     grid-template-columns: 1fr;
   }
 
+  .task-control-grid {
+    grid-template-columns: 1fr;
+  }
+
   .criteria-panel,
   .evidence-grid {
     grid-template-columns: 1fr;
@@ -2087,5 +2223,9 @@ section {
 
   .cockpit-timeline {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .steering-form fieldset {
+    grid-template-columns: 1fr;
   }
 }

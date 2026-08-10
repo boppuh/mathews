@@ -1,13 +1,23 @@
 import type {
   CreateTaskRequest,
+  TaskCancellationRequest,
+  TaskCancellationResponse,
   TaskCockpitResponse,
   TaskEvidenceSummary,
   TaskListResponse,
+  TaskSteeringRequest,
+  TaskSteeringResponse,
   TaskSummary,
 } from "@mathews/contracts";
 
 import { cookieValue, normalizeControlPlaneUrl } from "./auth";
-import { parseTaskCockpit, parseTaskList, parseTaskSummary } from "./tasks";
+import {
+  parseTaskCancellationResponse,
+  parseTaskCockpit,
+  parseTaskList,
+  parseTaskSteeringResponse,
+  parseTaskSummary,
+} from "./tasks";
 
 const CSRF_COOKIE_NAME = "__Host-mathews-csrf";
 const MAX_EVIDENCE_CONTENT_BYTES = 1024 * 1024;
@@ -40,7 +50,12 @@ export class TaskRequestError extends Error {
   }
 }
 
-async function request(path: string, init: RequestInit, fallbackError: string): Promise<Response> {
+async function request(
+  path: string,
+  init: RequestInit,
+  fallbackError: string,
+  statusMessages: Partial<Record<number, string>> = {},
+): Promise<Response> {
   const response = await fetch(`${controlPlaneUrl}${path}`, {
     ...init,
     credentials: "include",
@@ -51,7 +66,8 @@ async function request(path: string, init: RequestInit, fallbackError: string): 
   });
   if (!response.ok) {
     const message =
-      response.status === 401
+      statusMessages[response.status] ??
+      (response.status === 401
         ? "Your session expired. Refresh the page and sign in again."
         : response.status === 404
           ? "This task is unavailable."
@@ -59,7 +75,7 @@ async function request(path: string, init: RequestInit, fallbackError: string): 
             ? "The task request is too large."
             : response.status === 422
               ? "Check the repository, exact base SHA, and task request."
-              : fallbackError;
+              : fallbackError);
     throw new TaskRequestError(message, response.status);
   }
   return response;
@@ -106,6 +122,29 @@ export const taskClient = {
       "Unable to load the task cockpit.",
     );
     return parseTaskCockpit(await response.json());
+  },
+
+  async steer(taskId: string, body: TaskSteeringRequest): Promise<TaskSteeringResponse> {
+    const response = await request(
+      `/api/tasks/${encodeURIComponent(taskId)}/steering`,
+      { method: "POST", headers: csrfHeaders(), body: JSON.stringify(body) },
+      "Unable to record the steering message.",
+      { 409: "The task changed before steering was applied. Refresh and try again." },
+    );
+    return parseTaskSteeringResponse(await response.json());
+  },
+
+  async cancel(taskId: string, body: TaskCancellationRequest): Promise<TaskCancellationResponse> {
+    const response = await request(
+      `/api/tasks/${encodeURIComponent(taskId)}/cancellations`,
+      { method: "POST", headers: csrfHeaders(), body: JSON.stringify(body) },
+      "Unable to cancel the task.",
+      {
+        403: "Re-enter your password to cancel this task.",
+        409: "The task changed before cancellation was applied. Refresh and try again.",
+      },
+    );
+    return parseTaskCancellationResponse(await response.json());
   },
 };
 

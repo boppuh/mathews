@@ -22,6 +22,10 @@ from mathews_control_plane.authentication import (
     AuthenticatedSession,
     require_authenticated_session,
 )
+from mathews_control_plane.background_jobs import (
+    BackgroundJobConflictError,
+    BackgroundJobNotFoundError,
+)
 from mathews_control_plane.database import (
     AuthSession,
     SessionFactory,
@@ -44,11 +48,29 @@ from mathews_control_plane.domain_models import (
     TaskState,
 )
 from mathews_control_plane.evidence import redact_evidence_content
+from mathews_control_plane.reliability import (
+    CancellationService,
+    ReliabilityConflictError,
+)
+from mathews_control_plane.steering import (
+    STEERING_EVENT_TYPE,
+    SteeringClassification,
+    SteeringConflictError,
+    SteeringImpact,
+    SteeringNotFoundError,
+    SteeringResult,
+    SteeringService,
+)
+from mathews_control_plane.task_state_machine import (
+    TaskTransitionError,
+    TaskTransitionKind,
+)
 
 TASK_INTAKE_EVENT_TYPE = "TASK_CREATED"
 TASK_INTAKE_EVENT_SCHEMA_VERSION = 1
 MAX_TASK_REQUEST_CHARACTERS = 20_000
 MAX_TASK_REQUEST_BYTES = 64 * 1024
+MAX_STEERING_MESSAGE_CHARACTERS = 2_000
 TASK_EVENT_STREAM_BATCH_SIZE = 100
 TASK_EVENT_POLL_INTERVAL_SECONDS = 1.0
 TASK_EVENT_HEARTBEAT_SECONDS = 15.0
@@ -109,6 +131,67 @@ class TaskCreateRequest(BaseModel):
         if value.endswith(".git"):
             raise ValueError("repository key must not use a transport suffix")
         return value
+
+
+class TaskSteeringRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    steering_id: UUID
+    expected_state: TaskState
+    message: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=MAX_STEERING_MESSAGE_CHARACTERS,
+        ),
+    ]
+    impacts: tuple[SteeringImpact, ...] = Field(default=(), max_length=4)
+
+    @field_validator("impacts")
+    @classmethod
+    def impacts_are_unique(
+        cls,
+        values: tuple[SteeringImpact, ...],
+    ) -> tuple[SteeringImpact, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("steering impacts must be unique")
+        return values
+
+
+class TaskSteeringResponse(BaseModel):
+    steering_id: UUID
+    task_id: UUID
+    classification: SteeringClassification
+    impacts: list[SteeringImpact]
+    task_state: TaskState
+    evidence_id: UUID
+    request_evidence_id: UUID
+    event_id: UUID
+    invalidated_brief_id: UUID | None = None
+    invalidated_validation_contract_id: UUID | None = None
+    revoked_lease_count: int = Field(ge=0)
+    revoked_tool_grant_count: int = Field(ge=0)
+    replayed: bool
+
+
+class TaskCancellationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    cancellation_id: UUID
+    expected_state: TaskState
+    reason_code: Literal["USER_REQUEST"] = "USER_REQUEST"
+
+
+class TaskCancellationResponse(BaseModel):
+    cancellation_id: UUID
+    task_id: UUID
+    task_state: TaskState
+    partial_evidence_id: UUID
+    revoked_lease_count: int = Field(ge=0)
+    revoked_tool_grant_count: int = Field(ge=0)
+    cleanup_complete: bool
+    replayed: bool
 
 
 class TaskBlockerResponse(BaseModel):
@@ -246,6 +329,11 @@ class TaskService:
         self._factory = session_factory
         self._artifact_store = artifact_store
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._steering = SteeringService(
+            session_factory,
+            artifact_store,
+            clock=self._clock,
+        )
 
     def create(
         self,
@@ -340,6 +428,80 @@ class TaskService:
                     for task, last_activity_at in rows
                 ]
             )
+
+    def steer(
+        self,
+        task_id: UUID,
+        body: TaskSteeringRequest,
+        authentication: AuthenticatedSession,
+    ) -> TaskSteeringResponse:
+        owner_id = _principal(authentication)
+        result: SteeringResult = self._steering.steer(
+            task_id,
+            steering_id=body.steering_id,
+            expected_state=body.expected_state,
+            message=body.message,
+            impacts=body.impacts,
+            owner_id=owner_id,
+        )
+        return TaskSteeringResponse(
+            steering_id=result.steering_id,
+            task_id=result.task_id,
+            classification=result.classification,
+            impacts=list(result.impacts),
+            task_state=result.task_state,
+            evidence_id=result.evidence_id,
+            request_evidence_id=result.request_evidence_id,
+            event_id=result.event_id,
+            invalidated_brief_id=result.invalidated_brief_id,
+            invalidated_validation_contract_id=(
+                result.invalidated_validation_contract_id
+            ),
+            revoked_lease_count=result.revoked_lease_count,
+            revoked_tool_grant_count=result.revoked_tool_grant_count,
+            replayed=result.replayed,
+        )
+
+    def cancel(
+        self,
+        task_id: UUID,
+        body: TaskCancellationRequest,
+        authentication: AuthenticatedSession,
+    ) -> TaskCancellationResponse:
+        owner_id = _principal(authentication)
+        now = _as_utc(self._clock())
+        if not (
+            authentication.recent_password_verified
+            and _as_utc(authentication.reauthenticated_until) > now
+        ):
+            raise PermissionError("recent password authentication required")
+        with self._factory() as session:
+            task = session.scalar(
+                select(Task).where(Task.id == task_id, Task.owner_id == owner_id)
+            )
+        if task is None:
+            raise TaskNotFoundError("task is unavailable")
+        result = CancellationService(
+            self._factory,
+            self._artifact_store,
+            principal_id=owner_id,
+            clock=self._clock,
+        ).cancel_task(
+            task_id,
+            cancellation_id=body.cancellation_id,
+            expected_state=body.expected_state,
+            reason_code=body.reason_code,
+        )
+        return TaskCancellationResponse(
+            cancellation_id=result.cancellation_id,
+            task_id=result.task_id,
+            task_state=result.task_state,
+            partial_evidence_id=result.partial_evidence_id,
+            revoked_lease_count=result.revoked_lease_count,
+            revoked_tool_grant_count=result.revoked_tool_grant_count,
+            cleanup_complete=result.cleanup_complete,
+            replayed=result.replayed,
+        )
 
     def detail(
         self,
@@ -844,11 +1006,24 @@ def _event_response(
         summary = "Task request captured."
     elif event.event_type == "TASK_STATE_TRANSITION":
         kind = "STATE_TRANSITION"
+        if event.transition_kind == TaskTransitionKind.CANCEL.value:
+            summary = "Task cancelled; active automation was fenced."
+        elif event.transition_kind == TaskTransitionKind.SCOPE_STEER.value:
+            summary = "Scope changed; a new brief and validation contract are required."
+        else:
+            summary = (
+                f"State changed from {_state_label(from_state)} "
+                f"to {_state_label(to_state)}."
+                if from_state is not None and to_state is not None
+                else "Task state changed."
+            )
+    elif event.event_type == STEERING_EVENT_TYPE:
+        kind = "ACTIVITY"
         summary = (
-            f"State changed from {_state_label(from_state)} "
-            f"to {_state_label(to_state)}."
-            if from_state is not None and to_state is not None
-            else "Task state changed."
+            "In-scope clarification recorded."
+            if event.payload.get("classification")
+            == SteeringClassification.CLARIFICATION.value
+            else "Scope-changing steering recorded."
         )
     elif event.event_type == "APPROVAL_REQUESTED":
         kind = "APPROVAL"
@@ -1093,7 +1268,7 @@ class TaskBodyLimitMiddleware:
         bounded = (
             scope["type"] == "http"
             and scope.get("method") == "POST"
-            and scope.get("path") == "/api/tasks"
+            and self._bounded_path(str(scope.get("path", "")))
         )
         if not bounded:
             await self._app(scope, receive, send)
@@ -1131,6 +1306,18 @@ class TaskBodyLimitMiddleware:
             return await receive()
 
         await self._app(scope, replay_receive, send)
+
+    @staticmethod
+    def _bounded_path(path: str) -> bool:
+        if path == "/api/tasks":
+            return True
+        parts = path.split("/")
+        return (
+            len(parts) == 5
+            and parts[:3] == ["", "api", "tasks"]
+            and bool(parts[3])
+            and parts[4] in {"steering", "cancellations"}
+        )
 
     @staticmethod
     def _content_length(scope: Scope) -> int | None:
@@ -1188,6 +1375,63 @@ def create_task_router(service: TaskService) -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="task unavailable",
+            ) from None
+
+    @router.post(
+        "/{task_id}/steering",
+        response_model=TaskSteeringResponse,
+    )
+    def steer_task(
+        task_id: UUID,
+        body: TaskSteeringRequest,
+        authentication: AuthenticatedTaskSession,
+        response: Response,
+    ) -> TaskSteeringResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return service.steer(task_id, body, authentication)
+        except (TaskAccessError, SteeringNotFoundError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="task unavailable",
+            ) from None
+        except (SteeringConflictError, TaskTransitionError):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="task steering conflicts with durable state",
+            ) from None
+
+    @router.post(
+        "/{task_id}/cancellations",
+        response_model=TaskCancellationResponse,
+    )
+    def cancel_task(
+        task_id: UUID,
+        body: TaskCancellationRequest,
+        authentication: AuthenticatedTaskSession,
+        response: Response,
+    ) -> TaskCancellationResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return service.cancel(task_id, body, authentication)
+        except PermissionError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="recent password authentication required",
+            ) from None
+        except (TaskAccessError, TaskNotFoundError, BackgroundJobNotFoundError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="task unavailable",
+            ) from None
+        except (
+            BackgroundJobConflictError,
+            ReliabilityConflictError,
+            TaskTransitionError,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="task cancellation conflicts with durable state",
             ) from None
 
     @router.get("/{task_id}/events")
