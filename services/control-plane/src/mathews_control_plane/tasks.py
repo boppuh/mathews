@@ -46,6 +46,8 @@ from mathews_control_plane.domain_models import (
     TaskEvent,
     TaskEventEvidenceReference,
     TaskState,
+    ValidationContract,
+    ValidationRun,
 )
 from mathews_control_plane.evidence import redact_evidence_content
 from mathews_control_plane.github_webhooks import (
@@ -284,6 +286,21 @@ class TaskEvidenceResponse(BaseModel):
     download_path: str | None = None
 
 
+class TaskAcceptanceAssertionResponse(BaseModel):
+    assertion_id: str
+    kind: Literal[
+        "ELEMENT_VALUE_PRESENT",
+        "NAVIGATION_STATE_REACHED",
+        "EXPECTED_NETWORK_RESPONSE",
+        "EXPECTED_LOG_EVENT",
+        "NO_CRASH",
+    ]
+    verifier_catalog_key: str
+    status: Literal["PENDING", "PASSED", "FAILED", "BLOCKED"]
+    result_code: str
+    evidence_ids: list[UUID]
+
+
 class TaskAcceptanceCriterionResponse(BaseModel):
     id: str
     requirement: str
@@ -294,6 +311,12 @@ class TaskAcceptanceCriterionResponse(BaseModel):
         "HUMAN_INSPECTION",
     ]
     status: Literal["PENDING", "PASSED", "FAILED", "BLOCKED"]
+    validation_run_id: UUID | None = None
+    validation_contract_version: int | None = Field(default=None, ge=1)
+    commit_sha: GitObjectId | None = None
+    tree_sha: GitObjectId | None = None
+    evidence_ids: list[UUID] = Field(default_factory=list)
+    assertions: list[TaskAcceptanceAssertionResponse] = Field(default_factory=list)
 
 
 class TaskApprovalResponse(BaseModel):
@@ -595,6 +618,24 @@ class TaskService:
                 if task.accepted_brief_id is None
                 else session.get(Brief, task.accepted_brief_id)
             )
+            validation_contract = (
+                None
+                if task.validation_contract_id is None
+                else session.get(ValidationContract, task.validation_contract_id)
+            )
+            latest_validation_run = (
+                None
+                if validation_contract is None
+                else session.scalar(
+                    select(ValidationRun)
+                    .where(
+                        ValidationRun.task_id == task.id,
+                        ValidationRun.validation_contract_id == validation_contract.id,
+                    )
+                    .order_by(ValidationRun.created_at.desc(), ValidationRun.id.desc())
+                    .limit(1)
+                )
+            )
             approvals = tuple(
                 session.scalars(
                     select(ApprovalRequest)
@@ -629,7 +670,11 @@ class TaskService:
                     )
                     for event in events
                 ],
-                acceptance_criteria=_acceptance_criteria_response(accepted_brief),
+                acceptance_criteria=_acceptance_criteria_response(
+                    accepted_brief,
+                    latest_validation_run,
+                    validation_contract,
+                ),
                 evidence=[
                     _evidence_response(
                         record,
@@ -1343,6 +1388,8 @@ def _evidence_category(
 
 def _acceptance_criteria_response(
     brief: Brief | None,
+    validation_run: ValidationRun | None = None,
+    validation_contract: ValidationContract | None = None,
 ) -> list[TaskAcceptanceCriterionResponse]:
     if brief is None:
         return []
@@ -1354,6 +1401,10 @@ def _acceptance_criteria_response(
         "STATIC_CHECK",
         "HUMAN_INSPECTION",
     }
+    recorded_results = _recorded_criterion_results(
+        validation_run,
+        validation_contract,
+    )
     for value in brief.acceptance_criteria:
         if not isinstance(value, dict):
             continue
@@ -1374,6 +1425,7 @@ def _acceptance_criteria_response(
         if criterion_id in seen_criterion_ids:
             continue
         seen_criterion_ids.add(criterion_id)
+        recorded = recorded_results.get(criterion_id)
         result.append(
             TaskAcceptanceCriterionResponse(
                 id=criterion_id,
@@ -1387,9 +1439,196 @@ def _acceptance_criteria_response(
                     ],
                     verification,
                 ),
-                status="PENDING",
+                status=(
+                    "PENDING"
+                    if recorded is None
+                    else cast(
+                        Literal["PENDING", "PASSED", "FAILED", "BLOCKED"],
+                        recorded["status"],
+                    )
+                ),
+                validation_run_id=(
+                    None
+                    if recorded is None
+                    else cast(UUID, recorded["validation_run_id"])
+                ),
+                validation_contract_version=(
+                    None
+                    if recorded is None
+                    else cast(int, recorded["validation_contract_version"])
+                ),
+                commit_sha=(
+                    None if recorded is None else cast(str, recorded["commit_sha"])
+                ),
+                tree_sha=(
+                    None if recorded is None else cast(str, recorded["tree_sha"])
+                ),
+                evidence_ids=(
+                    [] if recorded is None else cast(list[UUID], recorded["evidence_ids"])
+                ),
+                assertions=(
+                    []
+                    if recorded is None
+                    else cast(
+                        list[TaskAcceptanceAssertionResponse],
+                        recorded["assertions"],
+                    )
+                ),
             )
         )
+    return result
+
+
+def _recorded_criterion_results(
+    validation_run: ValidationRun | None,
+    validation_contract: ValidationContract | None,
+) -> dict[str, dict[str, object]]:
+    if (
+        validation_run is None
+        or validation_contract is None
+        or validation_run.validation_contract_id != validation_contract.id
+    ):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    allowed_statuses = {"PENDING", "PASSED", "FAILED", "BLOCKED"}
+    allowed_kinds = {
+        "ELEMENT_VALUE_PRESENT",
+        "NAVIGATION_STATE_REACHED",
+        "EXPECTED_NETWORK_RESPONSE",
+        "EXPECTED_LOG_EVENT",
+        "NO_CRASH",
+    }
+    for value in validation_run.acceptance_criterion_results:
+        if not isinstance(value, dict):
+            continue
+        criterion_id = value.get("criterion_id")
+        status_value = value.get("status")
+        contract_version = value.get("validation_contract_version")
+        commit_sha = value.get("commit_sha")
+        tree_sha = value.get("tree_sha")
+        raw_evidence_ids = value.get("evidence_ids")
+        raw_assertions = value.get("assertions")
+        if (
+            not isinstance(criterion_id, str)
+            or not criterion_id
+            or status_value not in allowed_statuses
+            or contract_version != validation_contract.version
+            or commit_sha != validation_run.commit_sha
+            or tree_sha != validation_run.tree_sha
+            or not isinstance(raw_evidence_ids, list)
+            or not isinstance(raw_assertions, list)
+            or not raw_assertions
+        ):
+            continue
+        try:
+            evidence_ids = [UUID(item) for item in raw_evidence_ids if isinstance(item, str)]
+        except ValueError:
+            continue
+        if len(evidence_ids) != len(raw_evidence_ids):
+            continue
+        assertions: list[TaskAcceptanceAssertionResponse] = []
+        seen_assertion_ids: set[str] = set()
+        valid = True
+        for assertion in raw_assertions:
+            if not isinstance(assertion, dict):
+                valid = False
+                break
+            assertion_id = assertion.get("assertion_id")
+            kind = assertion.get("kind")
+            catalog_key = assertion.get("verifier_catalog_key")
+            assertion_status = assertion.get("status")
+            result_code = assertion.get("result_code")
+            raw_assertion_evidence = assertion.get("evidence_ids")
+            if (
+                not isinstance(assertion_id, str)
+                or not assertion_id
+                or kind not in allowed_kinds
+                or not isinstance(catalog_key, str)
+                or not catalog_key
+                or assertion_status not in allowed_statuses
+                or not isinstance(result_code, str)
+                or not result_code
+                or not isinstance(raw_assertion_evidence, list)
+                or assertion_id in seen_assertion_ids
+            ):
+                valid = False
+                break
+            try:
+                assertion_evidence = [
+                    UUID(item)
+                    for item in raw_assertion_evidence
+                    if isinstance(item, str)
+                ]
+            except ValueError:
+                valid = False
+                break
+            if (
+                len(assertion_evidence) != len(raw_assertion_evidence)
+                or len(assertion_evidence) != len(set(assertion_evidence))
+                or (
+                    assertion_status == "PENDING" and bool(assertion_evidence)
+                )
+                or (
+                    assertion_status != "PENDING" and not assertion_evidence
+                )
+            ):
+                valid = False
+                break
+            seen_assertion_ids.add(assertion_id)
+            assertions.append(
+                TaskAcceptanceAssertionResponse(
+                    assertion_id=assertion_id,
+                    kind=cast(
+                        Literal[
+                            "ELEMENT_VALUE_PRESENT",
+                            "NAVIGATION_STATE_REACHED",
+                            "EXPECTED_NETWORK_RESPONSE",
+                            "EXPECTED_LOG_EVENT",
+                            "NO_CRASH",
+                        ],
+                        kind,
+                    ),
+                    verifier_catalog_key=catalog_key,
+                    status=cast(
+                        Literal["PENDING", "PASSED", "FAILED", "BLOCKED"],
+                        assertion_status,
+                    ),
+                    result_code=result_code,
+                    evidence_ids=assertion_evidence,
+                )
+            )
+        assertion_evidence_ids = {
+            evidence_id
+            for assertion in assertions
+            for evidence_id in assertion.evidence_ids
+        }
+        assertion_statuses = {assertion.status for assertion in assertions}
+        expected_status = (
+            "FAILED"
+            if "FAILED" in assertion_statuses
+            else "BLOCKED"
+            if "BLOCKED" in assertion_statuses
+            else "PENDING"
+            if "PENDING" in assertion_statuses
+            else "PASSED"
+        )
+        if (
+            not valid
+            or criterion_id in result
+            or len(evidence_ids) != len(set(evidence_ids))
+            or set(evidence_ids) != assertion_evidence_ids
+            or status_value != expected_status
+        ):
+            continue
+        result[criterion_id] = {
+            "status": status_value,
+            "validation_run_id": validation_run.id,
+            "validation_contract_version": contract_version,
+            "commit_sha": commit_sha,
+            "tree_sha": tree_sha,
+            "evidence_ids": evidence_ids,
+            "assertions": assertions,
+        }
     return result
 
 

@@ -414,6 +414,30 @@ export function EvidenceWorkbench({
                   <small>
                     {criterion.id} · {verificationLabels[criterion.verification]}
                   </small>
+                  {criterion.validation_run_id ? (
+                    <small>
+                      Contract v{criterion.validation_contract_version} · candidate{" "}
+                      <code>{criterion.commit_sha?.slice(0, 8)}</code> · tree{" "}
+                      <code>{criterion.tree_sha?.slice(0, 8)}</code>
+                    </small>
+                  ) : null}
+                  {criterion.assertions.map((assertion) => (
+                    <small key={assertion.assertion_id}>
+                      {assertion.assertion_id}: {assertion.status.toLowerCase()} ·{" "}
+                      {assertion.result_code}
+                    </small>
+                  ))}
+                  {criterion.evidence_ids.length > 0 ? (
+                    <small>
+                      Evidence:{" "}
+                      {criterion.evidence_ids.map((evidenceId, index) => (
+                        <span key={evidenceId}>
+                          {index > 0 ? ", " : ""}
+                          <a href={`#evidence-${evidenceId}`}>{evidenceId.slice(0, 8)}</a>
+                        </span>
+                      ))}
+                    </small>
+                  ) : null}
                 </div>
               </li>
             ))}

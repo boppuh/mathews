@@ -29,12 +29,13 @@ complete here unless its backlog definition of done is satisfied on `main`.
   `4.1` structured task briefing, `4.2` versioned role-specific prompts,
   `4.3` durable, lease-fenced Hermes run integration, `4.4`
   control-plane-authorized scoped code-change execution,
-  `5.1` deterministic simulator-flow
-  contracts, `6.1` least-privilege GitHub App authentication, and `6.3` signed,
+  `5.1` deterministic simulator-flow contracts, `5.2` validation evidence
+  collection,
+  `6.1` least-privilege GitHub App authentication, and `6.3` signed,
   idempotent CI and review webhook ingestion.
-- Remaining: 11 of 40 MVP tasks.
+- Remaining: 10 of 40 MVP tasks.
 - Active next wave: Wave 6 validation, repair, and evidence intelligence.
-- Next completion target: `5.2`.
+- Next completion target: `5.3`.
 
 ## Operating model
 

@@ -130,6 +130,12 @@ describe("task cockpit parsing", () => {
         requirement: "The task can be inspected without leaving the cockpit.",
         verification: "HUMAN_INSPECTION",
         status: "PENDING",
+        validation_run_id: null,
+        validation_contract_version: null,
+        commit_sha: null,
+        tree_sha: null,
+        evidence_ids: [],
+        assertions: [],
       },
     ],
     evidence: [

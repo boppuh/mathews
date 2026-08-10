@@ -431,6 +431,20 @@ class ConfiguredOperationRunner:
             and after["tree_sha"] == before["tree_sha"]
         )
         cancelled = cancellation_status != "NOT_REQUESTED"
+        simulator_target = None
+        if operation.kind is OperationKind.SIMULATOR_E2E:
+            flow = e2e_flow
+            if simulator_id is None or flow is None:
+                raise ConfiguredExecutionError("E2E_CONFIGURATION_INVALID")
+            simulator_target = {
+                "device_id": simulator_id,
+                "device_type_identifier": (
+                    configuration.xcode.simulator.device_type_identifier
+                ),
+                "runtime_identifier": configuration.xcode.simulator.runtime_identifier,
+                "locale_identifier": flow.locale_identifier,
+                "time_zone_identifier": flow.time_zone_identifier,
+            }
         return {
             "operation_id": operation.operation_id,
             "operation_kind": operation.kind.value,
@@ -452,6 +466,7 @@ class ConfiguredOperationRunner:
             "configuration_version": configuration.version,
             "configuration_digest": configuration.digest,
             "validation_contract_version": validation_contract_version,
+            "simulator_target": simulator_target,
             "fencing_token": authority.fencing_token,
             "artifacts": [reference.to_dict() for reference in references],
         }

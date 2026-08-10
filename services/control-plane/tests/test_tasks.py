@@ -594,6 +594,12 @@ def test_cockpit_projects_criteria_lineage_access_fences_and_tombstones(
             "requirement": "Redacted logs are searchable on demand.",
             "verification": "HUMAN_INSPECTION",
             "status": "PENDING",
+            "validation_run_id": None,
+            "validation_contract_version": None,
+            "commit_sha": None,
+            "tree_sha": None,
+            "evidence_ids": [],
+            "assertions": [],
         }
     ]
     by_id = {item["id"]: item for item in cockpit["evidence"]}
