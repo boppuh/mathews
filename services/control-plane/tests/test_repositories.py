@@ -311,6 +311,47 @@ def test_invalid_configuration_creates_no_version(
         assert len(session.scalars(select(RepositoryConfiguration)).all()) == 1
 
 
+def test_configuration_too_large_for_host_protocol_creates_no_version(
+    repository_harness: RepositoryHarness,
+) -> None:
+    headers = _authenticate(repository_harness)
+    body = _write_body(repository_harness.configuration)
+    cast(dict[str, object], body["artifact_settings"])["collection_paths"] = [
+        f"artifacts/result-{index}.json" for index in range(513)
+    ]
+
+    response = repository_harness.client.post(
+        "/api/repository/versions", json=body, headers=headers
+    )
+
+    assert response.status_code == 422
+    with repository_harness.factory() as session:
+        assert len(session.scalars(select(RepositoryConfiguration)).all()) == 1
+
+
+def test_preflight_host_protocol_failure_does_not_leave_a_running_attempt(
+    repository_harness: RepositoryHarness,
+) -> None:
+    headers = _authenticate(repository_harness)
+    with repository_harness.factory() as session, session.begin():
+        configuration = session.get(RepositoryConfiguration, repository_harness.configuration.id)
+        assert configuration is not None
+        artifact_settings = copy.deepcopy(configuration.artifact_settings)
+        artifact_settings["collection_paths"] = [
+            f"artifacts/result-{index}.json" for index in range(513)
+        ]
+        configuration.artifact_settings = artifact_settings
+
+    response = repository_harness.client.post(
+        "/api/repository/preflights", json={}, headers=headers
+    )
+
+    assert response.status_code == 503
+    current = repository_harness.client.get("/api/repository")
+    assert current.status_code == 200
+    assert current.json()["preflight"]["status"] == "NOT_RUN"
+
+
 def test_stale_configuration_version_cannot_overwrite_the_latest_secrets(
     repository_harness: RepositoryHarness,
 ) -> None:

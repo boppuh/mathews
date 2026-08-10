@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from mathews_configuration import (
     HostOperation,
+    HostProtocolError,
     HostRequestMessage,
     HostResponseMessage,
     HostResponseStatus,
@@ -227,6 +228,7 @@ class RepositoryService:
                 actor_id=actor_id,
                 root_correlation_id=root_id,
             )
+            _validate_preflight_host_operation(created)
             return self._projection(session, created)
 
     def preflight(self, authentication: AuthenticatedSession) -> RepositoryProjection:
@@ -251,27 +253,33 @@ class RepositoryService:
             validated = validated_repository_configuration(configuration)
 
         issued_at_ms = int(now.timestamp() * 1000)
-        request = HostRequestMessage(
-            request_id=uuid4(),
-            issued_at_ms=issued_at_ms,
-            expires_at_ms=int((now + _PREFLIGHT_LIFETIME).timestamp() * 1000),
-            authority=RepositoryHostAuthority(
-                repository_key=attempt.repository_key,
-                configuration_id=attempt.configuration_id,
-                configuration_digest=attempt.configuration_digest,
-            ),
-            operation=HostOperation(
-                name="repository.preflight",
-                idempotency_key=f"repository-preflight:{attempt.attempt_id}",
-                arguments=cast(
-                    dict[str, JsonValue],
-                    {
-                        "attempt_id": str(attempt.attempt_id),
-                        "configuration": validated.to_dict(),
-                    },
+        try:
+            request = HostRequestMessage(
+                request_id=uuid4(),
+                issued_at_ms=issued_at_ms,
+                expires_at_ms=int((now + _PREFLIGHT_LIFETIME).timestamp() * 1000),
+                authority=RepositoryHostAuthority(
+                    repository_key=attempt.repository_key,
+                    configuration_id=attempt.configuration_id,
+                    configuration_digest=attempt.configuration_digest,
                 ),
-            ),
-        )
+                operation=HostOperation(
+                    name="repository.preflight",
+                    idempotency_key=f"repository-preflight:{attempt.attempt_id}",
+                    arguments=cast(
+                        dict[str, JsonValue],
+                        {
+                            "attempt_id": str(attempt.attempt_id),
+                            "configuration": validated.to_dict(),
+                        },
+                    ),
+                ),
+            )
+        except HostProtocolError:
+            self._clear_failed_preflight(attempt)
+            raise RepositoryPreflightBindingError(
+                "repository configuration exceeds the host protocol boundary"
+            ) from None
         try:
             response = self._host_gateway.execute(request)
             if response.status is not HostResponseStatus.OK:
@@ -436,6 +444,25 @@ def _lock_repository_writer(session: Session) -> None:
     owner = session.get(LocalUser, _USER_ID, with_for_update=True)
     if owner is None:
         raise PermissionError("repository configuration is unavailable")
+
+
+def _validate_preflight_host_operation(
+    configuration: RepositoryConfigurationRecord,
+) -> None:
+    """Reject saved versions that cannot cross the typed host boundary."""
+
+    validated = validated_repository_configuration(configuration)
+    HostOperation(
+        name="repository.preflight",
+        idempotency_key="repository-preflight:configuration-validation",
+        arguments=cast(
+            dict[str, JsonValue],
+            {
+                "attempt_id": str(uuid4()),
+                "configuration": validated.to_dict(),
+            },
+        ),
+    )
 
 
 def _configuration_projection(
