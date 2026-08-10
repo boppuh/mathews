@@ -220,6 +220,7 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
     acceptance_criteria: acceptanceCriteria,
     evidence,
     approvals,
+    github,
   } = state.cockpit;
   const visitedStates = new Set(
     events.flatMap((event) => [event.from_state, event.to_state]).filter(Boolean),
@@ -236,6 +237,7 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
           <Link href="/inbox">Decision inbox</Link>
           <a href="#timeline">Timeline</a>
           <a href="#controls">Controls</a>
+          <a href="#github">GitHub</a>
           <a href="#activity">Activity</a>
           <a href="#acceptance">Criteria</a>
           <a href="#evidence">Evidence</a>
@@ -281,6 +283,53 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
       </section>
 
       <TaskControls task={task} onRefresh={() => loadCockpit(undefined, true)} />
+
+      <section id="github" className="github-status-panel" aria-labelledby="github-heading">
+        <div className="cockpit-section-heading">
+          <div>
+            <p className="eyebrow">Exact pull-request head</p>
+            <h2 id="github-heading">GitHub checks & review</h2>
+          </div>
+          {github.linked ? (
+            <span className="github-pr-number">PR #{github.pull_request_number}</span>
+          ) : null}
+        </div>
+        {github.linked ? (
+          <>
+            <div className="github-status-grid">
+              <div>
+                <span>Continuous integration</span>
+                <strong className={`github-state github-state-${github.ci_status.toLowerCase()}`}>
+                  {github.ci_status.replaceAll("_", " ")}
+                </strong>
+                <small>
+                  {github.checks_passed} of {github.checks_total} checks passing
+                </small>
+              </div>
+              <div>
+                <span>Review</span>
+                <strong
+                  className={`github-state github-state-${github.review_status.toLowerCase()}`}
+                >
+                  {github.review_status.replaceAll("_", " ")}
+                </strong>
+                <small>
+                  {github.blocking_reviews} blocking · {github.review_comments} open comments
+                </small>
+              </div>
+            </div>
+            <p className="github-binding">
+              <code>{github.task_branch}</code> at{" "}
+              <code>{shortRevision(github.head_sha ?? "")}</code>
+              {github.last_updated_at ? (
+                <> · Updated {formatTimestamp(github.last_updated_at)}</>
+              ) : null}
+            </p>
+          </>
+        ) : (
+          <p className="cockpit-empty">No exact pull-request binding has been recorded yet.</p>
+        )}
+      </section>
 
       <section id="timeline" className="cockpit-section" aria-labelledby="timeline-heading">
         <div className="cockpit-section-heading">

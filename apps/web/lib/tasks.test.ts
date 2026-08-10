@@ -158,6 +158,19 @@ describe("task cockpit parsing", () => {
         expires_at: null,
       },
     ],
+    github: {
+      linked: false,
+      pull_request_number: null,
+      task_branch: null,
+      head_sha: null,
+      ci_status: "NOT_LINKED",
+      review_status: "NOT_LINKED",
+      checks_total: 0,
+      checks_passed: 0,
+      blocking_reviews: 0,
+      review_comments: 0,
+      last_updated_at: null,
+    },
   };
 
   it("accepts a safe durable cockpit projection", () => {
@@ -179,6 +192,23 @@ describe("task cockpit parsing", () => {
     ]);
   });
 
+  it("accepts an exact linked GitHub projection", () => {
+    const github = {
+      linked: true,
+      pull_request_number: 42,
+      task_branch: "codex/task-6-3",
+      head_sha: "a".repeat(40),
+      ci_status: "PASSED",
+      review_status: "CHANGES_REQUESTED",
+      checks_total: 3,
+      checks_passed: 3,
+      blocking_reviews: 1,
+      review_comments: 2,
+      last_updated_at: "2026-08-10T15:00:00Z",
+    };
+    expect(parseTaskCockpit({ ...cockpit, github }).github).toEqual(github);
+  });
+
   it.each([
     { ...cockpit, state_context: { ...cockpit.state_context, kind: "MERGED" } },
     { ...cockpit, events: [{ ...cockpit.events[0], sequence: 0 }] },
@@ -197,6 +227,11 @@ describe("task cockpit parsing", () => {
       acceptance_criteria: [{ ...cockpit.acceptance_criteria[0], verification: "SHELL" }],
     },
     { ...cockpit, approvals: [{ ...cockpit.approvals[0], status: "UNKNOWN" }] },
+    { ...cockpit, github: { ...cockpit.github, checks_total: 1 } },
+    {
+      ...cockpit,
+      github: { ...cockpit.github, linked: true, ci_status: "PASSED" },
+    },
   ])("rejects unsafe cockpit projections", (value) => {
     expect(() => parseTaskCockpit(value)).toThrow("control plane returned");
   });

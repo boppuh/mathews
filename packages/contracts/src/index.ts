@@ -166,6 +166,40 @@ export interface TaskApprovalSummary {
   expires_at: string | null;
 }
 
+export const TASK_GITHUB_CI_STATUSES = [
+  "NOT_LINKED",
+  "NOT_RUN",
+  "PENDING",
+  "PASSED",
+  "FAILED",
+] as const;
+
+export type TaskGitHubCiStatus = (typeof TASK_GITHUB_CI_STATUSES)[number];
+
+export const TASK_GITHUB_REVIEW_STATUSES = [
+  "NOT_LINKED",
+  "NOT_REVIEWED",
+  "COMMENTED",
+  "APPROVED",
+  "CHANGES_REQUESTED",
+] as const;
+
+export type TaskGitHubReviewStatus = (typeof TASK_GITHUB_REVIEW_STATUSES)[number];
+
+export interface TaskGitHubStatus {
+  linked: boolean;
+  pull_request_number: number | null;
+  task_branch: string | null;
+  head_sha: string | null;
+  ci_status: TaskGitHubCiStatus;
+  review_status: TaskGitHubReviewStatus;
+  checks_total: number;
+  checks_passed: number;
+  blocking_reviews: number;
+  review_comments: number;
+  last_updated_at: string | null;
+}
+
 export interface TaskCockpitResponse {
   task: TaskSummary;
   state_context: TaskStateContext;
@@ -173,6 +207,7 @@ export interface TaskCockpitResponse {
   acceptance_criteria: TaskAcceptanceCriterionSummary[];
   evidence: TaskEvidenceSummary[];
   approvals: TaskApprovalSummary[];
+  github: TaskGitHubStatus;
 }
 
 export interface CreateTaskRequest {
