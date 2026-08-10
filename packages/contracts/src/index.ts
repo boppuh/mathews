@@ -78,15 +78,72 @@ export interface TaskEventSummary {
   evidence_count: number;
 }
 
-export const TASK_EVIDENCE_STATUSES = ["AVAILABLE", "CORRECTION", "DELETED"] as const;
+export const TASK_EVIDENCE_STATUSES = ["AVAILABLE", "CORRECTION", "SUPERSEDED", "DELETED"] as const;
 
 export type TaskEvidenceStatus = (typeof TASK_EVIDENCE_STATUSES)[number];
+
+export const TASK_EVIDENCE_CATEGORIES = [
+  "CRITERIA",
+  "CHANGE",
+  "TEST",
+  "LOG",
+  "NETWORK",
+  "PR_CI",
+  "ARTIFACT",
+  "OTHER",
+] as const;
+
+export type TaskEvidenceCategory = (typeof TASK_EVIDENCE_CATEGORIES)[number];
+
+export const TASK_EVIDENCE_CONTENT_ACCESS = [
+  "AVAILABLE",
+  "RECENT_PASSWORD_REQUIRED",
+  "DELETED",
+] as const;
+
+export type TaskEvidenceContentAccess = (typeof TASK_EVIDENCE_CONTENT_ACCESS)[number];
+
+export const EVIDENCE_DELETION_REASONS = [
+  "USER_REQUEST",
+  "RETENTION_EXPIRED",
+  "SOURCE_REVOKED",
+  "SECURITY_RESPONSE",
+] as const;
+
+export type EvidenceDeletionReason = (typeof EVIDENCE_DELETION_REASONS)[number];
 
 export interface TaskEvidenceSummary {
   id: string;
   evidence_type: string;
   captured_at: string;
   status: TaskEvidenceStatus;
+  category: TaskEvidenceCategory;
+  content_access: TaskEvidenceContentAccess;
+  correction_of_id: string | null;
+  corrected_by_id: string | null;
+  deletion_reason: EvidenceDeletionReason | null;
+  deleted_at: string | null;
+  download_path: string | null;
+}
+
+export const ACCEPTANCE_CRITERION_STATUSES = ["PENDING", "PASSED", "FAILED", "BLOCKED"] as const;
+
+export type AcceptanceCriterionStatus = (typeof ACCEPTANCE_CRITERION_STATUSES)[number];
+
+export const ACCEPTANCE_CRITERION_VERIFICATIONS = [
+  "AUTOMATED_TEST",
+  "SIMULATOR_ASSERTION",
+  "STATIC_CHECK",
+  "HUMAN_INSPECTION",
+] as const;
+
+export type AcceptanceCriterionVerification = (typeof ACCEPTANCE_CRITERION_VERIFICATIONS)[number];
+
+export interface TaskAcceptanceCriterionSummary {
+  id: string;
+  requirement: string;
+  verification: AcceptanceCriterionVerification;
+  status: AcceptanceCriterionStatus;
 }
 
 export const APPROVAL_STATUSES = [
@@ -113,6 +170,7 @@ export interface TaskCockpitResponse {
   task: TaskSummary;
   state_context: TaskStateContext;
   events: TaskEventSummary[];
+  acceptance_criteria: TaskAcceptanceCriterionSummary[];
   evidence: TaskEvidenceSummary[];
   approvals: TaskApprovalSummary[];
 }

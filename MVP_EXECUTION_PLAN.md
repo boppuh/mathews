@@ -19,7 +19,8 @@ complete here unless its backlog definition of done is satisfied on `main`.
   machine, `1.4` leased durable background-job loop, `1.5` approvals and
   resumable escalation, and `1.6` cancellation and dependency-outage handling,
   `2.1` authenticated task creation and durable work queue, `2.2` durable task
-  cockpit shell, `2.3` durable live task events,
+  cockpit shell, `2.3` durable live task events, `2.4` evidence and artifact
+  views,
   plus `3.1` validated repository configuration and read-only preflight, `3.2`
   authenticated macOS host agent, `3.3` task-owned Git workspace lifecycle,
   `3.4` controlled Git branch, commit, and push operations,
@@ -29,9 +30,9 @@ complete here unless its backlog definition of done is satisfied on `main`.
   control-plane-authorized scoped code-change execution,
   `5.1` deterministic simulator-flow
   contracts, and `6.1` least-privilege GitHub App authentication.
-- Remaining: 16 of 40 MVP tasks.
+- Remaining: 15 of 40 MVP tasks.
 - Active next wave: Wave 5 controlled execution adapters.
-- Next completion target: `2.4`.
+- Next completion target: `2.5`.
 
 ## Operating model
 

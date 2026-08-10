@@ -1,17 +1,28 @@
 import {
+  ACCEPTANCE_CRITERION_STATUSES,
+  ACCEPTANCE_CRITERION_VERIFICATIONS,
+  type AcceptanceCriterionStatus,
+  type AcceptanceCriterionVerification,
   APPROVAL_STATUSES,
   type ApprovalStatus,
+  EVIDENCE_DELETION_REASONS,
+  type EvidenceDeletionReason,
   TASK_BLOCKER_CODES,
   TASK_EVENT_KINDS,
+  TASK_EVIDENCE_CATEGORIES,
+  TASK_EVIDENCE_CONTENT_ACCESS,
   TASK_EVIDENCE_STATUSES,
   TASK_STATE_CONTEXT_KINDS,
   TASK_STATES,
+  type TaskAcceptanceCriterionSummary,
   type TaskApprovalSummary,
   type TaskBlocker,
   type TaskBlockerCode,
   type TaskCockpitResponse,
   type TaskEventKind,
   type TaskEventSummary,
+  type TaskEvidenceCategory,
+  type TaskEvidenceContentAccess,
   type TaskEvidenceStatus,
   type TaskEvidenceSummary,
   type TaskListResponse,
@@ -26,6 +37,11 @@ const blockerCodes = new Set<string>(TASK_BLOCKER_CODES);
 const stateContextKinds = new Set<string>(TASK_STATE_CONTEXT_KINDS);
 const eventKinds = new Set<string>(TASK_EVENT_KINDS);
 const evidenceStatuses = new Set<string>(TASK_EVIDENCE_STATUSES);
+const evidenceCategories = new Set<string>(TASK_EVIDENCE_CATEGORIES);
+const evidenceContentAccess = new Set<string>(TASK_EVIDENCE_CONTENT_ACCESS);
+const evidenceDeletionReasons = new Set<string>(EVIDENCE_DELETION_REASONS);
+const criterionStatuses = new Set<string>(ACCEPTANCE_CRITERION_STATUSES);
+const criterionVerifications = new Set<string>(ACCEPTANCE_CRITERION_VERIFICATIONS);
 const approvalStatuses = new Set<string>(APPROVAL_STATUSES);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const GIT_OBJECT_ID_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
@@ -37,6 +53,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isTimestamp(value: unknown): value is string {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function parseOptionalUuid(value: unknown): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
+    throw new Error("The control plane returned an invalid evidence lineage.");
+  }
+  return value;
 }
 
 function parseBlocker(value: unknown): TaskBlocker {
@@ -171,15 +197,74 @@ function parseEvidence(value: unknown): TaskEvidenceSummary {
     !EVIDENCE_TYPE_PATTERN.test(value.evidence_type) ||
     !isTimestamp(value.captured_at) ||
     typeof value.status !== "string" ||
-    !evidenceStatuses.has(value.status)
+    !evidenceStatuses.has(value.status) ||
+    typeof value.category !== "string" ||
+    !evidenceCategories.has(value.category) ||
+    typeof value.content_access !== "string" ||
+    !evidenceContentAccess.has(value.content_access) ||
+    !(
+      value.deletion_reason === null ||
+      (typeof value.deletion_reason === "string" &&
+        evidenceDeletionReasons.has(value.deletion_reason))
+    ) ||
+    !(value.deleted_at === null || isTimestamp(value.deleted_at)) ||
+    !(value.download_path === null || typeof value.download_path === "string")
   ) {
     throw new Error("The control plane returned invalid task evidence.");
+  }
+  const correctionOfId = parseOptionalUuid(value.correction_of_id);
+  const correctedById = parseOptionalUuid(value.corrected_by_id);
+  const expectedDownloadPath = `/api/evidence/${value.id}/download`;
+  const deleted = value.status === "DELETED";
+  if (
+    (deleted &&
+      (value.content_access !== "DELETED" ||
+        value.deletion_reason === null ||
+        value.download_path !== null)) ||
+    (!deleted && (value.deletion_reason !== null || value.deleted_at !== null)) ||
+    (value.status === "CORRECTION" && correctionOfId === null) ||
+    (value.status === "SUPERSEDED" && correctedById === null) ||
+    (value.content_access === "AVAILABLE" && value.download_path !== expectedDownloadPath) ||
+    (value.content_access !== "AVAILABLE" && value.download_path !== null)
+  ) {
+    throw new Error("The control plane returned inconsistent task evidence.");
   }
   return {
     id: value.id,
     evidence_type: value.evidence_type,
     captured_at: value.captured_at,
     status: value.status as TaskEvidenceStatus,
+    category: value.category as TaskEvidenceCategory,
+    content_access: value.content_access as TaskEvidenceContentAccess,
+    correction_of_id: correctionOfId,
+    corrected_by_id: correctedById,
+    deletion_reason: value.deletion_reason as EvidenceDeletionReason | null,
+    deleted_at: value.deleted_at,
+    download_path: value.download_path,
+  };
+}
+
+function parseAcceptanceCriterion(value: unknown): TaskAcceptanceCriterionSummary {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    value.id.length === 0 ||
+    value.id.length > 128 ||
+    typeof value.requirement !== "string" ||
+    value.requirement.length === 0 ||
+    value.requirement.length > 2_000 ||
+    typeof value.verification !== "string" ||
+    !criterionVerifications.has(value.verification) ||
+    typeof value.status !== "string" ||
+    !criterionStatuses.has(value.status)
+  ) {
+    throw new Error("The control plane returned an invalid acceptance criterion.");
+  }
+  return {
+    id: value.id,
+    requirement: value.requirement,
+    verification: value.verification as AcceptanceCriterionVerification,
+    status: value.status as AcceptanceCriterionStatus,
   };
 }
 
@@ -215,12 +300,14 @@ export function parseTaskCockpit(value: unknown): TaskCockpitResponse {
   if (
     !isRecord(value) ||
     !Array.isArray(value.events) ||
+    !Array.isArray(value.acceptance_criteria) ||
     !Array.isArray(value.evidence) ||
     !Array.isArray(value.approvals)
   ) {
     throw new Error("The control plane returned an invalid task cockpit.");
   }
   const events = value.events.map(parseTaskEvent);
+  const acceptanceCriteria = value.acceptance_criteria.map(parseAcceptanceCriterion);
   for (let index = 1; index < events.length; index += 1) {
     const previous = events[index - 1];
     const current = events[index];
@@ -228,10 +315,16 @@ export function parseTaskCockpit(value: unknown): TaskCockpitResponse {
       throw new Error("The control plane returned an invalid task event order.");
     }
   }
+  if (
+    new Set(acceptanceCriteria.map((criterion) => criterion.id)).size !== acceptanceCriteria.length
+  ) {
+    throw new Error("The control plane returned duplicate acceptance criteria.");
+  }
   return {
     task: parseTaskSummary(value.task),
     state_context: parseStateContext(value.state_context),
     events,
+    acceptance_criteria: acceptanceCriteria,
     evidence: value.evidence.map(parseEvidence),
     approvals: value.approvals.map(parseApproval),
   };

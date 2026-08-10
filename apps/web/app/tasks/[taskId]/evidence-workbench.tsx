@@ -1,0 +1,310 @@
+"use client";
+
+import {
+  TASK_EVIDENCE_CATEGORIES,
+  type TaskAcceptanceCriterionSummary,
+  type TaskEvidenceCategory,
+  type TaskEvidenceSummary,
+} from "@mathews/contracts";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  type EvidenceContent,
+  evidenceClient,
+  evidenceDownloadUrl,
+  TaskRequestError,
+} from "../../../lib/task-client";
+
+const categoryLabels: Record<TaskEvidenceCategory, string> = {
+  CRITERIA: "Criteria",
+  CHANGE: "Changes",
+  TEST: "Tests",
+  LOG: "Logs",
+  NETWORK: "Network",
+  PR_CI: "PR & CI",
+  ARTIFACT: "Artifacts",
+  OTHER: "Other",
+};
+
+const verificationLabels: Record<TaskAcceptanceCriterionSummary["verification"], string> = {
+  AUTOMATED_TEST: "Automated test",
+  SIMULATOR_ASSERTION: "Simulator assertion",
+  STATIC_CHECK: "Static check",
+  HUMAN_INSPECTION: "Human inspection",
+};
+
+type PreviewState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ready"; content: EvidenceContent }
+  | { status: "failed"; message: string };
+
+function title(value: string): string {
+  return value
+    .split(/[-_.]/)
+    .filter(Boolean)
+    .map((part) => `${part[0]?.toUpperCase() ?? ""}${part.slice(1).toLowerCase()}`)
+    .join(" ");
+}
+
+function formatTimestamp(timestamp: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(timestamp));
+}
+
+function matchCount(content: string, query: string): number {
+  const needle = query.trim().toLocaleLowerCase();
+  if (!needle) {
+    return 0;
+  }
+  const haystack = content.toLocaleLowerCase();
+  let count = 0;
+  let cursor = 0;
+  let matchIndex = haystack.indexOf(needle, cursor);
+  while (matchIndex !== -1) {
+    count += 1;
+    cursor = matchIndex + needle.length;
+    matchIndex = haystack.indexOf(needle, cursor);
+  }
+  return count;
+}
+
+function previewFailure(error: unknown): string {
+  if (error instanceof TaskRequestError) {
+    return error.message;
+  }
+  return "This evidence content is unavailable.";
+}
+
+function EvidenceCard({ record }: { record: TaskEvidenceSummary }) {
+  const [preview, setPreview] = useState<PreviewState>({ status: "idle" });
+  const [contentQuery, setContentQuery] = useState("");
+  const controller = useRef<AbortController | null>(null);
+  const downloadUrl = evidenceDownloadUrl(record);
+
+  useEffect(
+    () => () => {
+      controller.current?.abort();
+    },
+    [],
+  );
+
+  const loadPreview = () => {
+    if (preview.status !== "idle" || !downloadUrl) {
+      return;
+    }
+    controller.current = new AbortController();
+    setPreview({ status: "loading" });
+    void evidenceClient.content(record, controller.current.signal).then(
+      (content) => setPreview({ status: "ready", content }),
+      (error: unknown) => {
+        if (!(error instanceof Error && error.name === "AbortError")) {
+          setPreview({ status: "failed", message: previewFailure(error) });
+        }
+      },
+    );
+  };
+
+  const count = preview.status === "ready" ? matchCount(preview.content.text, contentQuery) : 0;
+
+  return (
+    <article
+      id={`evidence-${record.id}`}
+      className={`evidence-card evidence-card-${record.status.toLowerCase()}`}
+    >
+      <div className="evidence-card-heading">
+        <div>
+          <span className="evidence-category">{categoryLabels[record.category]}</span>
+          <h3>{title(record.evidence_type)}</h3>
+        </div>
+        <span className={`evidence-pill evidence-${record.status.toLowerCase()}`}>
+          {record.status.toLowerCase()}
+        </span>
+      </div>
+      <p className="evidence-record-meta">
+        EvidenceRecord <code>{record.id.slice(0, 8)}</code> ·{" "}
+        <time dateTime={record.captured_at}>{formatTimestamp(record.captured_at)}</time>
+      </p>
+
+      {record.correction_of_id ? (
+        <p className="evidence-lineage">
+          Corrects record <code>{record.correction_of_id.slice(0, 8)}</code>
+        </p>
+      ) : null}
+      {record.corrected_by_id ? (
+        <p className="evidence-lineage">
+          Superseded by{" "}
+          <a href={`#evidence-${record.corrected_by_id}`}>{record.corrected_by_id.slice(0, 8)}</a>
+        </p>
+      ) : null}
+
+      {record.content_access === "DELETED" ? (
+        <div className="evidence-tombstone" role="note">
+          <strong>Content removed</strong>
+          <span>{title(record.deletion_reason ?? "deleted")}</span>
+          <small>
+            {record.deleted_at
+              ? `Destroyed ${formatTimestamp(record.deleted_at)}`
+              : "Deletion is fenced; cleanup is pending."}
+          </small>
+        </div>
+      ) : record.content_access === "RECENT_PASSWORD_REQUIRED" ? (
+        <p className="evidence-restricted">
+          Re-enter your password to inspect this protected evidence.
+        </p>
+      ) : (
+        <details
+          className="evidence-preview"
+          onToggle={(event) => event.currentTarget.open && loadPreview()}
+        >
+          <summary>Preview redacted content</summary>
+          {preview.status === "loading" ? (
+            <p className="evidence-preview-status" role="status">
+              Loading redacted content…
+            </p>
+          ) : preview.status === "failed" ? (
+            <p className="task-error" role="alert">
+              {preview.message}
+            </p>
+          ) : preview.status === "ready" ? (
+            <div className="evidence-preview-body">
+              <label>
+                Search this record
+                <span>
+                  <input
+                    type="search"
+                    value={contentQuery}
+                    onChange={(event) => setContentQuery(event.target.value)}
+                    placeholder="Find in evidence"
+                  />
+                  <output>{contentQuery.trim() ? `${count} matches` : ""}</output>
+                </span>
+              </label>
+              <pre>{preview.content.text}</pre>
+            </div>
+          ) : null}
+        </details>
+      )}
+
+      {downloadUrl ? (
+        <a className="evidence-download" href={downloadUrl} download>
+          Download redacted record
+        </a>
+      ) : null}
+    </article>
+  );
+}
+
+export function EvidenceWorkbench({
+  criteria,
+  evidence,
+}: {
+  criteria: TaskAcceptanceCriterionSummary[];
+  evidence: TaskEvidenceSummary[];
+}) {
+  const [category, setCategory] = useState<TaskEvidenceCategory | "ALL">("ALL");
+  const [query, setQuery] = useState("");
+  const visibleEvidence = useMemo(() => {
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    return evidence.filter(
+      (record) =>
+        (category === "ALL" || record.category === category) &&
+        (!normalizedQuery ||
+          `${record.evidence_type} ${record.category} ${record.id}`
+            .toLocaleLowerCase()
+            .includes(normalizedQuery)),
+    );
+  }, [category, evidence, query]);
+
+  return (
+    <section
+      id="evidence"
+      className="cockpit-section evidence-workbench"
+      aria-labelledby="evidence-heading"
+    >
+      <div className="cockpit-section-heading">
+        <div>
+          <p className="eyebrow">Verification ledger</p>
+          <h2 id="evidence-heading">Evidence & artifacts</h2>
+        </div>
+        <p>{evidence.length} records</p>
+      </div>
+
+      <section id="acceptance" className="criteria-panel" aria-labelledby="criteria-heading">
+        <div>
+          <p className="eyebrow">Definition of done</p>
+          <h3 id="criteria-heading">Acceptance criteria</h3>
+        </div>
+        {criteria.length === 0 ? (
+          <p className="cockpit-empty">
+            Criteria will appear after the implementation brief is accepted.
+          </p>
+        ) : (
+          <ol>
+            {criteria.map((criterion) => (
+              <li key={criterion.id}>
+                <span className={`criterion-state criterion-${criterion.status.toLowerCase()}`}>
+                  {criterion.status.toLowerCase()}
+                </span>
+                <div>
+                  <strong>{criterion.requirement}</strong>
+                  <small>
+                    {criterion.id} · {verificationLabels[criterion.verification]}
+                  </small>
+                </div>
+              </li>
+            ))}
+          </ol>
+        )}
+      </section>
+
+      <div className="evidence-toolbar">
+        <fieldset className="evidence-filters">
+          <legend className="visually-hidden">Evidence categories</legend>
+          <button
+            type="button"
+            aria-pressed={category === "ALL"}
+            onClick={() => setCategory("ALL")}
+          >
+            All
+          </button>
+          {TASK_EVIDENCE_CATEGORIES.map((value) => (
+            <button
+              type="button"
+              key={value}
+              aria-pressed={category === value}
+              onClick={() => setCategory(value)}
+            >
+              {categoryLabels[value]}
+            </button>
+          ))}
+        </fieldset>
+        <label className="evidence-search">
+          <span>Search records</span>
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Type, category, or record ID"
+          />
+        </label>
+      </div>
+
+      {visibleEvidence.length === 0 ? (
+        <p className="cockpit-empty evidence-empty">
+          {evidence.length === 0
+            ? "Evidence will appear as work is verified."
+            : "No evidence matches this view."}
+        </p>
+      ) : (
+        <div className="evidence-grid">
+          {visibleEvidence.map((record) => (
+            <EvidenceCard key={record.id} record={record} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}

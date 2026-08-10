@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -31,8 +31,11 @@ from mathews_control_plane.domain_models import (
     ApprovalRequest,
     ApprovalStatus,
     BackgroundJob,
+    Brief,
     DependencyOutageAttempt,
+    EvidenceDeletionRequest,
     EvidenceRecord,
+    EvidenceTombstone,
     ReconciliationStatus,
     ReconciliationTarget,
     Task,
@@ -163,7 +166,44 @@ class TaskEvidenceResponse(BaseModel):
     id: UUID
     evidence_type: str
     captured_at: datetime
-    status: Literal["AVAILABLE", "CORRECTION", "DELETED"]
+    status: Literal["AVAILABLE", "CORRECTION", "SUPERSEDED", "DELETED"]
+    category: Literal[
+        "CRITERIA",
+        "CHANGE",
+        "TEST",
+        "LOG",
+        "NETWORK",
+        "PR_CI",
+        "ARTIFACT",
+        "OTHER",
+    ]
+    content_access: Literal[
+        "AVAILABLE",
+        "RECENT_PASSWORD_REQUIRED",
+        "DELETED",
+    ]
+    correction_of_id: UUID | None = None
+    corrected_by_id: UUID | None = None
+    deletion_reason: Literal[
+        "USER_REQUEST",
+        "RETENTION_EXPIRED",
+        "SOURCE_REVOKED",
+        "SECURITY_RESPONSE",
+    ] | None = None
+    deleted_at: datetime | None = None
+    download_path: str | None = None
+
+
+class TaskAcceptanceCriterionResponse(BaseModel):
+    id: str
+    requirement: str
+    verification: Literal[
+        "AUTOMATED_TEST",
+        "SIMULATOR_ASSERTION",
+        "STATIC_CHECK",
+        "HUMAN_INSPECTION",
+    ]
+    status: Literal["PENDING", "PASSED", "FAILED", "BLOCKED"]
 
 
 class TaskApprovalResponse(BaseModel):
@@ -180,6 +220,7 @@ class TaskCockpitResponse(BaseModel):
     task: TaskSummaryResponse
     state_context: TaskStateContextResponse
     events: list[TaskEventResponse]
+    acceptance_criteria: list[TaskAcceptanceCriterionResponse]
     evidence: list[TaskEvidenceResponse]
     approvals: list[TaskApprovalResponse]
 
@@ -332,9 +373,37 @@ class TaskService:
                     .where(
                         EvidenceRecord.task_id == task.id,
                         EvidenceRecord.owner_id == owner_id,
+                        EvidenceRecord.access_classification != "INTERNAL",
                     )
                     .order_by(EvidenceRecord.captured_at, EvidenceRecord.id)
                 )
+            )
+            evidence_ids = tuple(record.id for record in evidence)
+            deletion_requests = {
+                request.evidence_id: request
+                for request in session.scalars(
+                    select(EvidenceDeletionRequest).where(
+                        EvidenceDeletionRequest.evidence_id.in_(evidence_ids)
+                    )
+                )
+            } if evidence_ids else {}
+            tombstones = {
+                tombstone.evidence_id: tombstone
+                for tombstone in session.scalars(
+                    select(EvidenceTombstone).where(
+                        EvidenceTombstone.evidence_id.in_(evidence_ids)
+                    )
+                )
+            } if evidence_ids else {}
+            corrected_by = {
+                record.correction_of_id: record.id
+                for record in evidence
+                if record.correction_of_id is not None
+            }
+            accepted_brief = (
+                None
+                if task.accepted_brief_id is None
+                else session.get(Brief, task.accepted_brief_id)
             )
             approvals = tuple(
                 session.scalars(
@@ -355,6 +424,7 @@ class TaskService:
                 (event.occurred_at for event in events),
                 default=task.updated_at,
             )
+            now = _as_utc(self._clock())
             return TaskCockpitResponse(
                 task=_task_response(
                     task,
@@ -369,7 +439,18 @@ class TaskService:
                     )
                     for event in events
                 ],
-                evidence=[_evidence_response(record) for record in evidence],
+                acceptance_criteria=_acceptance_criteria_response(accepted_brief),
+                evidence=[
+                    _evidence_response(
+                        record,
+                        deletion_request=deletion_requests.get(record.id),
+                        tombstone=tombstones.get(record.id),
+                        corrected_by_id=corrected_by.get(record.id),
+                        authentication=authentication,
+                        now=now,
+                    )
+                    for record in evidence
+                ],
                 approvals=[_approval_response(request) for request in approvals],
             )
 
@@ -793,20 +874,154 @@ def _event_response(
     )
 
 
-def _evidence_response(record: EvidenceRecord) -> TaskEvidenceResponse:
-    status_value: Literal["AVAILABLE", "CORRECTION", "DELETED"]
-    if record.deleted_at is not None:
+def _evidence_response(
+    record: EvidenceRecord,
+    *,
+    deletion_request: EvidenceDeletionRequest | None,
+    tombstone: EvidenceTombstone | None,
+    corrected_by_id: UUID | None,
+    authentication: AuthenticatedSession,
+    now: datetime,
+) -> TaskEvidenceResponse:
+    deleted = deletion_request is not None or record.deleted_at is not None
+    status_value: Literal["AVAILABLE", "CORRECTION", "SUPERSEDED", "DELETED"]
+    if deleted:
         status_value = "DELETED"
+    elif corrected_by_id is not None:
+        status_value = "SUPERSEDED"
     elif record.correction_of_id is not None:
         status_value = "CORRECTION"
     else:
         status_value = "AVAILABLE"
+    content_access: Literal[
+        "AVAILABLE",
+        "RECENT_PASSWORD_REQUIRED",
+        "DELETED",
+    ]
+    if deleted:
+        content_access = "DELETED"
+    elif record.access_classification == "RECENT_PASSWORD" and not (
+        authentication.recent_password_verified
+        and _as_utc(authentication.reauthenticated_until) > now
+    ):
+        content_access = "RECENT_PASSWORD_REQUIRED"
+    else:
+        content_access = "AVAILABLE"
     return TaskEvidenceResponse(
         id=record.id,
         evidence_type=record.evidence_type,
         captured_at=_as_utc(record.captured_at),
         status=status_value,
+        category=_evidence_category(record.evidence_type),
+        content_access=content_access,
+        correction_of_id=record.correction_of_id,
+        corrected_by_id=corrected_by_id,
+        deletion_reason=(
+            None
+            if deletion_request is None
+            else cast(
+                Literal[
+                    "USER_REQUEST",
+                    "RETENTION_EXPIRED",
+                    "SOURCE_REVOKED",
+                    "SECURITY_RESPONSE",
+                ],
+                deletion_request.reason_code,
+            )
+        ),
+        deleted_at=(
+            _as_utc(tombstone.deleted_at)
+            if tombstone is not None
+            else (
+                None
+                if record.deleted_at is None
+                else _as_utc(record.deleted_at)
+            )
+        ),
+        download_path=(
+            f"/api/evidence/{record.id}/download"
+            if content_access == "AVAILABLE"
+            else None
+        ),
     )
+
+
+def _evidence_category(
+    evidence_type: str,
+) -> Literal[
+    "CRITERIA",
+    "CHANGE",
+    "TEST",
+    "LOG",
+    "NETWORK",
+    "PR_CI",
+    "ARTIFACT",
+    "OTHER",
+]:
+    normalized = evidence_type.casefold()
+    if any(token in normalized for token in ("brief", "criterion", "contract")):
+        return "CRITERIA"
+    if any(token in normalized for token in ("diff", "patch", "commit", "code-change")):
+        return "CHANGE"
+    if any(token in normalized for token in ("artifact", "screenshot", "video", "attachment")):
+        return "ARTIFACT"
+    if any(token in normalized for token in ("network", "performance", "metric")):
+        return "NETWORK"
+    if any(token in normalized for token in ("github", "pull-request", "review", "ci-")):
+        return "PR_CI"
+    if any(token in normalized for token in ("log", "console", "crash", "error-signal")):
+        return "LOG"
+    if any(token in normalized for token in ("test", "build", "validation", "simulator")):
+        return "TEST"
+    return "OTHER"
+
+
+def _acceptance_criteria_response(
+    brief: Brief | None,
+) -> list[TaskAcceptanceCriterionResponse]:
+    if brief is None:
+        return []
+    result: list[TaskAcceptanceCriterionResponse] = []
+    allowed_verifications = {
+        "AUTOMATED_TEST",
+        "SIMULATOR_ASSERTION",
+        "STATIC_CHECK",
+        "HUMAN_INSPECTION",
+    }
+    for value in brief.acceptance_criteria:
+        if not isinstance(value, dict):
+            continue
+        criterion_id = value.get("criterion_id")
+        requirement = value.get("requirement")
+        verification = value.get("verification")
+        if (
+            not isinstance(criterion_id, str)
+            or not criterion_id
+            or len(criterion_id) > 128
+            or not isinstance(requirement, str)
+            or not requirement
+            or len(requirement) > 2_000
+            or not isinstance(verification, str)
+            or verification not in allowed_verifications
+        ):
+            continue
+        result.append(
+            TaskAcceptanceCriterionResponse(
+                id=criterion_id,
+                requirement=requirement,
+                verification=cast(
+                    Literal[
+                        "AUTOMATED_TEST",
+                        "SIMULATOR_ASSERTION",
+                        "STATIC_CHECK",
+                        "HUMAN_INSPECTION",
+                    ],
+                    verification,
+                ),
+                status="PENDING",
+            )
+        )
+    return result
 
 
 def _approval_response(request: ApprovalRequest) -> TaskApprovalResponse:

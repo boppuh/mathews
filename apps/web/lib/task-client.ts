@@ -1,6 +1,7 @@
 import type {
   CreateTaskRequest,
   TaskCockpitResponse,
+  TaskEvidenceSummary,
   TaskListResponse,
   TaskSummary,
 } from "@mathews/contracts";
@@ -13,6 +14,18 @@ const controlPlaneUrl = normalizeControlPlaneUrl(process.env.NEXT_PUBLIC_CONTROL
 
 export function taskEventStreamUrl(taskId: string): string {
   return `${controlPlaneUrl}/api/tasks/${encodeURIComponent(taskId)}/events`;
+}
+
+export interface EvidenceContent {
+  text: string;
+  mediaType: "application/json" | "text/plain";
+}
+
+export function evidenceDownloadUrl(record: TaskEvidenceSummary): string | null {
+  const expectedPath = `/api/evidence/${record.id}/download`;
+  return record.content_access === "AVAILABLE" && record.download_path === expectedPath
+    ? `${controlPlaneUrl}${expectedPath}`
+    : null;
 }
 
 export class TaskRequestError extends Error {
@@ -91,6 +104,43 @@ export const taskClient = {
       "Unable to load the task cockpit.",
     );
     return parseTaskCockpit(await response.json());
+  },
+};
+
+export const evidenceClient = {
+  async content(record: TaskEvidenceSummary, signal?: AbortSignal): Promise<EvidenceContent> {
+    const url = evidenceDownloadUrl(record);
+    if (!url) {
+      throw new TaskRequestError("This evidence content is unavailable.", 404);
+    }
+    const response = await fetch(url, {
+      method: "GET",
+      credentials: "include",
+      headers: { Accept: "application/json, text/plain" },
+      signal,
+    });
+    if (!response.ok) {
+      throw new TaskRequestError(
+        response.status === 401
+          ? "Your session expired. Refresh the page and sign in again."
+          : "This evidence content is unavailable.",
+        response.status,
+      );
+    }
+    const contentType = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim();
+    if (contentType !== "application/json" && contentType !== "text/plain") {
+      throw new TaskRequestError("This evidence format cannot be previewed safely.", 415);
+    }
+    const raw = await response.text();
+    let text = raw;
+    if (contentType === "application/json") {
+      try {
+        text = JSON.stringify(JSON.parse(raw), null, 2);
+      } catch {
+        throw new TaskRequestError("This evidence content is malformed.", 502);
+      }
+    }
+    return { text, mediaType: contentType };
   },
 };
 
