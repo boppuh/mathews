@@ -40,7 +40,7 @@ type PreviewState =
   | { status: "ready"; content: EvidenceContent }
   | { status: "failed"; message: string };
 
-type ReauthenticationState = "idle" | "submitting" | "failed";
+type ReauthenticationState = "idle" | "submitting" | "failed" | "refresh_failed";
 
 function title(value: string): string {
   return value
@@ -88,7 +88,7 @@ function EvidenceCard({
 }: {
   record: TaskEvidenceSummary;
   onRevealEvidence: (evidenceId: string) => void;
-  onReauthenticated: () => Promise<unknown>;
+  onReauthenticated: () => Promise<boolean>;
 }) {
   const [preview, setPreview] = useState<PreviewState>({ status: "idle" });
   const [contentQuery, setContentQuery] = useState("");
@@ -140,6 +140,20 @@ function EvidenceCard({
     () => (preview.status === "ready" ? matchCount(preview.content.text, contentQuery) : 0),
     [contentQuery, preview],
   );
+  const refreshUnlockedEvidence = async () => {
+    setReauthenticationError("");
+    setReauthenticationState("submitting");
+    try {
+      const refreshed = await onReauthenticated();
+      if (!refreshed) {
+        throw new Error("cockpit refresh was not applied");
+      }
+      setReauthenticationState("idle");
+    } catch {
+      setReauthenticationState("refresh_failed");
+      setReauthenticationError("Password accepted, but the evidence did not refresh.");
+    }
+  };
   const reauthenticate = async () => {
     if (!password || reauthenticationState === "submitting") {
       return;
@@ -149,8 +163,7 @@ function EvidenceCard({
     try {
       await authClient.reauthenticate(password);
       setPassword("");
-      await onReauthenticated();
-      setReauthenticationState("idle");
+      await refreshUnlockedEvidence();
     } catch (error) {
       setReauthenticationState("failed");
       setReauthenticationError(
@@ -215,7 +228,11 @@ function EvidenceCard({
           className="evidence-reauthentication"
           onSubmit={(event) => {
             event.preventDefault();
-            void reauthenticate();
+            if (reauthenticationState === "refresh_failed") {
+              void refreshUnlockedEvidence();
+            } else {
+              void reauthenticate();
+            }
           }}
         >
           <label>
@@ -231,10 +248,20 @@ function EvidenceCard({
               }}
             />
           </label>
-          <button type="submit" disabled={!password || reauthenticationState === "submitting"}>
-            {reauthenticationState === "submitting" ? "Checking…" : "Unlock evidence"}
+          <button
+            type="submit"
+            disabled={
+              reauthenticationState === "submitting" ||
+              (!password && reauthenticationState !== "refresh_failed")
+            }
+          >
+            {reauthenticationState === "submitting"
+              ? "Checking…"
+              : reauthenticationState === "refresh_failed"
+                ? "Retry refresh"
+                : "Unlock evidence"}
           </button>
-          {reauthenticationState === "failed" ? (
+          {reauthenticationState === "failed" || reauthenticationState === "refresh_failed" ? (
             <p className="task-error" role="alert">
               {reauthenticationError}
             </p>
@@ -295,7 +322,7 @@ export function EvidenceWorkbench({
 }: {
   criteria: TaskAcceptanceCriterionSummary[];
   evidence: TaskEvidenceSummary[];
-  onRefresh: () => Promise<unknown>;
+  onRefresh: () => Promise<boolean>;
 }) {
   const [category, setCategory] = useState<TaskEvidenceCategory | "ALL">("ALL");
   const [query, setQuery] = useState("");
