@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -33,6 +33,7 @@ from mathews_control_plane.domain_models import (
     TaskState,
     WebhookDelivery,
 )
+from mathews_control_plane.evidence import load_evidence
 from mathews_control_plane.github_app import GitHubWebhookVerifier
 from mathews_control_plane.github_webhooks import (
     GITHUB_CHECK_UPDATED_EVENT,
@@ -68,6 +69,7 @@ class WebhookHarness:
     service: GitHubWebhookService
     task_service: TaskService
     task_id: UUID
+    clock: list[datetime]
 
 
 @pytest.fixture
@@ -91,6 +93,7 @@ def webhook_harness(tmp_path: Path) -> Iterator[WebhookHarness]:
         private_key_ref=private_key_reference,
         webhook_secret_ref=webhook_reference,
     )
+    clock = [_NOW]
     service = GitHubWebhookService(
         factory,
         store,
@@ -99,7 +102,7 @@ def webhook_harness(tmp_path: Path) -> Iterator[WebhookHarness]:
             configuration,
             secret_provider=StaticSecretProvider(webhook_reference),
         ),
-        clock=lambda: _NOW,
+        clock=lambda: clock[0],
     )
     task_id = uuid4()
     with factory.begin() as session:
@@ -126,8 +129,9 @@ def webhook_harness(tmp_path: Path) -> Iterator[WebhookHarness]:
         pull_request_number=42,
         task_branch="codex/task-6-3",
         head_sha=_HEAD_SHA,
+        required_checks=("test",),
     )
-    task_service = TaskService(factory, store, clock=lambda: _NOW)
+    task_service = TaskService(factory, store, clock=lambda: clock[0])
     app = create_app(
         Settings(database_url=SecretStr(database_url), artifact_root=store.root),
         session_factory=factory,
@@ -135,7 +139,15 @@ def webhook_harness(tmp_path: Path) -> Iterator[WebhookHarness]:
         github_webhook_service=service,
     )
     with TestClient(app, base_url="https://localhost") as client:
-        yield WebhookHarness(client, factory, store, service, task_service, task_id)
+        yield WebhookHarness(
+            client,
+            factory,
+            store,
+            service,
+            task_service,
+            task_id,
+            clock,
+        )
     engine.dispose()
 
 
@@ -145,27 +157,35 @@ def _check_payload(
     updated_at: str = "2026-08-10T14:59:00Z",
     status: str = "completed",
     conclusion: str | None = "success",
+    check_id: int = 901,
 ) -> dict[str, object]:
     return {
         "action": "completed" if status == "completed" else "rerequested",
         "installation": {"id": 202},
         "repository": {"id": 303, "full_name": "boppuh/mathews"},
         "check_run": {
-            "id": 901,
+            "id": check_id,
             "name": "test",
             "status": status,
             "conclusion": conclusion,
             "head_sha": head_sha,
             "updated_at": updated_at,
-            "check_suite": {"head_branch": "codex/task-6-3"},
+            "check_suite": {"id": 801, "head_branch": "codex/task-6-3"},
             "pull_requests": [{"number": 42}],
         },
     }
 
 
-def _review_payload(*, state: str = "changes_requested") -> dict[str, object]:
+def _review_payload(
+    *,
+    state: str = "changes_requested",
+    action: str = "submitted",
+    review_id: int = 902,
+    commit_id: str = _HEAD_SHA,
+    submitted_at: str = "2026-08-10T14:59:30Z",
+) -> dict[str, object]:
     return {
-        "action": "submitted",
+        "action": action,
         "installation": {"id": 202},
         "repository": {"id": 303, "full_name": "boppuh/mathews"},
         "pull_request": {
@@ -173,10 +193,41 @@ def _review_payload(*, state: str = "changes_requested") -> dict[str, object]:
             "head": {"ref": "codex/task-6-3", "sha": _HEAD_SHA},
         },
         "review": {
-            "id": 902,
+            "id": review_id,
+            "commit_id": commit_id,
             "state": state,
-            "submitted_at": "2026-08-10T14:59:30Z",
+            "submitted_at": submitted_at,
+            "user": {"id": 501, "login": "reviewer"},
         },
+    }
+
+
+def _pull_request_payload(*, head_sha: str) -> dict[str, object]:
+    return {
+        "action": "synchronize",
+        "installation": {"id": 202},
+        "repository": {"id": 303, "full_name": "boppuh/mathews"},
+        "pull_request": {
+            "number": 42,
+            "head": {"ref": "codex/task-6-3", "sha": head_sha},
+            "state": "open",
+            "draft": True,
+            "merged": False,
+            "updated_at": "2026-08-10T15:00:00Z",
+        },
+    }
+
+
+def _thread_payload(*, resolved: bool) -> dict[str, object]:
+    return {
+        "action": "resolved" if resolved else "unresolved",
+        "installation": {"id": 202},
+        "repository": {"id": 303, "full_name": "boppuh/mathews"},
+        "pull_request": {
+            "number": 42,
+            "head": {"ref": "codex/task-6-3", "sha": _HEAD_SHA},
+        },
+        "thread": {"id": 777, "resolved": resolved},
     }
 
 
@@ -231,6 +282,16 @@ def test_verified_delivery_is_persisted_correlated_and_wakes_task(
         assert delivery.processed_at == _NOW.replace(tzinfo=None)
         assert delivery.quarantine_reason is None
         assert session.scalar(select(func.count(EvidenceRecord.id))) == 1
+        evidence = session.get(EvidenceRecord, delivery.payload_evidence_id)
+        assert evidence is not None
+        receipt = load_evidence(session, webhook_harness.store, evidence)
+        receipt_content = cast(dict[str, object], receipt.content)
+        assert isinstance(receipt_content["signature_header"], str)
+        raw_body_address = cast(str, receipt_content["raw_body_artifact"])
+        assert webhook_harness.store.get_bytes(raw_body_address) == json.dumps(
+            _check_payload(),
+            separators=(",", ":"),
+        ).encode()
         event = session.scalar(
             select(TaskEvent).where(TaskEvent.event_type == GITHUB_CHECK_UPDATED_EVENT)
         )
@@ -396,6 +457,7 @@ def test_ambiguous_exact_correlation_is_quarantined(
         pull_request_number=42,
         task_branch="codex/task-6-3",
         head_sha=_HEAD_SHA,
+        required_checks=("test",),
     )
 
     response = _post(webhook_harness, _check_payload(), delivery="ambiguous")
@@ -430,3 +492,157 @@ def test_webhook_body_is_bounded_before_verification(
     assert response.json() == {"detail": "webhook request body too large"}
     with webhook_harness.factory() as session:
         assert session.scalar(select(func.count(WebhookDelivery.id))) == 0
+
+
+def test_check_rerun_replaces_failed_generation(
+    webhook_harness: WebhookHarness,
+) -> None:
+    assert _post(
+        webhook_harness,
+        _check_payload(
+            updated_at="2026-08-10T14:58:00Z",
+            conclusion="failure",
+        ),
+        delivery="check-failed",
+    ).status_code == 202
+    assert _post(
+        webhook_harness,
+        _check_payload(check_id=902),
+        delivery="check-rerun",
+    ).status_code == 202
+
+    cockpit = webhook_harness.task_service.detail(
+        webhook_harness.task_id,
+        _authentication(),
+    )
+    assert cockpit.github.ci_status == "PASSED"
+    assert cockpit.github.checks_total == 1
+    assert cockpit.github.checks_passed == 1
+
+
+def test_missing_required_check_cannot_report_ci_passed(
+    webhook_harness: WebhookHarness,
+) -> None:
+    webhook_harness.service.bind_pull_request(
+        webhook_harness.task_id,
+        installation_id=202,
+        repository_id=303,
+        pull_request_number=42,
+        task_branch="codex/task-6-3",
+        head_sha=_HEAD_SHA,
+        required_checks=("lint", "test"),
+    )
+    assert _post(
+        webhook_harness,
+        _check_payload(),
+        delivery="only-one-required-check",
+    ).status_code == 202
+
+    cockpit = webhook_harness.task_service.detail(
+        webhook_harness.task_id,
+        _authentication(),
+    )
+    assert cockpit.github.ci_status == "PENDING"
+    assert cockpit.github.checks_total == 2
+    assert cockpit.github.checks_passed == 1
+
+
+def test_latest_review_per_reviewer_and_exact_commit_control_status(
+    webhook_harness: WebhookHarness,
+) -> None:
+    assert _post(
+        webhook_harness,
+        _review_payload(),
+        event="pull_request_review",
+        delivery="changes-requested",
+    ).json()["disposition"] == "ACCEPTED"
+    assert _post(
+        webhook_harness,
+        _review_payload(
+            state="approved",
+            review_id=903,
+            submitted_at="2026-08-10T14:59:45Z",
+        ),
+        event="pull_request_review",
+        delivery="approved",
+    ).json()["disposition"] == "ACCEPTED"
+    stale_commit = _post(
+        webhook_harness,
+        _review_payload(
+            state="changes_requested",
+            review_id=904,
+            commit_id=_NEW_HEAD_SHA,
+            submitted_at="2026-08-10T14:59:50Z",
+        ),
+        event="pull_request_review",
+        delivery="stale-review-commit",
+    )
+
+    assert stale_commit.json()["disposition"] == "STALE"
+    cockpit = webhook_harness.task_service.detail(
+        webhook_harness.task_id,
+        _authentication(),
+    )
+    assert cockpit.github.review_status == "APPROVED"
+    assert cockpit.github.blocking_reviews == 0
+
+
+def test_dismissal_and_thread_resolution_replace_blocking_review_state(
+    webhook_harness: WebhookHarness,
+) -> None:
+    assert _post(
+        webhook_harness,
+        _review_payload(),
+        event="pull_request_review",
+        delivery="review-before-dismissal",
+    ).json()["disposition"] == "ACCEPTED"
+    webhook_harness.clock[0] += timedelta(seconds=1)
+    assert _post(
+        webhook_harness,
+        _review_payload(state="dismissed", action="dismissed"),
+        event="pull_request_review",
+        delivery="review-dismissed",
+    ).json()["disposition"] == "ACCEPTED"
+    assert _post(
+        webhook_harness,
+        _thread_payload(resolved=False),
+        event="pull_request_review_thread",
+        delivery="thread-open",
+    ).json()["disposition"] == "ACCEPTED"
+    webhook_harness.clock[0] += timedelta(seconds=1)
+    assert _post(
+        webhook_harness,
+        _thread_payload(resolved=True),
+        event="pull_request_review_thread",
+        delivery="thread-resolved",
+    ).json()["disposition"] == "ACCEPTED"
+
+    cockpit = webhook_harness.task_service.detail(
+        webhook_harness.task_id,
+        _authentication(),
+    )
+    assert cockpit.github.review_status == "COMMENTED"
+    assert cockpit.github.blocking_reviews == 0
+    assert cockpit.github.review_comments == 0
+
+
+def test_synchronized_pr_head_wakes_reconciliation_and_invalidates_projection(
+    webhook_harness: WebhookHarness,
+) -> None:
+    response = _post(
+        webhook_harness,
+        _pull_request_payload(head_sha=_NEW_HEAD_SHA),
+        event="pull_request",
+        delivery="head-changed",
+    )
+
+    assert response.status_code == 202
+    assert response.json()["disposition"] == "ACCEPTED"
+    cockpit = webhook_harness.task_service.detail(
+        webhook_harness.task_id,
+        _authentication(),
+    )
+    assert cockpit.github.head_sha == _NEW_HEAD_SHA
+    assert cockpit.github.ci_status == "NOT_RUN"
+    with webhook_harness.factory() as session:
+        assert session.scalar(select(func.count(BackgroundJob.id))) == 1

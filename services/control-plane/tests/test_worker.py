@@ -102,7 +102,7 @@ def test_default_worker_registers_the_fail_closed_hermes_handler(
     with caplog.at_level(logging.WARNING, logger="mathews.worker"):
         worker, engine = build_worker(runtime_settings)
     try:
-        assert set(worker._handlers) == {"hermes-run"}
+        assert set(worker._handlers) == {"github-webhook", "hermes-run"}
         assert "no registered handlers" not in caplog.text
     finally:
         engine.dispose()

@@ -6,8 +6,8 @@ import hashlib
 import json
 import re
 import threading
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, cast
 from uuid import UUID, uuid4
@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from mathews_configuration import GITHUB_WEBHOOK_EVENTS, GitHubAppConfiguration
 from pydantic import BaseModel
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
@@ -23,6 +24,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mathews_control_plane.api_paths import GITHUB_WEBHOOK_ENDPOINT
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.background_jobs import LeasedJobContext
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
     BackgroundJob,
@@ -50,6 +52,7 @@ GITHUB_PR_BOUND_EVENT = "GITHUB_PR_BOUND"
 GITHUB_CHECK_UPDATED_EVENT = "GITHUB_CHECK_UPDATED"
 GITHUB_REVIEW_UPDATED_EVENT = "GITHUB_REVIEW_UPDATED"
 GITHUB_PULL_REQUEST_UPDATED_EVENT = "GITHUB_PULL_REQUEST_UPDATED"
+GITHUB_PR_HEAD_CHANGED_EVENT = "GITHUB_PR_HEAD_CHANGED"
 MAX_GITHUB_WEBHOOK_BYTES = 1024 * 1024
 MAX_GITHUB_WEBHOOK_CHUNKS = 1024
 
@@ -75,6 +78,7 @@ _EVENT_ACTIONS = {
     ),
     "pull_request_review": frozenset({"submitted", "edited", "dismissed"}),
     "pull_request_review_comment": frozenset({"created", "edited", "deleted"}),
+    "pull_request_review_thread": frozenset({"resolved", "unresolved"}),
 }
 
 
@@ -92,6 +96,28 @@ class GitHubWebhookIngestionResponse(BaseModel):
     task_id: UUID | None = None
     event_id: UUID | None = None
     job_id: UUID | None = None
+
+
+class GitHubWebhookJobHandler:
+    """Consume one durable GitHub wake-up after its task event is committed."""
+
+    def __call__(self, context: LeasedJobContext) -> Mapping[str, object]:
+        payload = context.grant.input_payload
+        delivery_id = payload.get("delivery_id")
+        task_event_id = payload.get("task_event_id")
+        head_sha = payload.get("head_sha")
+        if not all(isinstance(value, str) and value for value in (
+            delivery_id,
+            task_event_id,
+            head_sha,
+        )):
+            raise ValueError("github webhook wake-up payload is invalid")
+        return {
+            "delivery_id": cast(str, delivery_id),
+            "task_event_id": cast(str, task_event_id),
+            "head_sha": cast(str, head_sha),
+            "workflow_woken": True,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +186,7 @@ class GitHubWebhookService:
         pull_request_number: int,
         task_branch: str,
         head_sha: str,
+        required_checks: Sequence[str],
     ) -> UUID:
         """Append the exact PR identity used by all later webhook correlation."""
 
@@ -171,6 +198,7 @@ class GitHubWebhookService:
                 pull_request_number=pull_request_number,
                 task_branch=task_branch,
                 head_sha=head_sha,
+                required_checks=required_checks,
             )
 
     def _bind_pull_request(
@@ -182,10 +210,27 @@ class GitHubWebhookService:
         pull_request_number: int,
         task_branch: str,
         head_sha: str,
+        required_checks: Sequence[str],
     ) -> UUID:
 
         branch = _required_branch(task_branch)
         sha = _required_sha(head_sha)
+        checks = tuple(
+            sorted(
+                {
+                    check.strip()
+                    for check in required_checks
+                    if isinstance(check, str) and check.strip()
+                }
+            )
+        )
+        if (
+            not checks
+            or len(checks) != len(required_checks)
+            or len(checks) > 50
+            or any(len(check) > 255 for check in checks)
+        ):
+            raise GitHubWebhookPayloadError("required checks are invalid")
         if (
             installation_id != self._configuration.installation_id
             or repository_id != self._configuration.repository_id
@@ -200,6 +245,7 @@ class GitHubWebhookService:
             "pull_request_number": pull_request_number,
             "task_branch": branch,
             "head_sha": sha,
+            "required_checks": list(checks),
         }
         with self._factory.begin() as session:
             task = session.scalar(
@@ -257,78 +303,79 @@ class GitHubWebhookService:
         normalized_event = _required_event_name(event_name)
         payload = _decode_payload(body)
         now = _utc(self._clock())
-
-        with self._factory.begin() as session:
-            existing = session.scalar(
-                select(WebhookDelivery).where(
-                    WebhookDelivery.provider == "github",
-                    WebhookDelivery.provider_delivery_id == normalized_delivery,
-                )
-            )
-            if existing is not None:
-                prior_result = cast(
-                    dict[str, object],
-                    existing.processing_result or {},
-                )
-                if prior_result.get("body_sha256") != verified.body_sha256:
-                    raise GitHubWebhookConflictError(
-                        "delivery identifier does not match the original body"
+        replayed = False
+        try:
+            with self._factory.begin() as session:
+                existing = _delivery_by_provider_id(session, normalized_delivery)
+                if existing is not None:
+                    _require_same_delivery(existing, verified.body_sha256)
+                    existing_id = existing.id
+                    replayed = True
+                else:
+                    delivery_uuid = uuid4()
+                    raw_artifact = self._store.put_bytes(body)
+                    captured = capture_evidence(
+                        session,
+                        self._store,
+                        payload={
+                            "schema_version": 1,
+                            "provider_delivery_id": normalized_delivery,
+                            "event_name": normalized_event,
+                            "signature_header": cast(str, signature_header),
+                            "raw_body_artifact": raw_artifact.address,
+                            "verification": verified.to_dict(),
+                            "payload": payload,
+                        },
+                        media_type="application/json",
+                        source_kind=EvidenceSourceKind.EXTERNAL_EVENT,
+                        evidence_type="github-webhook",
+                        origin="github:webhook",
+                        access_classification=EvidenceAccessClass.INTERNAL,
+                        retention_policy=EvidenceRetentionClass.AUDIT,
+                        owner_id=_OWNER,
+                        actor_id=_ACTOR,
+                        root_correlation_id=delivery_uuid,
+                        causation_id=delivery_uuid,
+                        captured_at=now,
                     )
-                existing_id = existing.id
-            else:
-                delivery_uuid = uuid4()
-                captured = capture_evidence(
-                    session,
-                    self._store,
-                    payload={
-                        "schema_version": 1,
-                        "provider_delivery_id": normalized_delivery,
-                        "event_name": normalized_event,
-                        "verification": verified.to_dict(),
-                        "payload": payload,
-                    },
-                    media_type="application/json",
-                    source_kind=EvidenceSourceKind.EXTERNAL_EVENT,
-                    evidence_type="github-webhook",
-                    origin="github:webhook",
-                    access_classification=EvidenceAccessClass.INTERNAL,
-                    retention_policy=EvidenceRetentionClass.AUDIT,
-                    owner_id=_OWNER,
-                    actor_id=_ACTOR,
-                    root_correlation_id=delivery_uuid,
-                    causation_id=delivery_uuid,
-                    captured_at=now,
-                )
-                identity = _best_effort_identity(payload)
-                delivery = WebhookDelivery(
-                    id=delivery_uuid,
-                    provider="github",
-                    provider_delivery_id=normalized_delivery,
-                    installation_id=identity[0],
-                    repository_id=identity[1],
-                    pull_request_number=identity[2],
-                    head_sha=identity[3],
-                    signature_verified=True,
-                    payload_evidence_id=captured.record.id,
-                    processing_result={
-                        "stage": "RECEIVED",
-                        "body_sha256": verified.body_sha256,
-                        "event_name": normalized_event,
-                    },
-                    quarantine_reason=None,
-                    received_at=now,
-                    processed_at=None,
-                    owner_id=_OWNER,
-                    actor_id=_ACTOR,
-                    root_correlation_id=delivery_uuid,
-                    causation_id=delivery_uuid,
-                )
-                session.add(delivery)
-                session.flush()
-                existing_id = delivery.id
+                    identity = _best_effort_identity(payload)
+                    delivery = WebhookDelivery(
+                        id=delivery_uuid,
+                        provider="github",
+                        provider_delivery_id=normalized_delivery,
+                        installation_id=identity[0],
+                        repository_id=identity[1],
+                        pull_request_number=identity[2],
+                        head_sha=identity[3],
+                        signature_verified=True,
+                        payload_evidence_id=captured.record.id,
+                        processing_result={
+                            "stage": "RECEIVED",
+                            "body_sha256": verified.body_sha256,
+                            "event_name": normalized_event,
+                        },
+                        quarantine_reason=None,
+                        received_at=now,
+                        processed_at=None,
+                        owner_id=_OWNER,
+                        actor_id=_ACTOR,
+                        root_correlation_id=delivery_uuid,
+                        causation_id=delivery_uuid,
+                    )
+                    session.add(delivery)
+                    session.flush()
+                    existing_id = delivery.id
+        except IntegrityError:
+            with self._factory() as session:
+                winner = _delivery_by_provider_id(session, normalized_delivery)
+                if winner is None:
+                    raise
+                _require_same_delivery(winner, verified.body_sha256)
+                existing_id = winner.id
+                replayed = True
 
         processed = self._process(existing_id)
-        if existing is not None:
+        if replayed:
             return processed.model_copy(update={"disposition": "REPLAYED"})
         return processed
 
@@ -384,7 +431,11 @@ class GitHubWebhookService:
             event_name = cast(str, captured.get("event_name", ""))
             payload = cast(dict[str, object], captured.get("payload"))
             try:
-                update = _normalize_update(event_name, payload)
+                update = _normalize_update(
+                    event_name,
+                    payload,
+                    received_at=_utc(delivery.received_at),
+                )
             except GitHubWebhookPayloadError as error:
                 return self._quarantine(session, delivery, str(error), now)
             mismatch = _configuration_mismatch(update, self._configuration)
@@ -396,17 +447,36 @@ class GitHubWebhookService:
             delivery.head_sha = update.head_sha
 
             candidates = _correlation_candidates(session, update)
+            previous_head_sha: str | None = None
             if not candidates:
                 stale = _same_pr_different_head(session, update)
                 if stale is not None:
-                    return self._finish(
-                        delivery,
-                        disposition="STALE",
-                        now=now,
-                        task=stale,
-                        reason="head_sha_not_current",
-                    )
-                return self._quarantine(session, delivery, "correlation_unknown", now)
+                    binding = _latest_binding(session, stale.id)
+                    if (
+                        update.event_type == GITHUB_PULL_REQUEST_UPDATED_EVENT
+                        and update.action == "synchronize"
+                        and binding is not None
+                        and isinstance(binding.payload.get("head_sha"), str)
+                    ):
+                        previous_head_sha = cast(str, binding.payload["head_sha"])
+                        update = replace(
+                            update,
+                            event_type=GITHUB_PR_HEAD_CHANGED_EVENT,
+                            resource_type="pull_request_head",
+                            resource_id=str(update.pull_request_number),
+                            state="HEAD_CHANGED",
+                        )
+                        candidates = [stale]
+                    else:
+                        return self._finish(
+                            delivery,
+                            disposition="STALE",
+                            now=now,
+                            task=stale,
+                            reason="head_sha_not_current",
+                        )
+                else:
+                    return self._quarantine(session, delivery, "correlation_unknown", now)
             if len(candidates) != 1:
                 return self._quarantine(session, delivery, "correlation_ambiguous", now)
             task = session.scalar(
@@ -432,11 +502,14 @@ class GitHubWebhookService:
                         reason="source_update_not_newer",
                     )
 
+            event_payload = update.event_payload(delivery)
+            if previous_head_sha is not None:
+                event_payload["previous_head_sha"] = previous_head_sha
             event = _append_task_event(
                 session,
                 task,
                 event_type=update.event_type,
-                payload=update.event_payload(delivery),
+                payload=event_payload,
                 occurred_at=now,
                 causation_id=delivery.id,
                 parent_correlation_id=delivery.id,
@@ -658,7 +731,12 @@ def _decode_payload(body: bytes) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _normalize_update(event_name: str, payload: dict[str, object]) -> _WebhookUpdate:
+def _normalize_update(
+    event_name: str,
+    payload: dict[str, object],
+    *,
+    received_at: datetime,
+) -> _WebhookUpdate:
     if event_name not in GITHUB_WEBHOOK_EVENTS:
         raise GitHubWebhookPayloadError("event_not_allowed")
     installation = _mapping(payload, "installation")
@@ -677,6 +755,7 @@ def _normalize_update(event_name: str, payload: dict[str, object]) -> _WebhookUp
             raise GitHubWebhookPayloadError("check_pull_request_ambiguous")
         pr_number = _positive_int(cast(dict[str, object], prs[0]), "number")
         suite = _mapping(check, "check_suite")
+        suite_id = _positive_int(suite, "id")
         branch = _required_branch(_required_string(suite, "head_branch", 255))
         sha = _required_sha(_required_string(check, "head_sha", 64))
         status_value = _required_string(check, "status", 30)
@@ -699,7 +778,7 @@ def _normalize_update(event_name: str, payload: dict[str, object]) -> _WebhookUp
             sha,
             action,
             "check_run",
-            str(_positive_int(check, "id")),
+            f"{suite_id}:{_required_string(check, 'name', 255)}",
             _required_string(check, "name", 255),
             state,
             _parse_timestamp(check.get("updated_at"), "updated_at"),
@@ -712,6 +791,7 @@ def _normalize_update(event_name: str, payload: dict[str, object]) -> _WebhookUp
     sha = _required_sha(_required_string(head, "sha", 64))
     if event_name == "pull_request_review":
         review = _mapping(payload, "review")
+        reviewer = _mapping(review, "user")
         state = _required_string(review, "state", 40).upper()
         if state not in {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}:
             raise GitHubWebhookPayloadError("review_state_unknown")
@@ -722,14 +802,19 @@ def _normalize_update(event_name: str, payload: dict[str, object]) -> _WebhookUp
             repository_key,
             pr_number,
             branch,
-            sha,
+            _required_sha(_required_string(review, "commit_id", 64)),
             action,
             "review",
-            str(_positive_int(review, "id")),
-            "Pull request review",
+            str(_positive_int(reviewer, "id")),
+            _required_string(reviewer, "login", 255),
             state,
             _parse_timestamp(
-                review.get("submitted_at") or review.get("updated_at"),
+                (
+                    review.get("updated_at")
+                    or review.get("submitted_at")
+                    if action != "dismissed"
+                    else received_at.isoformat()
+                ),
                 "review timestamp",
             ),
         )
@@ -752,6 +837,26 @@ def _normalize_update(event_name: str, payload: dict[str, object]) -> _WebhookUp
                 comment.get("updated_at") or comment.get("created_at"),
                 "comment timestamp",
             ),
+        )
+    if event_name == "pull_request_review_thread":
+        thread = _mapping(payload, "thread")
+        resolved = thread.get("resolved")
+        if not isinstance(resolved, bool):
+            raise GitHubWebhookPayloadError("thread_resolved_invalid")
+        return _WebhookUpdate(
+            GITHUB_REVIEW_UPDATED_EVENT,
+            installation_id,
+            repository_id,
+            repository_key,
+            pr_number,
+            branch,
+            sha,
+            action,
+            "review_thread",
+            str(_positive_int(thread, "id")),
+            "Review thread",
+            "RESOLVED" if resolved else "OPEN",
+            received_at,
         )
     state = (
         "MERGED"
@@ -897,6 +1002,26 @@ def _configuration_mismatch(
     if update.repository_key != configuration.repository_key:
         return "repository_key_mismatch"
     return None
+
+
+def _delivery_by_provider_id(
+    session: Session,
+    provider_delivery_id: str,
+) -> WebhookDelivery | None:
+    return session.scalar(
+        select(WebhookDelivery).where(
+            WebhookDelivery.provider == "github",
+            WebhookDelivery.provider_delivery_id == provider_delivery_id,
+        )
+    )
+
+
+def _require_same_delivery(delivery: WebhookDelivery, body_sha256: str) -> None:
+    result = cast(dict[str, object], delivery.processing_result or {})
+    if result.get("body_sha256") != body_sha256:
+        raise GitHubWebhookConflictError(
+            "delivery identifier does not match the original body"
+        )
 
 
 def _best_effort_identity(payload: dict[str, object]) -> tuple[str, str, int | None, str | None]:
