@@ -18,7 +18,10 @@ stored relationships still agree:
 The `BEGIN_VALIDATION` or `REVALIDATE` transition issues the attempt identity
 and records its exact commit/tree pair. Collection jobs carry that identity,
 and both scheduling and persistence reject a delayed result when a newer
-attempt has become current.
+attempt has become current. During the upgrade that introduced candidate-bound
+attempts, the first locked v2 schedule or collection may bind a legacy in-flight
+attempt that has no candidate payload yet; subsequent submissions must match
+that exact pair.
 
 One collection ID identifies one immutable input. Reusing that ID with changed
 artifact metadata, operation output, assertion output, or Git bindings is a
@@ -45,11 +48,26 @@ an aggregate validation manifest in the evidence ledger. The source artifact's
 host address remains content-addressed; credentials and raw agent prose are not
 accepted as verifier results.
 
-`ValidationEvidenceJobScheduler` is the production handoff from configured
-validation execution to the durable `validation-evidence` worker. Before every
-source descriptor is committed, the worker renews its lease and verifies the
-task-scoped host content address and byte size. Deterministic malformed or
-stale jobs fail terminally with their stable refusal code.
+The authenticated `POST /api/validation-evidence/collections` completion
+endpoint is the production handoff from configured validation execution to
+`ValidationEvidenceJobScheduler`. Validation-attempt checking and durable job
+insertion occur under the same task lock, so a state transition cannot create a
+check/enqueue gap.
+
+New submissions use the versioned `validation-evidence-v2` job type. Updated
+workers temporarily accept both v2 payloads and legacy `validation-evidence`
+payloads; older workers cannot claim v2 work, which keeps rolling deployments
+schema-compatible. Legacy queued payloads resolve and bind the current exact
+validation attempt before host access.
+
+Before every source descriptor is committed, the worker renews its lease and
+verifies the task-scoped host content address and byte size. It checks task and
+attempt state before contacting the host, then rechecks both under the final
+task lock. The persistence transaction also verifies the current job lease and
+fencing token, preventing a reclaimed worker from committing a late result.
+Deterministic malformed or stale jobs fail terminally with their stable refusal
+code. A temporary escalation pauses and requeues the job without spending its
+retry budget; resume can continue the same attempt and idempotency key.
 
 ## Typed results
 

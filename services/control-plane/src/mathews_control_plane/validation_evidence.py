@@ -10,9 +10,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Protocol, Self, cast
+from typing import Annotated, Protocol, Self, cast
 from uuid import UUID, uuid4
 
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from mathews_configuration import (
     AssertionKind,
     HostOperation,
@@ -25,18 +26,29 @@ from mathews_configuration import (
 from mathews_configuration import (
     RepositoryConfiguration as ValidatedRepositoryConfiguration,
 )
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.authentication import (
+    AuthenticatedSession,
+    require_authenticated_session,
+)
 from mathews_control_plane.background_jobs import (
+    BackgroundJobConflictError,
+    BackgroundJobError,
     BackgroundJobService,
     JobLeaseGrant,
     LeasedJobContext,
+    PausedBackgroundJobError,
     RetryableBackgroundJobError,
     RetryPolicy,
     ScheduledJob,
     TerminalBackgroundJobError,
+    require_current_job_lease,
 )
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
@@ -68,7 +80,8 @@ from mathews_control_plane.repository_configuration import (
 )
 
 VALIDATION_EVIDENCE_EVENT_TYPE = "VALIDATION_EVIDENCE_COLLECTED"
-VALIDATION_EVIDENCE_JOB_TYPE = "validation-evidence"
+LEGACY_VALIDATION_EVIDENCE_JOB_TYPE = "validation-evidence"
+VALIDATION_EVIDENCE_JOB_TYPE = "validation-evidence-v2"
 VALIDATION_EVIDENCE_SCHEMA_VERSION = 1
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,254}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -76,6 +89,12 @@ _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _MAX_EVIDENCE_ITEMS = 256
 _MAX_ASSERTION_RESULTS = 256
 _MAX_OPERATION_RESULTS = 32
+_MAX_VALIDATION_EVIDENCE_BODY_BYTES = 1024 * 1024
+_MAX_VALIDATION_EVIDENCE_BODY_CHUNKS = 1024
+AuthenticatedValidationSession = Annotated[
+    AuthenticatedSession,
+    Depends(require_authenticated_session),
+]
 
 
 class ValidationEvidenceError(RuntimeError):
@@ -642,6 +661,7 @@ class ValidationEvidenceService:
         collection: ValidationEvidenceCollection,
         *,
         artifact_verifier: Callable[[ValidationEvidenceItem], None],
+        lease_grant_supplier: Callable[[], JobLeaseGrant] | None = None,
     ) -> ValidationEvidenceResult:
         now = _as_utc(self._clock())
         with self._factory.begin() as session:
@@ -649,6 +669,7 @@ class ValidationEvidenceService:
             if replay is not None:
                 return _replayed_result(session, replay, collection)
 
+        self.precheck(collection)
         for item in collection.evidence:
             artifact_verifier(item)
 
@@ -661,9 +682,13 @@ class ValidationEvidenceService:
             replay = session.get(ValidationRun, collection.run_id)
             if replay is not None:
                 return _replayed_result(session, replay, collection)
-            if TaskState(task.state) is not TaskState.VALIDATING:
-                raise ValidationEvidenceError("TASK_NOT_VALIDATING")
-            _require_current_validation_attempt(session, collection)
+            if lease_grant_supplier is not None:
+                require_current_job_lease(
+                    session,
+                    lease_grant_supplier(),
+                    now=_as_utc(self._clock()),
+                )
+            _require_collectible_task(session, task, collection, bind_legacy=True)
             contract = session.get(ValidationContract, collection.validation_contract_id)
             configuration = session.get(
                 RepositoryConfiguration,
@@ -913,6 +938,17 @@ class ValidationEvidenceService:
                 replayed=False,
             )
 
+    def precheck(self, collection: ValidationEvidenceCollection) -> None:
+        """Reject stale or paused work before any host artifact access."""
+
+        with self._factory.begin() as session:
+            task = session.scalar(
+                select(Task).where(Task.id == collection.task_id).with_for_update()
+            )
+            if task is None or task.owner_id != self._principal_id:
+                raise ValidationEvidenceError("TASK_UNAVAILABLE")
+            _require_collectible_task(session, task, collection, bind_legacy=True)
+
 
 class ValidationHostGateway(Protocol):
     def execute(self, request: HostRequestMessage) -> HostResponseMessage: ...
@@ -996,11 +1032,6 @@ class ValidationEvidenceJobScheduler:
         )
 
     def schedule(self, collection: ValidationEvidenceCollection) -> ScheduledJob:
-        with self._factory.begin() as session:
-            task = session.get(Task, collection.task_id)
-            if task is None or TaskState(task.state) is not TaskState.VALIDATING:
-                raise ValidationEvidenceError("TASK_NOT_VALIDATING")
-            _require_current_validation_attempt(session, collection)
         return self._jobs.schedule(
             task_id=collection.task_id,
             job_type=VALIDATION_EVIDENCE_JOB_TYPE,
@@ -1014,7 +1045,144 @@ class ValidationEvidenceJobScheduler:
                 base_delay_seconds=2,
                 max_delay_seconds=30,
             ),
+            task_validator=lambda session, task: _require_collectible_task(
+                session,
+                task,
+                collection,
+                bind_legacy=True,
+            ),
         )
+
+
+class ValidationEvidenceScheduleResponse(BaseModel):
+    """Durable identity returned by the configured-operation completion handoff."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    job_id: UUID
+    replayed: bool
+
+
+class ValidationEvidenceBodyLimitMiddleware:
+    """Reject oversized collection submissions before JSON decoding."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/api/validation-evidence/collections"
+        ):
+            await self._app(scope, receive, send)
+            return
+        content_length = _content_length(scope)
+        if (
+            content_length is not None
+            and content_length > _MAX_VALIDATION_EVIDENCE_BODY_BYTES
+        ):
+            await _send_validation_body_too_large(scope, receive, send)
+            return
+        received_bytes = 0
+        received_chunks = 0
+        captured: list[Message] = []
+        while True:
+            message = await receive()
+            captured.append(message)
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            received_chunks += 1
+            received_bytes += len(message.get("body", b""))
+            if (
+                received_chunks > _MAX_VALIDATION_EVIDENCE_BODY_CHUNKS
+                or received_bytes > _MAX_VALIDATION_EVIDENCE_BODY_BYTES
+            ):
+                await _send_validation_body_too_large(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+        index = 0
+
+        async def replay_receive() -> Message:
+            nonlocal index
+            if index < len(captured):
+                message = captured[index]
+                index += 1
+                return message
+            return await receive()
+
+        await self._app(scope, replay_receive, send)
+
+
+def _content_length(scope: Scope) -> int | None:
+    for name, value in scope["headers"]:
+        if name.lower() != b"content-length":
+            continue
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return None
+    return None
+
+
+async def _send_validation_body_too_large(
+    scope: Scope,
+    receive: Receive,
+    send: Send,
+) -> None:
+    response = JSONResponse(
+        {"detail": "validation evidence request body too large"},
+        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+    await response(scope, receive, send)
+
+
+def create_validation_evidence_router(
+    scheduler: ValidationEvidenceJobScheduler,
+) -> APIRouter:
+    """Expose the production handoff from completed operations to collection."""
+
+    router = APIRouter(prefix="/api/validation-evidence", tags=["validation-evidence"])
+
+    @router.post(
+        "/collections",
+        response_model=ValidationEvidenceScheduleResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def schedule_collection(
+        body: dict[str, object],
+        _authentication: AuthenticatedValidationSession,
+        response: Response,
+    ) -> ValidationEvidenceScheduleResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            collection = ValidationEvidenceCollection.from_dict(body)
+            scheduled = scheduler.schedule(collection)
+        except ValidationEvidenceError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="validation evidence conflicts with durable state",
+            ) from None
+        except BackgroundJobConflictError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="validation evidence job conflicts with durable state",
+            ) from None
+        except BackgroundJobError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="validation evidence job is invalid",
+            ) from None
+        return ValidationEvidenceScheduleResponse(
+            job_id=scheduled.job_id,
+            replayed=scheduled.replayed,
+        )
+
+    return router
 
 
 class ValidationEvidenceJobHandler:
@@ -1039,11 +1207,10 @@ class ValidationEvidenceJobHandler:
 
     def __call__(self, context: LeasedJobContext) -> dict[str, object]:
         try:
-            collection = ValidationEvidenceCollection.from_dict(
-                context.grant.input_payload
-            )
+            collection = _collection_from_job_payload(self._factory, context.grant)
             if collection.task_id != context.grant.task_id:
                 raise ValidationEvidenceError("VALIDATION_JOB_TASK_MISMATCH")
+            self._collector.precheck(collection)
             with self._factory() as session:
                 configuration = session.get(
                     RepositoryConfiguration,
@@ -1072,6 +1239,7 @@ class ValidationEvidenceJobHandler:
             result = self._collector.collect(
                 collection,
                 artifact_verifier=verifier.verify,
+                lease_grant_supplier=lambda: context.grant,
             )
             return {
                 "validation_run_id": str(result.validation_run_id),
@@ -1080,12 +1248,16 @@ class ValidationEvidenceJobHandler:
                 "replayed": result.replayed,
             }
         except ValidationEvidenceError as error:
+            if error.code == "TASK_VALIDATION_PAUSED":
+                raise PausedBackgroundJobError(error.code) from None
             raise TerminalBackgroundJobError(error.code) from None
 
 
 def _require_current_validation_attempt(
     session: Session,
     collection: ValidationEvidenceCollection,
+    *,
+    bind_legacy: bool = False,
 ) -> None:
     attempt = session.scalar(
         select(TaskEvent)
@@ -1098,15 +1270,96 @@ def _require_current_validation_attempt(
         .limit(1)
     )
     candidate = None if attempt is None else attempt.payload.get("validation_candidate")
+    if attempt is None or attempt.transition_id != collection.validation_attempt_id:
+        raise ValidationEvidenceError("VALIDATION_ATTEMPT_STALE")
+    if candidate is None and bind_legacy:
+        attempt.payload = {
+            **attempt.payload,
+            "validation_candidate": {
+                "commit_sha": collection.commit_sha,
+                "tree_sha": collection.tree_sha,
+            },
+        }
+        session.flush()
+        return
     if (
-        attempt is None
-        or attempt.transition_id != collection.validation_attempt_id
-        or not isinstance(candidate, Mapping)
+        not isinstance(candidate, Mapping)
         or set(candidate) != {"commit_sha", "tree_sha"}
         or candidate.get("commit_sha") != collection.commit_sha
         or candidate.get("tree_sha") != collection.tree_sha
     ):
         raise ValidationEvidenceError("VALIDATION_ATTEMPT_STALE")
+
+
+def _require_collectible_task(
+    session: Session,
+    task: Task,
+    collection: ValidationEvidenceCollection,
+    *,
+    bind_legacy: bool,
+) -> None:
+    state = TaskState(task.state)
+    if state is TaskState.ESCALATED:
+        if task.escalation_resume_state is TaskState.VALIDATING:
+            _require_current_validation_attempt(
+                session,
+                collection,
+                bind_legacy=bind_legacy,
+            )
+            raise ValidationEvidenceError("TASK_VALIDATION_PAUSED")
+        raise ValidationEvidenceError("TASK_NOT_VALIDATING")
+    if state is not TaskState.VALIDATING:
+        raise ValidationEvidenceError("TASK_NOT_VALIDATING")
+    _require_current_validation_attempt(
+        session,
+        collection,
+        bind_legacy=bind_legacy,
+    )
+
+
+def _collection_from_job_payload(
+    factory: SessionFactory,
+    grant: JobLeaseGrant,
+) -> ValidationEvidenceCollection:
+    payload = grant.input_payload
+    if grant.job_type == VALIDATION_EVIDENCE_JOB_TYPE:
+        return ValidationEvidenceCollection.from_dict(payload)
+    if grant.job_type != LEGACY_VALIDATION_EVIDENCE_JOB_TYPE:
+        raise ValidationEvidenceError("VALIDATION_JOB_TYPE_INVALID")
+    if "validation_attempt_id" in payload:
+        return ValidationEvidenceCollection.from_dict(payload)
+    legacy_fields = {
+        "run_id",
+        "task_id",
+        "validation_contract_id",
+        "repository_configuration_id",
+        "commit_sha",
+        "tree_sha",
+        "duration_ms",
+        "evidence",
+        "operation_results",
+        "assertion_results",
+    }
+    if set(payload) != legacy_fields:
+        return ValidationEvidenceCollection.from_dict(payload)
+    task_id = _uuid(payload.get("task_id"), "task id")
+    with factory() as session:
+        attempt = session.scalar(
+            select(TaskEvent)
+            .where(
+                TaskEvent.task_id == task_id,
+                TaskEvent.transition_to_state == TaskState.VALIDATING,
+                TaskEvent.transition_kind.in_(("BEGIN_VALIDATION", "REVALIDATE")),
+            )
+            .order_by(TaskEvent.sequence.desc())
+            .limit(1)
+        )
+        if attempt is None or attempt.transition_id is None:
+            raise ValidationEvidenceError("VALIDATION_ATTEMPT_STALE")
+        attempt_id = attempt.transition_id
+    return ValidationEvidenceCollection.from_dict(
+        {**payload, "validation_attempt_id": str(attempt_id)}
+    )
 
 
 def _required_evidence_types(values: Sequence[object]) -> set[str]:

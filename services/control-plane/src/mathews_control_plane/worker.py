@@ -41,6 +41,7 @@ from mathews_control_plane.reliability import (
 )
 from mathews_control_plane.settings import Settings, settings
 from mathews_control_plane.validation_evidence import (
+    LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,
     VALIDATION_EVIDENCE_JOB_TYPE,
     ValidationEvidenceJobHandler,
 )
@@ -87,11 +88,13 @@ def build_worker(
             "github-webhook": GitHubWebhookJobHandler(),
         }
         if gateway is not None:
-            handler_registry[VALIDATION_EVIDENCE_JOB_TYPE] = ValidationEvidenceJobHandler(
+            validation_handler = ValidationEvidenceJobHandler(
                 factory,
                 store,
                 gateway,
             )
+            handler_registry[LEGACY_VALIDATION_EVIDENCE_JOB_TYPE] = validation_handler
+            handler_registry[VALIDATION_EVIDENCE_JOB_TYPE] = validation_handler
     else:
         handler_registry = dict(handlers)
     if not handler_registry:

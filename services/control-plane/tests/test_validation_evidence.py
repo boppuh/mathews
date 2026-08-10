@@ -20,9 +20,11 @@ from mathews_configuration import (
 )
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.background_jobs import (
+    BackgroundJobLeaseLostError,
     BackgroundJobService,
     JobLeaseGrant,
     LeasedJobContext,
+    PausedBackgroundJobError,
     TerminalBackgroundJobError,
 )
 from mathews_control_plane.database import (
@@ -48,6 +50,8 @@ from mathews_control_plane.domain_models import (
 )
 from mathews_control_plane.tasks import _acceptance_criteria_response
 from mathews_control_plane.validation_evidence import (
+    LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,
+    VALIDATION_EVIDENCE_JOB_TYPE,
     AssertionResultStatus,
     TypedAssertionResult,
     ValidationEvidenceCollection,
@@ -695,14 +699,47 @@ def test_rejects_collection_from_stale_validation_attempt(
         configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
     )
 
+    verified: list[UUID] = []
+
     with pytest.raises(ValidationEvidenceError, match="VALIDATION_ATTEMPT_STALE"):
         service.collect(
             replace(collection, validation_attempt_id=uuid4()),
-            artifact_verifier=_accept_artifact,
+            artifact_verifier=lambda item: verified.append(item.evidence_id),
         )
 
+    assert verified == []
     with factory() as session:
         assert session.scalar(select(func.count(ValidationRun.id))) == 0
+
+
+def test_scheduler_binds_pre_upgrade_validation_attempt_candidate(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    with factory.begin() as session:
+        attempt = session.scalar(
+            select(TaskEvent).where(TaskEvent.transition_id == _VALIDATION_ATTEMPT_ID)
+        )
+        assert attempt is not None
+        attempt.payload = {"schema_version": 1, "kind": "BEGIN_VALIDATION"}
+
+    ValidationEvidenceJobScheduler(factory, store, clock=lambda: _NOW).schedule(collection)
+
+    with factory() as session:
+        attempt = session.scalar(
+            select(TaskEvent).where(TaskEvent.transition_id == _VALIDATION_ATTEMPT_ID)
+        )
+        assert attempt is not None
+        assert attempt.payload["validation_candidate"] == {
+            "commit_sha": collection.commit_sha,
+            "tree_sha": collection.tree_sha,
+        }
 
 
 def test_scheduler_enqueues_one_exact_attempt_bound_collection(
@@ -728,8 +765,40 @@ def test_scheduler_enqueues_one_exact_attempt_bound_collection(
     with factory() as session:
         job = session.get(BackgroundJob, first.job_id)
         assert job is not None
-        assert job.job_type == "validation-evidence"
+        assert job.job_type == VALIDATION_EVIDENCE_JOB_TYPE
         assert job.input_payload == collection.to_dict()
+
+
+def test_legacy_job_payload_resolves_current_attempt(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, _store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    payload = collection.to_dict()
+    payload.pop("validation_attempt_id")
+    grant = JobLeaseGrant(
+        job_id=uuid4(),
+        task_id=task_id,
+        lease_id=uuid4(),
+        worker_id="validation-worker",
+        attempt=1,
+        fencing_token=1,
+        expires_at=_NOW + timedelta(seconds=30),
+        job_type=LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,
+        input_payload=payload,
+        checkpoint=None,
+        checkpoint_version=0,
+        recovered=False,
+    )
+
+    restored = validation_evidence_module._collection_from_job_payload(factory, grant)
+
+    assert restored == collection
 
 
 def test_handler_classifies_malformed_collection_as_terminal(
@@ -739,14 +808,14 @@ def test_handler_classifies_malformed_collection_as_terminal(
     jobs = BackgroundJobService(factory, store, clock=lambda: _NOW)
     jobs.schedule(
         task_id=task_id,
-        job_type="validation-evidence",
+        job_type=LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,
         idempotency_key=f"validation-evidence:malformed:{uuid4()}",
         input_payload={},
     )
     grant = jobs.claim_next(
         worker_id="validation-worker",
         lease_duration=timedelta(seconds=30),
-        job_types=("validation-evidence",),
+        job_types=(LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,),
     )
     assert grant is not None
 
@@ -760,6 +829,91 @@ def test_handler_classifies_malformed_collection_as_terminal(
         match="VALIDATION_EVIDENCE_COLLECTION_INVALID",
     ):
         handler(LeasedJobContext(jobs, grant))
+
+
+def test_handler_pauses_escalated_validation_attempt_before_host_access(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.state = TaskState.ESCALATED
+        task.escalation_resume_state = TaskState.VALIDATING
+
+    class UnusedHost:
+        def execute(self, _request: HostRequestMessage) -> HostResponseMessage:
+            raise AssertionError("paused validation must not access the host")
+
+    grant = JobLeaseGrant(
+        job_id=uuid4(),
+        task_id=task_id,
+        lease_id=uuid4(),
+        worker_id="validation-worker",
+        attempt=1,
+        fencing_token=1,
+        expires_at=_NOW + timedelta(seconds=30),
+        job_type=VALIDATION_EVIDENCE_JOB_TYPE,
+        input_payload=collection.to_dict(),
+        checkpoint=None,
+        checkpoint_version=0,
+        recovered=False,
+    )
+
+    handler = ValidationEvidenceJobHandler(factory, store, UnusedHost())
+    with pytest.raises(PausedBackgroundJobError, match="TASK_VALIDATION_PAUSED"):
+        handler(LeasedJobContext(BackgroundJobService(factory, store), grant))
+
+
+def test_collection_persistence_is_fenced_by_current_job_lease(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    current_time = [_NOW]
+    jobs = BackgroundJobService(factory, store, clock=lambda: current_time[0])
+    jobs.schedule(
+        task_id=task_id,
+        job_type=VALIDATION_EVIDENCE_JOB_TYPE,
+        idempotency_key=f"validation-evidence-v2:{collection.run_id}",
+        input_payload=collection.to_dict(),
+    )
+    grant = jobs.claim_next(
+        worker_id="validation-worker",
+        lease_duration=timedelta(seconds=30),
+        job_types=(VALIDATION_EVIDENCE_JOB_TYPE,),
+    )
+    assert grant is not None
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: current_time[0],
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
+
+    def expire_after_host_response(_item: ValidationEvidenceItem) -> None:
+        current_time[0] = _NOW + timedelta(seconds=31)
+
+    with pytest.raises(BackgroundJobLeaseLostError):
+        service.collect(
+            collection,
+            artifact_verifier=expire_after_host_response,
+            lease_grant_supplier=lambda: grant,
+        )
+
+    with factory() as session:
+        assert session.get(ValidationRun, collection.run_id) is None
 
 
 def test_handler_renews_lease_before_each_artifact_verification(
@@ -812,12 +966,17 @@ def test_handler_renews_lease_before_each_artifact_verification(
             )
 
     class RecordingCollector:
+        def precheck(self, _submitted: ValidationEvidenceCollection) -> None:
+            pass
+
         def collect(
             self,
             submitted: ValidationEvidenceCollection,
             *,
             artifact_verifier: Callable[[ValidationEvidenceItem], None],
+            lease_grant_supplier: Callable[[], JobLeaseGrant] | None = None,
         ) -> ValidationEvidenceResult:
+            assert lease_grant_supplier is not None
             artifact_verifier(submitted.evidence[0])
             artifact_verifier(submitted.evidence[1])
             return ValidationEvidenceResult(
@@ -841,7 +1000,7 @@ def test_handler_renews_lease_before_each_artifact_verification(
                 attempt=1,
                 fencing_token=1,
                 expires_at=_NOW + timedelta(seconds=1),
-                job_type="validation-evidence",
+                job_type=LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,
                 input_payload=collection.to_dict(),
                 checkpoint=None,
                 checkpoint_version=0,

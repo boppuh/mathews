@@ -133,6 +133,7 @@ def test_worker_registers_validation_evidence_handler_with_host_gateway(
             "github-webhook",
             "hermes-run",
             "validation-evidence",
+            "validation-evidence-v2",
         }
     finally:
         engine.dispose()
