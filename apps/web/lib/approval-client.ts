@@ -68,7 +68,7 @@ export interface ApprovalInboxItem {
   brief: BriefInboxItem | null;
   supporting_evidence_ids: string[];
   actionable: boolean;
-  unavailable_reason: "RULE_CANDIDATE_UNAVAILABLE" | null;
+  unavailable_reason: "BRIEF_UNAVAILABLE" | "RULE_CANDIDATE_UNAVAILABLE" | null;
 }
 
 export interface RuleInboxItem {
@@ -277,7 +277,9 @@ function parseApproval(value: unknown): ApprovalInboxItem {
     !(value.expires_at === null || isTimestamp(value.expires_at)) ||
     typeof value.actionable !== "boolean" ||
     !(
-      value.unavailable_reason === null || value.unavailable_reason === "RULE_CANDIDATE_UNAVAILABLE"
+      value.unavailable_reason === null ||
+      value.unavailable_reason === "BRIEF_UNAVAILABLE" ||
+      value.unavailable_reason === "RULE_CANDIDATE_UNAVAILABLE"
     ) ||
     !(
       value.operation_name === null ||
@@ -302,12 +304,19 @@ function parseApproval(value: unknown): ApprovalInboxItem {
   }
   if (
     value.actionable === (value.unavailable_reason !== null) ||
-    (value.unavailable_reason !== null && value.request_type !== "REVIEW_RULE")
+    (value.unavailable_reason === "RULE_CANDIDATE_UNAVAILABLE" &&
+      value.request_type !== "REVIEW_RULE") ||
+    (value.unavailable_reason === "BRIEF_UNAVAILABLE" && value.request_type !== "BRIEF")
   ) {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   const requestType = value.request_type as ApprovalRequestType;
-  if ((requestType === "BRIEF") !== (value.brief !== null)) {
+  if (
+    (requestType === "BRIEF" &&
+      value.brief === null &&
+      value.unavailable_reason !== "BRIEF_UNAVAILABLE") ||
+    (requestType !== "BRIEF" && value.brief !== null)
+  ) {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   const options = value.options as ApprovalDecision[];

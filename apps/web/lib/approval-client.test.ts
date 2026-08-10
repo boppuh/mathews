@@ -125,6 +125,16 @@ describe("parseApprovalInbox", () => {
       approvals: [briefApproval],
       rule_candidates: [],
     });
+    const unavailableBrief = {
+      ...briefApproval,
+      brief: null,
+      actionable: false,
+      unavailable_reason: "BRIEF_UNAVAILABLE",
+    };
+    expect(parseApprovalInbox({ approvals: [unavailableBrief], rule_candidates: [] })).toEqual({
+      approvals: [unavailableBrief],
+      rule_candidates: [],
+    });
   });
 });
 

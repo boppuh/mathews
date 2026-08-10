@@ -898,6 +898,61 @@ def test_inbox_does_not_hide_pending_decisions_after_two_hundred(
     assert len(inbox.approvals) == 201
 
 
+def test_invalid_brief_does_not_hide_other_pending_decisions(
+    approval_harness: ApprovalHarness,
+) -> None:
+    service = _service(approval_harness)
+    brief_task_id, brief_evidence_id, brief_id = _create_task(
+        approval_harness,
+        state=TaskState.BRIEFING,
+        with_brief=True,
+    )
+    assert brief_id is not None
+    brief_request_id, _result = _request(
+        service,
+        task_id=brief_task_id,
+        evidence_id=brief_evidence_id,
+        expected_state=TaskState.BRIEFING,
+        request_type=ApprovalRequestType.BRIEF,
+        subject_id=brief_id,
+    )
+    other_task_id, other_evidence_id, _subject_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+    )
+    other_request_id, _result = _request(
+        service,
+        task_id=other_task_id,
+        evidence_id=other_evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_CONFLICT,
+    )
+    with approval_harness.factory.begin() as session:
+        brief = session.get(Brief, brief_id)
+        assert brief is not None
+        brief.scope = {}
+
+    inbox = service.inbox(
+        AuthenticatedSession(
+            session_id=uuid4(),
+            user_id=1,
+            csrf_token_digest=b"test",
+            expires_at=_NOW + timedelta(hours=1),
+            absolute_expires_at=_NOW + timedelta(hours=1),
+            reauthenticated_until=_NOW + timedelta(hours=1),
+            evaluated_at=_NOW,
+            recent_password_verified=True,
+        )
+    )
+
+    by_id = {item.id: item for item in inbox.approvals}
+    assert set(by_id) == {brief_request_id, other_request_id}
+    assert by_id[brief_request_id].brief is None
+    assert by_id[brief_request_id].actionable is False
+    assert by_id[brief_request_id].unavailable_reason == "BRIEF_UNAVAILABLE"
+    assert by_id[other_request_id].actionable is True
+
+
 def test_policy_and_terminal_decisions_require_recent_password(
     approval_harness: ApprovalHarness,
 ) -> None:

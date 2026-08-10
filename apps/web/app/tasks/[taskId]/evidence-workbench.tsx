@@ -352,6 +352,8 @@ export function EvidenceWorkbench({
       return;
     }
     if (!anchor.startsWith("evidence-") || anchor === "evidence-") return;
+    const evidenceId = anchor.slice("evidence-".length);
+    if (!evidence.some((record) => record.id === evidenceId)) return;
     setCategory("ALL");
     setQuery("");
     setPendingAnchor(anchor);

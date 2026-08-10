@@ -203,7 +203,7 @@ class ApprovalInboxItem(BaseModel):
     brief: BriefInboxItem | None = None
     supporting_evidence_ids: list[UUID]
     actionable: bool = True
-    unavailable_reason: Literal["RULE_CANDIDATE_UNAVAILABLE"] | None = None
+    unavailable_reason: Literal["BRIEF_UNAVAILABLE", "RULE_CANDIDATE_UNAVAILABLE"] | None = None
 
 
 class RuleInboxItem(BaseModel):
@@ -978,6 +978,8 @@ def _durable_preconditions_are_current(
     session: Session,
     task: Task,
     request: ApprovalRequest,
+    *,
+    lock_rows: bool = True,
 ) -> bool:
     request_type = _request_type(request)
     blocked_operation = _stored_blocked_operation(request)
@@ -994,9 +996,8 @@ def _durable_preconditions_are_current(
     candidate: RuleCandidate | None = None
     subject_fingerprint: str | None = None
     if request_type is ApprovalRequestType.BRIEF:
-        brief = session.scalar(
-            select(Brief).where(Brief.id == request.subject_id).with_for_update()
-        )
+        brief_query = select(Brief).where(Brief.id == request.subject_id)
+        brief = session.scalar(brief_query.with_for_update() if lock_rows else brief_query)
         if brief is None or brief.task_id != task.id or brief.owner_id != task.owner_id:
             return False
         try:
@@ -1004,8 +1005,9 @@ def _durable_preconditions_are_current(
         except ApprovalConflictError:
             return False
     elif request_type is ApprovalRequestType.REVIEW_RULE:
+        candidate_query = select(RuleCandidate).where(RuleCandidate.id == request.subject_id)
         candidate = session.scalar(
-            select(RuleCandidate).where(RuleCandidate.id == request.subject_id).with_for_update()
+            candidate_query.with_for_update() if lock_rows else candidate_query
         )
         if not (
             candidate is not None
@@ -1057,11 +1059,10 @@ def _durable_preconditions_are_current(
     ):
         return False
     if request_type is ApprovalRequestType.BRIEF:
-        decision = session.scalar(
-            select(BriefApprovalDecision)
-            .where(BriefApprovalDecision.id == task.brief_approval_decision_id)
-            .with_for_update()
+        decision_query = select(BriefApprovalDecision).where(
+            BriefApprovalDecision.id == task.brief_approval_decision_id
         )
+        decision = session.scalar(decision_query.with_for_update() if lock_rows else decision_query)
         return bool(
             TaskState(task.state) is TaskState.BRIEF_PENDING_APPROVAL
             and request.resume_state is None
@@ -1088,22 +1089,18 @@ def _durable_preconditions_are_current(
         and blocked_operation is not None
         and blocked_operation.operation_name.startswith("dependency.")
     ):
-        outage = session.scalar(
-            select(DependencyOutageAttempt)
-            .where(
-                DependencyOutageAttempt.approval_request_id == request.id,
-                DependencyOutageAttempt.exhausted.is_(True),
-                DependencyOutageAttempt.resolved_at.is_(None),
-                DependencyOutageAttempt.checkpoint_evidence_id
-                == blocked_operation.checkpoint_evidence_id,
-            )
-            .with_for_update()
+        outage_query = select(DependencyOutageAttempt).where(
+            DependencyOutageAttempt.approval_request_id == request.id,
+            DependencyOutageAttempt.exhausted.is_(True),
+            DependencyOutageAttempt.resolved_at.is_(None),
+            DependencyOutageAttempt.checkpoint_evidence_id
+            == blocked_operation.checkpoint_evidence_id,
         )
+        outage = session.scalar(outage_query.with_for_update() if lock_rows else outage_query)
         if outage is None:
             return False
-        job = session.scalar(
-            select(BackgroundJob).where(BackgroundJob.id == outage.job_id).with_for_update()
-        )
+        job_query = select(BackgroundJob).where(BackgroundJob.id == outage.job_id)
+        job = session.scalar(job_query.with_for_update() if lock_rows else job_query)
         return bool(
             job is not None
             and job.task_id == task.id
@@ -1193,8 +1190,7 @@ class ApprovalService:
         authentication: AuthenticatedSession,
     ) -> ApprovalInboxResponse:
         owner_id = _approval_principal(authentication)
-        while len(self.expire_due(limit=100)) == 100:
-            pass
+        self.expire_due(limit=100)
         now = _as_utc(self._clock())
         with self._factory() as session:
             rows = session.execute(
@@ -1232,28 +1228,6 @@ class ApprovalService:
                     repository=task.repository,
                     cockpit_path=f"/tasks/{task.id}",
                 )
-                brief_item: BriefInboxItem | None = None
-                if request_type is ApprovalRequestType.BRIEF:
-                    brief = session.scalar(
-                        select(Brief).where(
-                            Brief.id == request.subject_id,
-                            Brief.task_id == task.id,
-                            Brief.owner_id == owner_id,
-                        )
-                    )
-                    if brief is None:
-                        raise ApprovalConflictError("exact brief approval subject is unavailable")
-                    _brief_fingerprint(brief)
-                    brief_item = BriefInboxItem(
-                        id=brief.id,
-                        version=brief.version,
-                        scope=brief.scope,
-                        exclusions=brief.exclusions,
-                        acceptance_criteria=brief.acceptance_criteria,
-                        risks=brief.risks,
-                        affected_flow=brief.affected_flow,
-                        test_plan=brief.test_plan,
-                    )
                 approval_item = ApprovalInboxItem(
                     id=request.id,
                     task=task_summary,
@@ -1283,10 +1257,39 @@ class ApprovalService:
                         if blocked_operation is None
                         else blocked_operation.checkpoint_evidence_id
                     ),
-                    brief=brief_item,
+                    brief=None,
                     supporting_evidence_ids=evidence_ids,
                 )
                 approvals.append(approval_item)
+                if request_type is ApprovalRequestType.BRIEF:
+                    brief = session.scalar(
+                        select(Brief).where(
+                            Brief.id == request.subject_id,
+                            Brief.task_id == task.id,
+                            Brief.owner_id == owner_id,
+                        )
+                    )
+                    try:
+                        if brief is None:
+                            raise ApprovalConflictError(
+                                "exact brief approval subject is unavailable"
+                            )
+                        _brief_fingerprint(brief)
+                    except ApprovalConflictError:
+                        _LOGGER.warning("Skipped unavailable brief for approval %s", request.id)
+                        approval_item.actionable = False
+                        approval_item.unavailable_reason = "BRIEF_UNAVAILABLE"
+                        continue
+                    approval_item.brief = BriefInboxItem(
+                        id=brief.id,
+                        version=brief.version,
+                        scope=brief.scope,
+                        exclusions=brief.exclusions,
+                        acceptance_criteria=brief.acceptance_criteria,
+                        risks=brief.risks,
+                        affected_flow=brief.affected_flow,
+                        test_plan=brief.test_plan,
+                    )
                 if request_type is not ApprovalRequestType.REVIEW_RULE:
                     continue
                 candidate = session.scalar(
@@ -1314,7 +1317,12 @@ class ApprovalService:
                         raise ApprovalConflictError(
                             "rule candidate evidence is not bound to the approval"
                         )
-                    if not _durable_preconditions_are_current(session, task, request):
+                    if not _durable_preconditions_are_current(
+                        session,
+                        task,
+                        request,
+                        lock_rows=False,
+                    ):
                         raise ApprovalConflictError("rule candidate changed after escalation")
                 except ApprovalConflictError:
                     _LOGGER.warning(

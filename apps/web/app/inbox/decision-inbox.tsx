@@ -358,8 +358,9 @@ export function DecisionInbox() {
                 <EvidenceLinks approval={approval} />
                 {!approval.actionable ? (
                   <p className="inbox-unavailable" role="status">
-                    This rule candidate changed or became unavailable. Inspect the task before
-                    creating a replacement approval request.
+                    {approval.unavailable_reason === "BRIEF_UNAVAILABLE"
+                      ? "This brief changed or became unavailable. You can cancel the task or inspect it before creating a replacement approval request."
+                      : "This rule candidate changed or became unavailable. You can cancel the task or inspect it before creating a replacement approval request."}
                   </p>
                 ) : null}
                 <div className="inbox-card-footer">
