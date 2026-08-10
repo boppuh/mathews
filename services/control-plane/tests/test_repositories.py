@@ -37,10 +37,11 @@ from mathews_control_plane.database import (
     session_scope,
 )
 from mathews_control_plane.domain_models import RepositoryConfiguration
+from mathews_control_plane.host_gateway import HostGatewayError
 from mathews_control_plane.repositories import RepositoryService
 from mathews_control_plane.settings import Settings
 from pydantic import SecretStr
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, delete, select
 from test_repository_configuration import _configuration
 
 _ORIGIN = "http://localhost:3000"
@@ -50,9 +51,12 @@ _PASSWORD = "correct horse battery staple"
 @dataclass(slots=True)
 class RecordingGateway:
     requests: list[HostRequestMessage]
+    failure_code: str | None = None
 
     def execute(self, request: HostRequestMessage) -> HostResponseMessage:
         self.requests.append(request)
+        if self.failure_code is not None:
+            raise HostGatewayError(self.failure_code)
         arguments = request.operation.arguments
         assert isinstance(request.authority, RepositoryHostAuthority)
         configuration = cast(dict[str, object], arguments["configuration"])
@@ -224,6 +228,43 @@ def test_sensitive_save_requires_confirmation_and_preserves_omitted_secrets(
         )
 
 
+def test_first_save_and_rotation_keep_only_current_designated_secret_references(
+    repository_harness: RepositoryHarness,
+) -> None:
+    headers = _authenticate(repository_harness)
+    body = _write_body(repository_harness.configuration)
+    body["expected_configuration_version"] = None
+    body["secret_updates"] = {
+        "push_credential": "keychain://mathews/git-first",
+        "e2e_test_account": "keychain://mathews/account-first",
+    }
+    with repository_harness.factory() as session, session.begin():
+        session.execute(delete(RepositoryConfiguration))
+
+    first = repository_harness.client.post("/api/repository/versions", json=body, headers=headers)
+
+    assert first.status_code == 201, first.text
+    assert first.json()["configuration"]["version"] == 1
+    body["expected_configuration_version"] = 1
+    body["secret_updates"] = {
+        "push_credential": "keychain://mathews/git-rotated",
+        "e2e_test_account": "keychain://mathews/account-rotated",
+    }
+
+    rotated = repository_harness.client.post("/api/repository/versions", json=body, headers=headers)
+
+    assert rotated.status_code == 201, rotated.text
+    with repository_harness.factory() as session:
+        latest = session.scalar(
+            select(RepositoryConfiguration).order_by(RepositoryConfiguration.version.desc())
+        )
+        assert latest is not None
+        assert latest.secret_references == [
+            "keychain://mathews/git-rotated",
+            "keychain://mathews/account-rotated",
+        ]
+
+
 def test_invalid_configuration_creates_no_version(
     repository_harness: RepositoryHarness,
 ) -> None:
@@ -277,6 +318,26 @@ def test_preflight_invokes_only_typed_read_only_operation_and_projects_readiness
     assert request.operation.name == "repository.preflight"
     assert isinstance(request.authority, RepositoryHostAuthority)
     assert request.authority.repository_key == "boppuh/mathews"
+
+
+def test_failed_host_preflight_is_persisted_as_blocked(
+    repository_harness: RepositoryHarness,
+) -> None:
+    headers = _authenticate(repository_harness)
+    repository_harness.gateway.failure_code = "HOST_UNAVAILABLE"
+
+    response = repository_harness.client.post(
+        "/api/repository/preflights", json={}, headers=headers
+    )
+
+    assert response.status_code == 503
+    current = repository_harness.client.get("/api/repository")
+    assert current.status_code == 200
+    payload = current.json()
+    assert payload["mutation_blocked"] is True
+    assert payload["preflight"]["status"] == "BLOCKED"
+    assert len(payload["preflight"]["checks"]) == len(PreflightCheckCode)
+    assert {check["status"] for check in payload["preflight"]["checks"]} == {"BLOCKED"}
 
 
 def test_oversized_repository_write_is_rejected_before_decoding(

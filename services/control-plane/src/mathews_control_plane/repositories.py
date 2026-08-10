@@ -14,7 +14,11 @@ from mathews_configuration import (
     HostRequestMessage,
     HostResponseMessage,
     HostResponseStatus,
+    PreflightCheck,
+    PreflightCheckCode,
+    PreflightStatus,
     RepositoryHostAuthority,
+    RepositoryPreflightReport,
 )
 from mathews_configuration import (
     RepositoryConfigurationError as SharedRepositoryConfigurationError,
@@ -38,6 +42,7 @@ from mathews_control_plane.domain_models import (
 from mathews_control_plane.host_gateway import HostGatewayError
 from mathews_control_plane.repository_configuration import (
     RepositoryConfigurationConflictError,
+    RepositoryPreflightAttempt,
     RepositoryPreflightBindingError,
     RepositoryPreflightNotReadyError,
     begin_preflight_attempt,
@@ -269,23 +274,73 @@ class RepositoryService:
                 ),
             ),
         )
-        response = self._host_gateway.execute(request)
-        if response.status is not HostResponseStatus.OK:
-            raise HostGatewayError("HOST_REJECTED_PREFLIGHT")
+        try:
+            response = self._host_gateway.execute(request)
+            if response.status is not HostResponseStatus.OK:
+                raise HostGatewayError("HOST_REJECTED_PREFLIGHT")
+        except HostGatewayError:
+            self._capture_blocked_preflight(
+                attempt=attempt,
+                actor_id=actor_id,
+                root_correlation_id=root_id,
+                causation_id=request.request_id,
+            )
+            raise
 
+        try:
+            with self._factory() as session, session.begin():
+                capture_preflight_report(
+                    session,
+                    self._artifact_store,
+                    report=cast(Mapping[str, object], response.result),
+                    owner_id=_OWNER_ID,
+                    actor_id=actor_id,
+                    root_correlation_id=root_id,
+                    captured_at=_as_utc(self._clock()),
+                    causation_id=request.request_id,
+                )
+                configuration = get_latest_repository_configuration(session, self._repository_key)
+                return self._projection(session, configuration)
+        except RepositoryPreflightBindingError:
+            self._capture_blocked_preflight(
+                attempt=attempt,
+                actor_id=actor_id,
+                root_correlation_id=root_id,
+                causation_id=request.request_id,
+            )
+            raise
+
+    def _capture_blocked_preflight(
+        self,
+        *,
+        attempt: RepositoryPreflightAttempt,
+        actor_id: str,
+        root_correlation_id: UUID,
+        causation_id: UUID,
+    ) -> None:
+        report = RepositoryPreflightReport(
+            attempt_id=attempt.attempt_id,
+            configuration_id=attempt.configuration_id,
+            configuration_version=attempt.configuration_version,
+            configuration_digest=attempt.configuration_digest,
+            status=PreflightStatus.BLOCKED,
+            checks=tuple(
+                PreflightCheck.for_status(code, PreflightStatus.BLOCKED)
+                for code in PreflightCheckCode
+            ),
+            resolved_base_sha=None,
+        )
         with self._factory() as session, session.begin():
             capture_preflight_report(
                 session,
                 self._artifact_store,
-                report=cast(Mapping[str, object], response.result),
+                report=report,
                 owner_id=_OWNER_ID,
                 actor_id=actor_id,
-                root_correlation_id=root_id,
+                root_correlation_id=root_correlation_id,
                 captured_at=_as_utc(self._clock()),
-                causation_id=request.request_id,
+                causation_id=causation_id,
             )
-            configuration = get_latest_repository_configuration(session, self._repository_key)
-            return self._projection(session, configuration)
 
     def _projection(
         self,
@@ -385,6 +440,17 @@ def _materialize_configuration(
         if body.secret_updates.additional is not None
         else copy.deepcopy(latest.secret_references if latest is not None else [])
     )
+    previous_designated = {
+        value for value in (previous_push, previous_account) if isinstance(value, str)
+    }
+    secret_references = [
+        reference
+        for reference in additional
+        if not isinstance(reference, str) or reference not in previous_designated
+    ]
+    for reference in (git_settings["push_credential"], _e2e_test_account(operations)):
+        if isinstance(reference, str) and reference not in secret_references:
+            secret_references.append(reference)
     return {
         "repository_settings": repository_settings,
         "git_settings": git_settings,
@@ -393,7 +459,7 @@ def _materialize_configuration(
         "e2e_assertions": e2e_assertions,
         "artifact_settings": artifact_settings,
         "prohibited_paths": prohibited_paths,
-        "secret_references": additional,
+        "secret_references": secret_references,
     }
 
 
