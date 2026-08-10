@@ -15,6 +15,14 @@ stored relationships still agree:
 - every configured operation result, validation-contract version, repository
   configuration version, candidate commit SHA, and candidate tree SHA.
 
+The `BEGIN_VALIDATION` or `REVALIDATE` transition issues the attempt identity
+and records its exact commit/tree pair. Collection jobs carry that identity,
+and both scheduling and persistence reject a delayed result when a newer
+attempt has become current. During the upgrade that introduced candidate-bound
+attempts, the first locked v2 schedule or collection may bind a legacy in-flight
+attempt that has no candidate payload yet; subsequent submissions must match
+that exact pair.
+
 One collection ID identifies one immutable input. Reusing that ID with changed
 artifact metadata, operation output, assertion output, or Git bindings is a
 conflict. An exact replay returns the original run without duplicating evidence.
@@ -40,6 +48,27 @@ an aggregate validation manifest in the evidence ledger. The source artifact's
 host address remains content-addressed; credentials and raw agent prose are not
 accepted as verifier results.
 
+The authenticated `POST /api/validation-evidence/collections` completion
+endpoint is the production handoff from configured validation execution to
+`ValidationEvidenceJobScheduler`. Validation-attempt checking and durable job
+insertion occur under the same task lock, so a state transition cannot create a
+check/enqueue gap.
+
+New submissions use the versioned `validation-evidence-v2` job type. Updated
+workers temporarily accept both v2 payloads and legacy `validation-evidence`
+payloads; older workers cannot claim v2 work, which keeps rolling deployments
+schema-compatible. Legacy queued payloads resolve and bind the current exact
+validation attempt before host access.
+
+Before every source descriptor is committed, the worker renews its lease and
+verifies the task-scoped host content address and byte size. It checks task and
+attempt state before contacting the host, then rechecks both under the final
+task lock. The persistence transaction also verifies the current job lease and
+fencing token, preventing a reclaimed worker from committing a late result.
+Deterministic malformed or stale jobs fail terminally with their stable refusal
+code. A temporary escalation pauses and requeues the job without spending its
+retry budget; resume can continue the same attempt and idempotency key.
+
 ## Typed results
 
 Each configured operation records its operation kind, exit status, duration,
@@ -52,6 +81,10 @@ Each assertion result must exactly match an assertion ID, kind, and verifier
 catalog key in the active contract. Its status is one of `PENDING`, `PASSED`,
 `FAILED`, or `BLOCKED`. Every non-pending result has direct evidence references;
 a pending result cannot claim evidence.
+
+All assertion results are stored once at run level and in the immutable
+manifest, including global assertions such as `NO_CRASH` that intentionally do
+not bind to one acceptance criterion.
 
 Criterion status is derived deterministically from its bound assertions:
 

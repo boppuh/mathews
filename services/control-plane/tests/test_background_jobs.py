@@ -22,6 +22,7 @@ from mathews_control_plane.background_jobs import (
     InvalidBackgroundJobError,
     JobLeaseGrant,
     LeasedJobContext,
+    PausedBackgroundJobError,
     RetryableBackgroundJobError,
     RetryPolicy,
     TerminalBackgroundJobError,
@@ -800,6 +801,30 @@ def test_current_lease_can_transition_task_in_the_same_transaction(
     assert provenance.fencing_token == grant.fencing_token
 
 
+def test_background_job_transition_rejects_validation_without_candidate(
+    job_harness: JobHarness,
+) -> None:
+    task_id, evidence_id = _create_task(job_harness)
+    service = job_harness.service()
+    service.schedule(
+        task_id=task_id,
+        job_type="task-action",
+        idempotency_key="task-transition:validation",
+        input_payload={"transition": "validation"},
+    )
+    grant = _claim(job_harness)
+
+    with pytest.raises(InvalidBackgroundJobError):
+        service.transition_task(
+            grant,
+            transition_id=uuid4(),
+            expected_state=TaskState.IMPLEMENTING,
+            kind=TaskTransitionKind.BEGIN_VALIDATION,
+            reason_code="BEGIN_VALIDATION",
+            evidence_ids=(evidence_id,),
+        )
+
+
 def test_sqlite_concurrent_claims_yield_exactly_one_lease(
     job_harness: JobHarness,
 ) -> None:
@@ -907,6 +932,48 @@ def test_worker_classifies_handler_failures(
         worker_id="worker-1",
     )
     assert worker.run_once() is expected
+
+
+def test_worker_pause_requeues_without_consuming_attempt(
+    job_harness: JobHarness,
+) -> None:
+    job_id = _schedule(job_harness, policy=RetryPolicy(max_attempts=1))
+    calls = 0
+
+    def handler(_context: LeasedJobContext) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PausedBackgroundJobError("TASK_VALIDATION_PAUSED")
+
+    worker = DurableJobWorker(
+        job_harness.service(),
+        {"task-action": cast(BackgroundJobHandler, handler)},
+        worker_id="worker-1",
+    )
+
+    assert worker.run_once() is WorkerRunOutcome.RETRY_SCHEDULED
+    with job_harness.factory() as session:
+        job = session.get(BackgroundJob, job_id)
+    assert job is not None
+    assert job.status is BackgroundJobStatus.QUEUED
+    assert job.attempt_count == 0
+    assert job.last_error_code == "TASK_VALIDATION_PAUSED"
+
+    assert worker.run_once() is WorkerRunOutcome.SUCCEEDED
+    with job_harness.factory() as session:
+        job = session.get(BackgroundJob, job_id)
+        lease_attempts = tuple(
+            session.scalars(
+                select(BackgroundJobLease.attempt)
+                .where(BackgroundJobLease.job_id == job_id)
+                .order_by(BackgroundJobLease.attempt)
+            )
+        )
+    assert job is not None
+    assert job.status is BackgroundJobStatus.SUCCEEDED
+    assert job.attempt_count == 1
+    assert lease_attempts == (1, 2)
 
 
 def test_worker_escalates_exhausted_dependency_outage(

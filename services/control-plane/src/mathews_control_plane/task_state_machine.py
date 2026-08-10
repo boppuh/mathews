@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -104,6 +104,18 @@ class DraftPrGateFacts:
     pull_request_is_draft: bool
     no_unresolved_approval: bool
     cancellation_clear: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationCandidate:
+    """Exact Git objects fenced to one validation transition."""
+
+    commit_sha: str
+    tree_sha: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "commit_sha", _normalized_git_sha(self.commit_sha))
+        object.__setattr__(self, "tree_sha", _normalized_git_sha(self.tree_sha))
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,8 +493,9 @@ def _command_fingerprint(
     reason_code: str,
     actor_id: str,
     evidence_ids: Sequence[UUID],
+    validation_candidate: ValidationCandidate | None,
 ) -> str:
-    command = {
+    command: dict[str, object] = {
         "actor_id": actor_id,
         "evidence_ids": sorted(str(evidence_id) for evidence_id in evidence_ids),
         "expected_state": expected_state.value,
@@ -491,6 +504,11 @@ def _command_fingerprint(
         "task_id": str(task_id),
         "transition_id": str(transition_id),
     }
+    if validation_candidate is not None:
+        command["validation_candidate"] = {
+            "commit_sha": validation_candidate.commit_sha,
+            "tree_sha": validation_candidate.tree_sha,
+        }
     payload = json.dumps(
         command,
         sort_keys=True,
@@ -556,10 +574,28 @@ def _replayed_result(
     *,
     task_id: UUID,
     transition_id: UUID,
+    kind: TaskTransitionKind,
+    validation_candidate: ValidationCandidate | None,
     fingerprint: str,
 ) -> TaskTransitionResult:
+    stored_candidate = event.payload.get("validation_candidate")
+    candidate_matches = True
+    if kind in {
+        TaskTransitionKind.BEGIN_VALIDATION,
+        TaskTransitionKind.REVALIDATE,
+    }:
+        candidate_matches = (
+            validation_candidate is not None
+            and isinstance(stored_candidate, Mapping)
+            and set(stored_candidate) == {"commit_sha", "tree_sha"}
+            and stored_candidate.get("commit_sha")
+            == validation_candidate.commit_sha
+            and stored_candidate.get("tree_sha") == validation_candidate.tree_sha
+        )
     if (
         event.task_id != task_id
+        or event.transition_kind != kind.value
+        or not candidate_matches
         or event.transition_fingerprint != fingerprint
         or event.transition_from_state is None
         or event.transition_to_state is None
@@ -642,6 +678,7 @@ def _transition_task(
     reason_code: str,
     actor_id: str,
     evidence_ids: Sequence[UUID],
+    validation_candidate: ValidationCandidate | None,
     gate_evaluator: TaskTransitionGateEvaluator,
     active_policy_lineage: str,
     occurred_at: datetime,
@@ -658,6 +695,18 @@ def _transition_task(
         or len(unique_evidence_ids) > MAX_TRANSITION_EVIDENCE_REFERENCES
     ):
         raise InvalidTaskTransitionError("transition evidence references are invalid")
+    if kind in {
+        TaskTransitionKind.BEGIN_VALIDATION,
+        TaskTransitionKind.REVALIDATE,
+    }:
+        if validation_candidate is None:
+            raise InvalidTaskTransitionError(
+                "validation transition requires exact candidate Git objects"
+            )
+    elif validation_candidate is not None:
+        raise InvalidTaskTransitionError(
+            "validation candidate is not allowed for this transition"
+        )
     fingerprint = _command_fingerprint(
         task_id=task_id,
         transition_id=transition_id,
@@ -666,6 +715,7 @@ def _transition_task(
         reason_code=normalized_reason,
         actor_id=normalized_actor,
         evidence_ids=unique_evidence_ids,
+        validation_candidate=validation_candidate,
     )
 
     task = session.scalar(select(Task).where(Task.id == task_id).with_for_update())
@@ -679,6 +729,8 @@ def _transition_task(
             existing,
             task_id=task_id,
             transition_id=transition_id,
+            kind=kind,
+            validation_candidate=validation_candidate,
             fingerprint=fingerprint,
         )
     if TaskState(task.state) is not expected_state:
@@ -750,6 +802,11 @@ def _transition_task(
             else None
         ),
     }
+    if validation_candidate is not None:
+        payload["validation_candidate"] = {
+            "commit_sha": validation_candidate.commit_sha,
+            "tree_sha": validation_candidate.tree_sha,
+        }
     event = TaskEvent(
         task_id=task.id,
         sequence=sequence,
@@ -843,6 +900,7 @@ class TaskTransitionService:
         kind: TaskTransitionKind,
         reason_code: str,
         evidence_ids: Sequence[UUID],
+        validation_candidate: ValidationCandidate | None = None,
     ) -> TaskTransitionResult:
         with self._factory() as session, session.begin():
             if session.get_bind().dialect.name == "sqlite":
@@ -859,6 +917,7 @@ class TaskTransitionService:
                         reason_code=reason_code,
                         actor_id=self._principal_id,
                         evidence_ids=evidence_ids,
+                        validation_candidate=validation_candidate,
                         gate_evaluator=self._gate_evaluator,
                         active_policy_lineage=self._active_policy_lineage,
                         occurred_at=_as_utc(self._clock()),
@@ -879,10 +938,13 @@ class TaskTransitionService:
                     reason_code=_required_reason_code(reason_code),
                     actor_id=self._principal_id,
                     evidence_ids=tuple(dict.fromkeys(evidence_ids)),
+                    validation_candidate=validation_candidate,
                 )
                 return _replayed_result(
                     existing,
                     task_id=task_id,
                     transition_id=transition_id,
+                    kind=kind,
+                    validation_candidate=validation_candidate,
                     fingerprint=fingerprint,
                 )

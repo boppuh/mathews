@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Event
 from uuid import UUID, uuid4
 
+import mathews_control_plane.task_state_machine as task_state_machine_module
 import pytest
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database import (
@@ -53,6 +54,7 @@ from mathews_control_plane.task_state_machine import (
     TaskTransitionResult,
     TaskTransitionService,
     TaskTransitionSnapshot,
+    ValidationCandidate,
     evaluate_task_transition,
 )
 from sqlalchemy import Engine, func, select, text
@@ -615,6 +617,83 @@ def test_transition_service_is_idempotent_and_writes_typed_provenance(
     assert event_count == 1
 
 
+def test_validation_transition_replay_requires_exact_stored_candidate(
+    state_machine_harness: StateMachineHarness,
+) -> None:
+    task_id, evidence_id = _create_task_policy_and_evidence(state_machine_harness)
+    service = _service(state_machine_harness, PositiveGateEvaluator())
+    service.transition(
+        task_id,
+        transition_id=uuid4(),
+        expected_state=TaskState.INTAKE,
+        kind=TaskTransitionKind.START_BRIEFING,
+        reason_code="START_BRIEFING",
+        evidence_ids=(evidence_id,),
+    )
+    service.transition(
+        task_id,
+        transition_id=uuid4(),
+        expected_state=TaskState.BRIEFING,
+        kind=TaskTransitionKind.AUTO_ACCEPT_BRIEF,
+        reason_code="AUTO_ACCEPT_BRIEF",
+        evidence_ids=(evidence_id,),
+    )
+    transition_id = uuid4()
+    candidate = ValidationCandidate("a" * 40, "b" * 40)
+    result = service.transition(
+        task_id,
+        transition_id=transition_id,
+        expected_state=TaskState.IMPLEMENTING,
+        kind=TaskTransitionKind.BEGIN_VALIDATION,
+        reason_code="BEGIN_VALIDATION",
+        evidence_ids=(evidence_id,),
+        validation_candidate=candidate,
+    )
+    with state_machine_harness.factory.begin() as session:
+        event = session.get(TaskEvent, result.event_id)
+        assert event is not None
+        event.payload = {
+            key: value
+            for key, value in event.payload.items()
+            if key != "validation_candidate"
+        }
+
+    with pytest.raises(TaskTransitionConflictError):
+        service.transition(
+            task_id,
+            transition_id=transition_id,
+            expected_state=TaskState.IMPLEMENTING,
+            kind=TaskTransitionKind.BEGIN_VALIDATION,
+            reason_code="BEGIN_VALIDATION",
+            evidence_ids=(evidence_id,),
+            validation_candidate=candidate,
+        )
+
+    with state_machine_harness.factory.begin() as session:
+        event = session.get(TaskEvent, result.event_id)
+        assert event is not None
+        event.transition_fingerprint = task_state_machine_module._command_fingerprint(
+            task_id=task_id,
+            transition_id=transition_id,
+            expected_state=TaskState.IMPLEMENTING,
+            kind=TaskTransitionKind.BEGIN_VALIDATION,
+            reason_code="BEGIN_VALIDATION",
+            actor_id="control-plane",
+            evidence_ids=(evidence_id,),
+            validation_candidate=None,
+        )
+
+    with pytest.raises(InvalidTaskTransitionError):
+        service.transition(
+            task_id,
+            transition_id=transition_id,
+            expected_state=TaskState.IMPLEMENTING,
+            kind=TaskTransitionKind.BEGIN_VALIDATION,
+            reason_code="BEGIN_VALIDATION",
+            evidence_ids=(evidence_id,),
+        )
+
+
 def test_transition_evidence_reference_limits_and_order_are_enforced(
     state_machine_harness: StateMachineHarness,
 ) -> None:
@@ -1071,6 +1150,11 @@ def test_full_verified_draft_readiness_and_handoff_path_records_exact_head(
             kind=kind,
             reason_code=kind.value,
             evidence_ids=(evidence_id,),
+            validation_candidate=(
+                ValidationCandidate("a" * 40, "b" * 40)
+                if kind is TaskTransitionKind.BEGIN_VALIDATION
+                else None
+            ),
         )
 
     with state_machine_harness.factory() as session:
@@ -1091,6 +1175,10 @@ def test_full_verified_draft_readiness_and_handoff_path_records_exact_head(
     assert events[-1].payload["meaning"] == (
         "automation responsibility handed off; not merged, deployed, or released"
     )
+    assert events[2].payload["validation_candidate"] == {
+        "commit_sha": "a" * 40,
+        "tree_sha": "b" * 40,
+    }
 
 
 def test_escalation_resumes_only_to_recorded_state_after_trusted_recheck(

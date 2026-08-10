@@ -69,6 +69,11 @@ from mathews_control_plane.tasks import (
     TaskService,
     create_task_router,
 )
+from mathews_control_plane.validation_evidence import (
+    ValidationEvidenceBodyLimitMiddleware,
+    ValidationEvidenceJobScheduler,
+    create_validation_evidence_router,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -90,6 +95,7 @@ def create_app(
     task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
     repository_service: RepositoryService | None = None,
+    validation_evidence_scheduler: ValidationEvidenceJobScheduler | None = None,
     github_webhook_service: GitHubWebhookService | None = None,
     startup_recovery_service: StartupRecoveryService | None = None,
     startup_recovery_adapters: Mapping[
@@ -149,6 +155,11 @@ def create_app(
             session_factory,
             artifact_store,
             host_gateway=host_gateway,
+        )
+    if validation_evidence_scheduler is None:
+        validation_evidence_scheduler = ValidationEvidenceJobScheduler(
+            session_factory,
+            artifact_store,
         )
     if startup_recovery_service is None:
         startup_recovery_service = StartupRecoveryService(
@@ -247,6 +258,7 @@ def create_app(
     application.state.task_service = task_service
     application.state.approval_service = approval_service
     application.state.repository_service = repository_service
+    application.state.validation_evidence_scheduler = validation_evidence_scheduler
     application.state.github_webhook_service = github_webhook_service
     application.state.startup_recovery_service = startup_recovery_service
     application.include_router(create_authentication_router(authentication_service))
@@ -254,6 +266,9 @@ def create_app(
     application.include_router(create_task_router(task_service))
     application.include_router(create_approval_router(approval_service))
     application.include_router(create_repository_router(repository_service))
+    application.include_router(
+        create_validation_evidence_router(validation_evidence_scheduler)
+    )
     if github_webhook_service is not None:
         application.include_router(create_github_webhook_router(github_webhook_service))
 
@@ -289,6 +304,7 @@ def create_app(
     application.add_middleware(TaskBodyLimitMiddleware)
     application.add_middleware(ApprovalBodyLimitMiddleware)
     application.add_middleware(RepositoryBodyLimitMiddleware)
+    application.add_middleware(ValidationEvidenceBodyLimitMiddleware)
     application.add_middleware(GitHubWebhookBodyLimitMiddleware)
     # CORS is the outer layer so even authentication failures carry the exact
     # trusted-origin response headers expected by browser clients.

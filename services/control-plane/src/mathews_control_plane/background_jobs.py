@@ -13,7 +13,7 @@ from enum import StrEnum
 from typing import Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -93,6 +93,14 @@ class AmbiguousBackgroundJobEffectError(BackgroundJobError):
 
 class RetryableBackgroundJobError(BackgroundJobError):
     """A handler failure that may consume another bounded attempt."""
+
+    def __init__(self, error_code: str) -> None:
+        self.error_code = _required_error_code(error_code)
+        super().__init__(self.error_code)
+
+
+class PausedBackgroundJobError(BackgroundJobError):
+    """A handler pause that releases its lease without consuming an attempt."""
 
     def __init__(self, error_code: str) -> None:
         self.error_code = _required_error_code(error_code)
@@ -553,6 +561,7 @@ class BackgroundJobService:
         input_payload: Mapping[str, object],
         retry_policy: RetryPolicy | None = None,
         available_at: datetime | None = None,
+        task_validator: Callable[[Session, Task], None] | None = None,
     ) -> ScheduledJob:
         policy = retry_policy or RetryPolicy()
         normalized_type = _required_identifier(
@@ -581,6 +590,8 @@ class BackgroundJobService:
             task = session.scalar(select(Task).where(Task.id == task_id).with_for_update())
             if task is None:
                 raise BackgroundJobNotFoundError("background job task is unavailable")
+            if task_validator is not None:
+                task_validator(session, task)
             existing = session.scalar(
                 select(BackgroundJob).where(BackgroundJob.idempotency_key == normalized_key)
             )
@@ -819,22 +830,30 @@ class BackgroundJobService:
                 now = _as_utc(self._clock())
                 token = counter.next_token
                 counter.next_token = token + 1
-                attempt = job.attempt_count + 1
+                attempt_count = job.attempt_count + 1
+                lease_attempt = (
+                    session.scalar(
+                        select(func.max(BackgroundJobLease.attempt)).where(
+                            BackgroundJobLease.job_id == job.id
+                        )
+                    )
+                    or 0
+                ) + 1
                 lease_id = uuid4()
                 expires_at = now + duration
                 lease = BackgroundJobLease(
                     id=lease_id,
                     job_id=job.id,
                     lease_owner=normalized_worker,
-                    attempt=attempt,
+                    attempt=lease_attempt,
                     fencing_token=token,
-                    idempotency_key=f"{job.id}:lease:{attempt}",
+                    idempotency_key=f"{job.id}:lease:{lease_attempt}",
                     lease_protocol_version=1,
                     claim_fingerprint=_lease_fingerprint(
                         job,
                         lease_id=lease_id,
                         worker_id=normalized_worker,
-                        attempt=attempt,
+                        attempt=lease_attempt,
                         token=token,
                     ),
                     heartbeat_at=now,
@@ -848,7 +867,7 @@ class BackgroundJobService:
                 session.add(lease)
                 session.flush()
                 job.status = BackgroundJobStatus.RUNNING
-                job.attempt_count = attempt
+                job.attempt_count = attempt_count
                 job.current_lease_id = lease.id
                 job.current_fencing_token = token
                 job.lease_owner = normalized_worker
@@ -1665,6 +1684,39 @@ class BackgroundJobService:
                 now=now,
             )
 
+    def pause_attempt(
+        self,
+        grant: JobLeaseGrant,
+        *,
+        error_code: str,
+    ) -> None:
+        """Release a temporarily blocked lease without spending retry budget."""
+
+        normalized_code = _required_error_code(error_code)
+        with self._factory() as session, session.begin():
+            _begin_serialized(session)
+            job, lease, now = _current_lease(
+                session,
+                grant,
+                clock=self._clock,
+            )
+            lease.released_at = now
+            lease.release_reason = "RETRY"
+            lease.actor_id = self._principal_id
+            lease.updated_at = now
+            job.status = BackgroundJobStatus.QUEUED
+            job.attempt_count = max(0, job.attempt_count - 1)
+            job.available_at = now
+            job.current_lease_id = None
+            job.current_fencing_token = None
+            job.lease_owner = None
+            job.lease_expires_at = None
+            job.last_fencing_token = grant.fencing_token
+            job.last_error_code = normalized_code
+            job.actor_id = self._principal_id
+            job.updated_at = now
+            session.flush()
+
     def fail_dependency_attempt(
         self,
         grant: JobLeaseGrant,
@@ -2097,6 +2149,13 @@ class BackgroundJobService:
         evidence_ids: Sequence[UUID],
         active_policy_lineage: str = "mvp",
     ) -> TaskTransitionResult:
+        if kind in {
+            TaskTransitionKind.BEGIN_VALIDATION,
+            TaskTransitionKind.REVALIDATE,
+        }:
+            raise InvalidBackgroundJobError(
+                "background jobs cannot issue validation transitions without a candidate"
+            )
         with self._factory() as session, session.begin():
             _begin_serialized(session)
             task = session.scalar(
@@ -2126,6 +2185,7 @@ class BackgroundJobService:
                 reason_code=reason_code,
                 actor_id=self._principal_id,
                 evidence_ids=evidence_ids,
+                validation_candidate=None,
                 gate_evaluator=self._gate_evaluator,
                 active_policy_lineage=active_policy_lineage,
                 occurred_at=now,
@@ -2273,6 +2333,17 @@ def _current_lease(
     ):
         raise BackgroundJobLeaseLostError("background job lease is no longer current")
     return job, lease, now
+
+
+def require_current_job_lease(
+    session: Session,
+    grant: JobLeaseGrant,
+    *,
+    now: datetime,
+) -> None:
+    """Fence a caller's mutation inside its existing database transaction."""
+
+    _current_lease(session, grant, clock=lambda: now)
 
 
 def _append_checkpoint(
@@ -2588,6 +2659,15 @@ class DurableJobWorker:
                 if disposition.status == BackgroundJobStatus.QUEUED
                 else WorkerRunOutcome.FAILED
             )
+        except PausedBackgroundJobError as error:
+            try:
+                self._service.pause_attempt(
+                    context.grant,
+                    error_code=error.error_code,
+                )
+            except BackgroundJobLeaseLostError:
+                return WorkerRunOutcome.LEASE_LOST
+            return WorkerRunOutcome.RETRY_SCHEDULED
         except TerminalBackgroundJobError as error:
             disposition = self._record_failure(
                 context.grant,
