@@ -227,7 +227,7 @@ def _thread_payload(*, resolved: bool) -> dict[str, object]:
             "number": 42,
             "head": {"ref": "codex/task-6-3", "sha": _HEAD_SHA},
         },
-        "thread": {"id": 777, "resolved": resolved},
+        "thread": {"id": 777},
     }
 
 
@@ -644,8 +644,19 @@ def test_synchronized_pr_head_wakes_reconciliation_and_invalidates_projection(
     )
     assert cockpit.github.head_sha == _NEW_HEAD_SHA
     assert cockpit.github.ci_status == "NOT_RUN"
+    check = _post(
+        webhook_harness,
+        _check_payload(head_sha=_NEW_HEAD_SHA),
+        delivery="new-head-check",
+    )
+    assert check.json()["disposition"] == "ACCEPTED"
+    cockpit = webhook_harness.task_service.detail(
+        webhook_harness.task_id,
+        _authentication(),
+    )
+    assert cockpit.github.ci_status == "PASSED"
     with webhook_harness.factory() as session:
-        assert session.scalar(select(func.count(BackgroundJob.id))) == 1
+        assert session.scalar(select(func.count(BackgroundJob.id))) == 2
 
 
 def test_unreadable_committed_receipt_is_quarantined_without_blocking_drain(

@@ -462,13 +462,16 @@ class GitHubWebhookService:
                 stale = _same_pr_different_head(session, update)
                 if stale is not None:
                     binding = _latest_binding(session, stale.id)
-                    if (
+                    effective_head_sha = _effective_task_head(session, stale.id)
+                    if update.head_sha == effective_head_sha:
+                        candidates = [stale]
+                    elif (
                         update.event_type == GITHUB_PULL_REQUEST_UPDATED_EVENT
                         and update.action == "synchronize"
                         and binding is not None
-                        and isinstance(binding.payload.get("head_sha"), str)
+                        and effective_head_sha is not None
                     ):
-                        previous_head_sha = cast(str, binding.payload["head_sha"])
+                        previous_head_sha = effective_head_sha
                         update = replace(
                             update,
                             event_type=GITHUB_PR_HEAD_CHANGED_EVENT,
@@ -850,9 +853,6 @@ def _normalize_update(
         )
     if event_name == "pull_request_review_thread":
         thread = _mapping(payload, "thread")
-        resolved = thread.get("resolved")
-        if not isinstance(resolved, bool):
-            raise GitHubWebhookPayloadError("thread_resolved_invalid")
         return _WebhookUpdate(
             GITHUB_REVIEW_UPDATED_EVENT,
             installation_id,
@@ -865,7 +865,7 @@ def _normalize_update(
             "review_thread",
             str(_positive_int(thread, "id")),
             "Review thread",
-            "RESOLVED" if resolved else "OPEN",
+            "RESOLVED" if action == "resolved" else "OPEN",
             received_at,
         )
     state = (
@@ -949,6 +949,32 @@ def _latest_binding(session: Session, task_id: UUID) -> TaskEvent | None:
         .order_by(TaskEvent.sequence.desc(), TaskEvent.id.desc())
         .limit(1)
     )
+
+
+def _effective_task_head(session: Session, task_id: UUID) -> str | None:
+    binding = _latest_binding(session, task_id)
+    if binding is None:
+        return None
+    head_change = session.scalar(
+        select(TaskEvent)
+        .where(
+            TaskEvent.task_id == task_id,
+            TaskEvent.event_type == GITHUB_PR_HEAD_CHANGED_EVENT,
+            TaskEvent.sequence > binding.sequence,
+            TaskEvent.payload["pull_request_number"].as_integer()
+            == binding.payload.get("pull_request_number"),
+            TaskEvent.payload["task_branch"].as_string()
+            == binding.payload.get("task_branch"),
+        )
+        .order_by(TaskEvent.sequence.desc(), TaskEvent.id.desc())
+        .limit(1)
+    )
+    candidate = (
+        head_change.payload.get("head_sha")
+        if head_change is not None
+        else binding.payload.get("head_sha")
+    )
+    return candidate if isinstance(candidate, str) else None
 
 
 def _latest_resource_event(
