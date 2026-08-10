@@ -331,6 +331,7 @@ export function EvidenceWorkbench({
 }) {
   const [category, setCategory] = useState<TaskEvidenceCategory | "ALL">("ALL");
   const [query, setQuery] = useState("");
+  const [pendingAnchor, setPendingAnchor] = useState<string | null>(null);
   const visibleEvidence = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
     return evidence.filter(
@@ -353,10 +354,16 @@ export function EvidenceWorkbench({
     if (!anchor.startsWith("evidence-") || anchor === "evidence-") return;
     setCategory("ALL");
     setQuery("");
-    window.requestAnimationFrame(() => {
-      document.getElementById(anchor)?.scrollIntoView({ block: "center" });
-    });
+    setPendingAnchor(anchor);
   }, [evidence]);
+  useEffect(() => {
+    if (pendingAnchor === null || category !== "ALL" || query !== "") return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(pendingAnchor)?.scrollIntoView({ block: "center" });
+      setPendingAnchor(null);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [category, pendingAnchor, query]);
   const revealEvidence = (evidenceId: string) => {
     if (!evidenceId) {
       return;

@@ -865,6 +865,39 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
         client.close()
 
 
+def test_inbox_does_not_hide_pending_decisions_after_two_hundred(
+    approval_harness: ApprovalHarness,
+) -> None:
+    service = _service(approval_harness)
+    for _index in range(201):
+        task_id, evidence_id, _subject_id = _create_task(
+            approval_harness,
+            state=TaskState.REPAIRING,
+        )
+        _request(
+            service,
+            task_id=task_id,
+            evidence_id=evidence_id,
+            expected_state=TaskState.REPAIRING,
+            request_type=ApprovalRequestType.REVIEW_CONFLICT,
+        )
+
+    inbox = service.inbox(
+        AuthenticatedSession(
+            session_id=uuid4(),
+            user_id=1,
+            csrf_token_digest=b"test",
+            expires_at=_NOW + timedelta(hours=1),
+            absolute_expires_at=_NOW + timedelta(hours=1),
+            reauthenticated_until=_NOW + timedelta(hours=1),
+            evaluated_at=_NOW,
+            recent_password_verified=True,
+        )
+    )
+
+    assert len(inbox.approvals) == 201
+
+
 def test_policy_and_terminal_decisions_require_recent_password(
     approval_harness: ApprovalHarness,
 ) -> None:

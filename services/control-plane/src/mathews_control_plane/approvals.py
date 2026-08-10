@@ -589,17 +589,19 @@ def _precondition_identity(
     retry_history: Sequence[ApprovalRetryAttempt],
     subject_fingerprint: str | None,
 ) -> dict[str, object]:
-    return {
+    identity: dict[str, object] = {
         "blocked_operation": (None if blocked_operation is None else blocked_operation.to_dict()),
         "request_type": request_type.value,
         "requesting_state": requesting_state.value,
         "resume_state": (None if resume_state is None else resume_state.value),
         "retry_history": [entry.to_dict() for entry in retry_history],
         "subject_id": None if subject_id is None else str(subject_id),
-        "subject_fingerprint": subject_fingerprint,
         "subject_type": subject_type,
         "task_id": str(task_id),
     }
+    if subject_fingerprint is not None:
+        identity["subject_fingerprint"] = subject_fingerprint
+    return identity
 
 
 def _request_fingerprint(
@@ -643,6 +645,15 @@ def _decision_fingerprint(
 def _begin_serialized(session: Session) -> None:
     if session.get_bind().dialect.name == "sqlite":
         session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+
+def _lock_policy_promotion(session: Session, lineage_key: str) -> None:
+    """Serialize lineage version allocation and active-policy reconstruction."""
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    digest = hashlib.sha256(f"mathews:policy-promotion:{lineage_key}".encode()).digest()
+    lock_key = int.from_bytes(digest[:8], byteorder="big", signed=True)
+    session.execute(select(func.pg_advisory_xact_lock(lock_key)))
 
 
 def _next_event_sequence(session: Session, task_id: UUID) -> int:
@@ -989,7 +1000,7 @@ def _durable_preconditions_are_current(
         if brief is None or brief.task_id != task.id or brief.owner_id != task.owner_id:
             return False
         try:
-            subject_fingerprint = _brief_fingerprint(brief)
+            _brief_fingerprint(brief)
         except ApprovalConflictError:
             return False
     elif request_type is ApprovalRequestType.REVIEW_RULE:
@@ -1199,7 +1210,6 @@ class ApprovalService:
                     ),
                 )
                 .order_by(ApprovalRequest.created_at, ApprovalRequest.id)
-                .limit(200)
             ).all()
             approvals: list[ApprovalInboxItem] = []
             rule_candidates: list[RuleInboxItem] = []
@@ -1871,7 +1881,8 @@ class ApprovalService:
                 or (require_actionable and decision.human_response is not None)
             ):
                 raise ApprovalNotFoundError("exact brief approval subject is unavailable")
-            return _brief_fingerprint(brief)
+            _brief_fingerprint(brief)
+            return None
         elif request_type is ApprovalRequestType.REVIEW_RULE:
             candidate = session.scalar(
                 select(RuleCandidate).where(RuleCandidate.id == subject_id).with_for_update()
@@ -1974,6 +1985,7 @@ class ApprovalService:
         cited_evidence_ids = _candidate_evidence_ids(session, task, candidate)
         if not set(cited_evidence_ids).issubset(_stored_evidence_ids(request)):
             raise ApprovalConflictError("rule candidate evidence is not bound to the approval")
+        _lock_policy_promotion(session, self._active_policy_lineage)
         predecessor = session.scalar(
             select(ReviewRule)
             .where(
