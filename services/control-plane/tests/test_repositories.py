@@ -37,7 +37,7 @@ from mathews_control_plane.database import (
     create_session_factory,
     session_scope,
 )
-from mathews_control_plane.domain_models import RepositoryConfiguration
+from mathews_control_plane.domain_models import EvidenceRecord, RepositoryConfiguration
 from mathews_control_plane.host_gateway import HostGatewayError
 from mathews_control_plane.repositories import (
     MAX_REPOSITORY_BODY_BYTES,
@@ -200,7 +200,7 @@ def test_repository_projection_requires_auth_and_never_returns_secret_references
     assert payload["configuration"]["secrets"] == {
         "push_credential_configured": True,
         "e2e_test_account_configured": True,
-        "additional_reference_count": 2,
+        "additional_reference_count": 0,
     }
     assert "keychain://" not in serialized
 
@@ -272,6 +272,29 @@ def test_first_save_and_rotation_keep_only_current_designated_secret_references(
         ]
 
 
+def test_explicit_empty_additional_secret_list_clears_existing_references(
+    repository_harness: RepositoryHarness,
+) -> None:
+    headers = _authenticate(repository_harness)
+    body = _write_body(repository_harness.configuration)
+    cast(dict[str, object], body["secret_updates"])["additional"] = ["keychain://mathews/extra"]
+    added = repository_harness.client.post("/api/repository/versions", json=body, headers=headers)
+    assert added.status_code == 201, added.text
+
+    body["expected_configuration_version"] = 2
+    body["secret_updates"] = {"additional": []}
+    cleared = repository_harness.client.post("/api/repository/versions", json=body, headers=headers)
+
+    assert cleared.status_code == 201, cleared.text
+    assert cleared.json()["configuration"]["secrets"]["additional_reference_count"] == 0
+    with repository_harness.factory() as session:
+        latest = session.scalar(
+            select(RepositoryConfiguration).order_by(RepositoryConfiguration.version.desc())
+        )
+        assert latest is not None
+        assert "keychain://mathews/extra" not in latest.secret_references
+
+
 def test_invalid_configuration_creates_no_version(
     repository_harness: RepositoryHarness,
 ) -> None:
@@ -327,7 +350,7 @@ def test_preflight_invokes_only_typed_read_only_operation_and_projects_readiness
     assert request.authority.repository_key == "boppuh/mathews"
 
 
-def test_failed_host_preflight_is_persisted_as_blocked(
+def test_failed_host_preflight_clears_request_without_fabricating_host_evidence(
     repository_harness: RepositoryHarness,
 ) -> None:
     headers = _authenticate(repository_harness)
@@ -342,9 +365,14 @@ def test_failed_host_preflight_is_persisted_as_blocked(
     assert current.status_code == 200
     payload = current.json()
     assert payload["mutation_blocked"] is True
-    assert payload["preflight"]["status"] == "BLOCKED"
-    assert len(payload["preflight"]["checks"]) == len(PreflightCheckCode)
-    assert {check["status"] for check in payload["preflight"]["checks"]} == {"BLOCKED"}
+    assert payload["preflight"]["status"] == "NOT_RUN"
+    assert payload["preflight"]["checks"] == []
+    with repository_harness.factory() as session:
+        configuration = session.get(RepositoryConfiguration, repository_harness.configuration.id)
+        assert configuration is not None
+        assert configuration.preflight_evidence_id is None
+        evidence = session.scalars(select(EvidenceRecord)).all()
+        assert {record.evidence_type for record in evidence} == {"repository-preflight-request"}
 
 
 def test_oversized_repository_write_is_rejected_before_decoding(

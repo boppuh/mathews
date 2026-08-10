@@ -812,6 +812,27 @@ section {
   gap: 0.5rem;
 }
 
+.secret-reference-fields .secret-replace-control {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 0.65rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.secret-reference-fields .secret-replace-control input {
+  width: 1rem;
+  height: 1rem;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.secret-reference-fields textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .repository-form-actions {
   display: flex;
   align-items: center;

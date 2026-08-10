@@ -472,6 +472,45 @@ def capture_preflight_report(
     )
 
 
+def clear_preflight_attempt(
+    session: Session,
+    artifact_store: ArtifactStore,
+    *,
+    attempt: RepositoryPreflightAttempt,
+) -> None:
+    """Detach an exact control-plane request that never produced a host report."""
+
+    configuration = session.scalar(
+        select(RepositoryConfigurationRecord)
+        .where(RepositoryConfigurationRecord.id == attempt.configuration_id)
+        .with_for_update()
+    )
+    if configuration is None:
+        raise RepositoryConfigurationNotFoundError("repository configuration not found")
+    latest = session.scalar(_latest_query(configuration.repository_key, for_update=True))
+    if latest is None or latest.id != configuration.id:
+        raise RepositoryPreflightBindingError(
+            "failed preflight attempt is not for the authoritative configuration"
+        )
+    if configuration.preflight_evidence_id != attempt.attempt_id:
+        raise RepositoryPreflightBindingError("failed preflight attempt is no longer active")
+    evidence, payload = _load_attached_evidence(session, artifact_store, configuration)
+    expected_binding = {
+        "attempt_id": str(attempt.attempt_id),
+        "configuration_id": str(attempt.configuration_id),
+        "repository_key": attempt.repository_key,
+        "configuration_version": attempt.configuration_version,
+        "configuration_digest": attempt.configuration_digest,
+    }
+    if (
+        evidence.evidence_type != _PREFLIGHT_REQUEST_EVIDENCE_TYPE
+        or _decode_preflight_request(payload) != expected_binding
+    ):
+        raise RepositoryPreflightBindingError("failed preflight attempt binding is invalid")
+    configuration.preflight_evidence_id = None
+    session.flush()
+
+
 def require_preflight_ready(
     session: Session,
     artifact_store: ArtifactStore,

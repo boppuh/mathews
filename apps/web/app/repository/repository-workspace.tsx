@@ -116,6 +116,7 @@ function writeRequest(
   draft: Draft,
   repositoryKey: string,
   expectedConfigurationVersion: number | null,
+  replaceAdditionalSecrets: boolean,
 ): RepositoryConfigurationWriteRequest {
   const additional = draft.additionalSecrets
     .split("\n")
@@ -134,7 +135,7 @@ function writeRequest(
     secret_updates: {
       ...(draft.pushCredential ? { push_credential: draft.pushCredential.trim() } : {}),
       ...(draft.e2eTestAccount ? { e2e_test_account: draft.e2eTestAccount.trim() } : {}),
-      ...(additional.length > 0 ? { additional } : {}),
+      ...(replaceAdditionalSecrets ? { additional } : {}),
     },
     approve_sensitive_change: false,
   };
@@ -341,6 +342,7 @@ export function RepositoryWorkspace() {
   );
   const [approved, setApproved] = useState(false);
   const [password, setPassword] = useState("");
+  const [replaceAdditionalSecrets, setReplaceAdditionalSecrets] = useState(false);
   const dialogRef = useRef<HTMLElement | null>(null);
   const pendingRef = useRef(pending);
   pendingRef.current = pending;
@@ -350,6 +352,7 @@ export function RepositoryWorkspace() {
       const repository = await repositoryClient.load(signal);
       setState({ status: "ready", repository });
       setDraft(draftFrom(repository.configuration));
+      setReplaceAdditionalSecrets(false);
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") return;
       setState({
@@ -432,6 +435,7 @@ export function RepositoryWorkspace() {
         draft,
         state.repository.repository_key,
         state.repository.configuration?.version ?? null,
+        replaceAdditionalSecrets,
       );
       setSaveCandidate(candidate);
       setValidationError(null);
@@ -458,6 +462,7 @@ export function RepositoryWorkspace() {
       });
       setState({ status: "ready", repository });
       setDraft(draftFrom(repository.configuration));
+      setReplaceAdditionalSecrets(false);
       setConfirmationOpen(false);
       setSaveCandidate(null);
       setApproved(false);
@@ -479,7 +484,14 @@ export function RepositoryWorkspace() {
       const repository = await repositoryClient.preflight();
       setState({ status: "ready", repository });
     } catch (error) {
-      setActionError(messageFrom(error, "Unable to run repository preflight."));
+      const failureMessage = messageFrom(error, "Unable to run repository preflight.");
+      setActionError(failureMessage);
+      try {
+        const repository = await repositoryClient.load();
+        setState({ status: "ready", repository });
+      } catch {
+        setActionError(`${failureMessage} Readiness could not be refreshed.`);
+      }
     } finally {
       setPending(null);
     }
@@ -726,6 +738,14 @@ export function RepositoryWorkspace() {
                 />
               </div>
               <div className="secret-reference-wide">
+                <label className="secret-replace-control">
+                  <input
+                    type="checkbox"
+                    checked={replaceAdditionalSecrets}
+                    onChange={(event) => setReplaceAdditionalSecrets(event.currentTarget.checked)}
+                  />
+                  <span>Replace all configured additional references with the list below.</span>
+                </label>
                 <label htmlFor="additional-secrets">
                   Additional secret references, one per line
                 </label>
@@ -734,10 +754,13 @@ export function RepositoryWorkspace() {
                   rows={4}
                   value={draft.additionalSecrets}
                   onChange={(event) => update("additionalSecrets", event.currentTarget.value)}
+                  disabled={!replaceAdditionalSecrets}
                   placeholder={
-                    configuration?.secrets.additional_reference_count
-                      ? `${configuration.secrets.additional_reference_count} configured, leave blank to preserve`
-                      : "Optional opaque references"
+                    replaceAdditionalSecrets
+                      ? "Leave blank to clear all additional references"
+                      : configuration?.secrets.additional_reference_count
+                        ? `${configuration.secrets.additional_reference_count} configured, enable replacement to change`
+                        : "Enable replacement to add optional references"
                   }
                 />
               </div>

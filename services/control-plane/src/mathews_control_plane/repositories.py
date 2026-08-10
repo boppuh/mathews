@@ -14,11 +14,7 @@ from mathews_configuration import (
     HostRequestMessage,
     HostResponseMessage,
     HostResponseStatus,
-    PreflightCheck,
-    PreflightCheckCode,
-    PreflightStatus,
     RepositoryHostAuthority,
-    RepositoryPreflightReport,
 )
 from mathews_configuration import (
     RepositoryConfigurationError as SharedRepositoryConfigurationError,
@@ -47,6 +43,7 @@ from mathews_control_plane.repository_configuration import (
     RepositoryPreflightNotReadyError,
     begin_preflight_attempt,
     capture_preflight_report,
+    clear_preflight_attempt,
     create_repository_configuration,
     get_latest_repository_configuration,
     get_repository_preflight_report,
@@ -280,12 +277,7 @@ class RepositoryService:
             if response.status is not HostResponseStatus.OK:
                 raise HostGatewayError("HOST_REJECTED_PREFLIGHT")
         except HostGatewayError:
-            self._capture_blocked_preflight(
-                attempt=attempt,
-                actor_id=actor_id,
-                root_correlation_id=root_id,
-                causation_id=request.request_id,
-            )
+            self._clear_failed_preflight(attempt)
             raise
 
         try:
@@ -303,44 +295,15 @@ class RepositoryService:
                 configuration = get_latest_repository_configuration(session, self._repository_key)
                 return self._projection(session, configuration)
         except RepositoryPreflightBindingError:
-            self._capture_blocked_preflight(
-                attempt=attempt,
-                actor_id=actor_id,
-                root_correlation_id=root_id,
-                causation_id=request.request_id,
-            )
+            self._clear_failed_preflight(attempt)
             raise
 
-    def _capture_blocked_preflight(
-        self,
-        *,
-        attempt: RepositoryPreflightAttempt,
-        actor_id: str,
-        root_correlation_id: UUID,
-        causation_id: UUID,
-    ) -> None:
-        report = RepositoryPreflightReport(
-            attempt_id=attempt.attempt_id,
-            configuration_id=attempt.configuration_id,
-            configuration_version=attempt.configuration_version,
-            configuration_digest=attempt.configuration_digest,
-            status=PreflightStatus.BLOCKED,
-            checks=tuple(
-                PreflightCheck.for_status(code, PreflightStatus.BLOCKED)
-                for code in PreflightCheckCode
-            ),
-            resolved_base_sha=None,
-        )
+    def _clear_failed_preflight(self, attempt: RepositoryPreflightAttempt) -> None:
         with self._factory() as session, session.begin():
-            capture_preflight_report(
+            clear_preflight_attempt(
                 session,
                 self._artifact_store,
-                report=report,
-                owner_id=_OWNER_ID,
-                actor_id=actor_id,
-                root_correlation_id=root_correlation_id,
-                captured_at=_as_utc(self._clock()),
-                causation_id=causation_id,
+                attempt=attempt,
             )
 
     def _projection(
@@ -488,6 +451,19 @@ def _configuration_projection(
         flow = operation.get("e2e_flow")
         if isinstance(flow, dict):
             e2e_configured = bool(flow.pop("test_account", None)) or e2e_configured
+    designated_references = {
+        reference
+        for reference in (
+            configuration.git_settings.get("push_credential"),
+            _e2e_test_account(configuration.operations),
+        )
+        if isinstance(reference, str)
+    }
+    additional_reference_count = sum(
+        1
+        for reference in configuration.secret_references
+        if not isinstance(reference, str) or reference not in designated_references
+    )
     return RepositoryConfigurationProjection(
         id=configuration.id,
         repository_key=configuration.repository_key,
@@ -505,7 +481,7 @@ def _configuration_projection(
         secrets=RepositorySecretStatus(
             push_credential_configured=push_configured,
             e2e_test_account_configured=e2e_configured,
-            additional_reference_count=len(configuration.secret_references),
+            additional_reference_count=additional_reference_count,
         ),
     )
 
