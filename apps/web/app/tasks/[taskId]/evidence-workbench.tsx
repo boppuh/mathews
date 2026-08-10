@@ -86,21 +86,36 @@ function EvidenceCard({ record }: { record: TaskEvidenceSummary }) {
 
   useEffect(
     () => () => {
-      controller.current?.abort();
+      const activeController = controller.current;
+      controller.current = null;
+      activeController?.abort();
     },
     [],
   );
 
   const loadPreview = () => {
-    if (preview.status !== "idle" || !downloadUrl) {
+    if (preview.status === "loading" || preview.status === "ready" || !downloadUrl) {
       return;
     }
-    controller.current = new AbortController();
+    controller.current?.abort();
+    const requestController = new AbortController();
+    controller.current = requestController;
     setPreview({ status: "loading" });
-    void evidenceClient.content(record, controller.current.signal).then(
-      (content) => setPreview({ status: "ready", content }),
+    void evidenceClient.content(record, requestController.signal).then(
+      (content) => {
+        if (controller.current === requestController) {
+          controller.current = null;
+          setPreview({ status: "ready", content });
+        }
+      },
       (error: unknown) => {
-        if (!(error instanceof Error && error.name === "AbortError")) {
+        if (controller.current !== requestController) {
+          return;
+        }
+        controller.current = null;
+        if (error instanceof Error && error.name === "AbortError") {
+          setPreview({ status: "idle" });
+        } else {
           setPreview({ status: "failed", message: previewFailure(error) });
         }
       },
@@ -165,9 +180,14 @@ function EvidenceCard({ record }: { record: TaskEvidenceSummary }) {
               Loading redacted content…
             </p>
           ) : preview.status === "failed" ? (
-            <p className="task-error" role="alert">
-              {preview.message}
-            </p>
+            <div className="evidence-preview-error">
+              <p className="task-error" role="alert">
+                {preview.message}
+              </p>
+              <button type="button" onClick={loadPreview}>
+                Try again
+              </button>
+            </div>
           ) : preview.status === "ready" ? (
             <div className="evidence-preview-body">
               <label>
