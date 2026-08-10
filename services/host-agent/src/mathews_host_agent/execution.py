@@ -175,6 +175,34 @@ class HostArtifactStore:
             "eof": offset + len(chunk) == total_size,
         }
 
+    def verify(
+        self,
+        task_id: UUID,
+        *,
+        address: str,
+        expected_size_bytes: int,
+    ) -> dict[str, object]:
+        """Verify one task-scoped artifact without returning its contents."""
+
+        match = _ARTIFACT_ADDRESS.fullmatch(address)
+        if (
+            match is None
+            or isinstance(expected_size_bytes, bool)
+            or not isinstance(expected_size_bytes, int)
+            or not 0 <= expected_size_bytes <= _MAX_CAPTURE_BYTES
+        ):
+            raise ConfiguredExecutionError("ARTIFACT_VERIFY_INVALID")
+        scope_root = self._prepare_scope(task_id, create=False)
+        path = scope_root / match.group(1)
+        digest, size_bytes = self._digest_file(path)
+        if digest != match.group(1) or size_bytes != expected_size_bytes:
+            raise ConfiguredExecutionError("ARTIFACT_CORRUPT")
+        return {
+            "address": address,
+            "size_bytes": size_bytes,
+            "verified": True,
+        }
+
     def _prepare_root(self) -> None:
         try:
             self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -348,6 +376,7 @@ class ConfiguredOperationRunner:
             raise ConfiguredExecutionError("CONFIGURED_OPERATION_UNAVAILABLE")
         operation = operations[0]
         e2e_flow = getattr(operation, "e2e_flow", None)
+        simulator_target = None
         try:
             before = self._workspaces.execution_context(
                 authority,
@@ -374,6 +403,15 @@ class ConfiguredOperationRunner:
                 e2e_secret = self._secrets.get(flow.test_account)
             except Exception:
                 raise ConfiguredExecutionError("E2E_SECRET_UNAVAILABLE") from None
+            simulator_target = {
+                "device_id": simulator_id,
+                "device_type_identifier": (
+                    configuration.xcode.simulator.device_type_identifier
+                ),
+                "runtime_identifier": configuration.xcode.simulator.runtime_identifier,
+                "locale_identifier": flow.locale_identifier,
+                "time_zone_identifier": flow.time_zone_identifier,
+            }
         artifact_snapshot = self._artifact_snapshot(workspace, configuration)
         started = self._monotonic()
         with tempfile.TemporaryDirectory(prefix="execution-output-") as raw_output:
@@ -431,20 +469,6 @@ class ConfiguredOperationRunner:
             and after["tree_sha"] == before["tree_sha"]
         )
         cancelled = cancellation_status != "NOT_REQUESTED"
-        simulator_target = None
-        if operation.kind is OperationKind.SIMULATOR_E2E:
-            flow = e2e_flow
-            if simulator_id is None or flow is None:
-                raise ConfiguredExecutionError("E2E_CONFIGURATION_INVALID")
-            simulator_target = {
-                "device_id": simulator_id,
-                "device_type_identifier": (
-                    configuration.xcode.simulator.device_type_identifier
-                ),
-                "runtime_identifier": configuration.xcode.simulator.runtime_identifier,
-                "locale_identifier": flow.locale_identifier,
-                "time_zone_identifier": flow.time_zone_identifier,
-            }
         return {
             "operation_id": operation.operation_id,
             "operation_kind": operation.kind.value,

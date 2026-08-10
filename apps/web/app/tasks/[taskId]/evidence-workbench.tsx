@@ -433,7 +433,13 @@ export function EvidenceWorkbench({
                       {criterion.evidence_ids.map((evidenceId, index) => (
                         <span key={evidenceId}>
                           {index > 0 ? ", " : ""}
-                          <a href={`#evidence-${evidenceId}`}>{evidenceId.slice(0, 8)}</a>
+                          <button
+                            type="button"
+                            className="evidence-link"
+                            onClick={() => revealEvidence(evidenceId)}
+                          >
+                            {evidenceId.slice(0, 8)}
+                          </button>
                         </span>
                       ))}
                     </small>

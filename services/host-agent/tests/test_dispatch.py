@@ -301,7 +301,6 @@ def test_new_fence_rejects_stale_worker_before_a_new_operation(
             )
         )
     )
-
     stale = authenticator.verify_response(
         dispatcher.dispatch(
             authenticator.sign_request(
@@ -895,6 +894,21 @@ def test_artifact_read_is_authenticated_bounded_and_task_scoped(
             )
         )
     )
+    verified = authenticator.verify_response(
+        dispatcher.dispatch(
+            authenticator.sign_request(
+                _request(
+                    name="artifact.verify",
+                    authority=authority,
+                    idempotency_key="verify-artifact",
+                    arguments={
+                        "address": reference.address,
+                        "expected_size_bytes": len(b"immutable-evidence"),
+                    },
+                )
+            )
+        )
+    )
     foreign = authenticator.verify_response(
         dispatcher.dispatch(
             authenticator.sign_request(
@@ -916,6 +930,12 @@ def test_artifact_read_is_authenticated_bounded_and_task_scoped(
     assert response.status is HostResponseStatus.OK
     assert response.result["data_base64"] == "aW1tdXRhYmxl"
     assert response.result["eof"] is False
+    assert verified.status is HostResponseStatus.OK
+    assert verified.result == {
+        "address": reference.address,
+        "size_bytes": len(b"immutable-evidence"),
+        "verified": True,
+    }
     assert foreign.status is HostResponseStatus.REJECTED
     assert foreign.code == "ARTIFACT_UNAVAILABLE"
 
@@ -925,6 +945,7 @@ def test_default_registry_exposes_only_typed_non_shell_capabilities() -> None:
 
     assert registry.capabilities == (
         "artifact.read",
+        "artifact.verify",
         "git.apply_patch",
         "git.commit",
         "git.inspect",

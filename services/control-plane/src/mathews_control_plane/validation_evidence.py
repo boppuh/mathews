@@ -8,16 +8,28 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import cast
-from uuid import UUID
+from typing import Protocol, Self, cast
+from uuid import UUID, uuid4
 
-from mathews_configuration import AssertionKind, OperationKind
+from mathews_configuration import (
+    AssertionKind,
+    HostOperation,
+    HostRequestMessage,
+    HostResponseMessage,
+    HostResponseStatus,
+    JsonValue,
+    OperationKind,
+)
+from mathews_configuration import (
+    RepositoryConfiguration as ValidatedRepositoryConfiguration,
+)
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.background_jobs import JobLeaseGrant, LeasedJobContext
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
     Brief,
@@ -38,8 +50,13 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
 )
+from mathews_control_plane.host_gateway import (
+    HostGatewayError,
+    authority_for_job_lease,
+)
 from mathews_control_plane.repository_configuration import (
     repository_configuration_digest,
+    validated_repository_configuration,
 )
 
 VALIDATION_EVIDENCE_EVENT_TYPE = "VALIDATION_EVIDENCE_COLLECTED"
@@ -128,6 +145,49 @@ class ValidationEvidenceItem:
             "source_path": self.source_path,
         }
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "evidence_id": str(self.evidence_id),
+            "evidence_key": self.evidence_key,
+            "evidence_type": self.evidence_type.value,
+            "origin": self.origin,
+            "content_address": self.content_address,
+            "size_bytes": self.size_bytes,
+            "role": self.role,
+            "source_path": self.source_path,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        fields = _exact_mapping(
+            value,
+            {
+                "evidence_id",
+                "evidence_key",
+                "evidence_type",
+                "origin",
+                "content_address",
+                "size_bytes",
+                "role",
+                "source_path",
+            },
+            "evidence item",
+        )
+        return cls(
+            evidence_id=_uuid(fields["evidence_id"], "evidence id"),
+            evidence_key=_string(fields["evidence_key"], "evidence key"),
+            evidence_type=_enum_value(
+                fields["evidence_type"],
+                ValidationEvidenceType,
+                "evidence type",
+            ),
+            origin=_string(fields["origin"], "evidence origin"),
+            content_address=_string(fields["content_address"], "content address"),
+            size_bytes=_integer(fields["size_bytes"], "evidence size"),
+            role=_string(fields["role"], "evidence role"),
+            source_path=_optional_string(fields["source_path"], "source path"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ValidationOperationResult:
@@ -188,6 +248,14 @@ class ValidationOperationResult:
             _validate_simulator_target(self.simulator_target)
         elif self.simulator_target is not None:
             raise ValidationEvidenceError("OPERATION_SIMULATOR_TARGET_UNEXPECTED")
+        expected_passed = (
+            self.exit_status == 0
+            and self.cancellation_status == "NOT_REQUESTED"
+            and not self.output_limited
+            and self.repository_state_valid
+        )
+        if self.passed is not expected_passed:
+            raise ValidationEvidenceError("OPERATION_PASS_RESULT_CONTRADICTORY")
 
     def to_dict(self, evidence_ids: Mapping[str, UUID]) -> dict[str, object]:
         return {
@@ -211,6 +279,95 @@ class ValidationOperationResult:
                 None if self.simulator_target is None else dict(self.simulator_target)
             ),
         }
+
+    def to_input_dict(self) -> dict[str, object]:
+        return {
+            "operation_id": self.operation_id,
+            "operation_kind": self.operation_kind.value,
+            "exit_status": self.exit_status,
+            "duration_ms": self.duration_ms,
+            "passed": self.passed,
+            "cancellation_status": self.cancellation_status,
+            "output_limited": self.output_limited,
+            "repository_state_valid": self.repository_state_valid,
+            "head_sha": self.head_sha,
+            "tree_sha": self.tree_sha,
+            "configuration_id": str(self.configuration_id),
+            "configuration_version": self.configuration_version,
+            "configuration_digest": self.configuration_digest,
+            "validation_contract_version": self.validation_contract_version,
+            "evidence_keys": list(self.evidence_keys),
+            "simulator_target": (
+                None if self.simulator_target is None else dict(self.simulator_target)
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        fields = _exact_mapping(
+            value,
+            {
+                "operation_id",
+                "operation_kind",
+                "exit_status",
+                "duration_ms",
+                "passed",
+                "cancellation_status",
+                "output_limited",
+                "repository_state_valid",
+                "head_sha",
+                "tree_sha",
+                "configuration_id",
+                "configuration_version",
+                "configuration_digest",
+                "validation_contract_version",
+                "evidence_keys",
+                "simulator_target",
+            },
+            "operation result",
+        )
+        raw_target = fields["simulator_target"]
+        return cls(
+            operation_id=_string(fields["operation_id"], "operation id"),
+            operation_kind=_enum_value(
+                fields["operation_kind"],
+                OperationKind,
+                "operation kind",
+            ),
+            exit_status=_integer(fields["exit_status"], "operation exit status"),
+            duration_ms=_integer(fields["duration_ms"], "operation duration"),
+            passed=_boolean(fields["passed"], "operation passed"),
+            cancellation_status=_string(
+                fields["cancellation_status"],
+                "cancellation status",
+            ),
+            output_limited=_boolean(fields["output_limited"], "output limited"),
+            repository_state_valid=_boolean(
+                fields["repository_state_valid"],
+                "repository state valid",
+            ),
+            head_sha=_string(fields["head_sha"], "operation head"),
+            tree_sha=_string(fields["tree_sha"], "operation tree"),
+            configuration_id=_uuid(fields["configuration_id"], "configuration id"),
+            configuration_version=_integer(
+                fields["configuration_version"],
+                "configuration version",
+            ),
+            configuration_digest=_string(
+                fields["configuration_digest"],
+                "configuration digest",
+            ),
+            validation_contract_version=_integer(
+                fields["validation_contract_version"],
+                "validation contract version",
+            ),
+            evidence_keys=_string_tuple(fields["evidence_keys"], "evidence keys"),
+            simulator_target=(
+                None
+                if raw_target is None
+                else dict(_mapping(raw_target, "simulator target"))
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +405,46 @@ class TypedAssertionResult:
             "result_code": self.result_code,
             "evidence_ids": [str(evidence_ids[key]) for key in self.evidence_keys],
         }
+
+    def to_input_dict(self) -> dict[str, object]:
+        return {
+            "assertion_id": self.assertion_id,
+            "kind": self.kind.value,
+            "verifier_catalog_key": self.verifier_catalog_key,
+            "status": self.status.value,
+            "evidence_keys": list(self.evidence_keys),
+            "result_code": self.result_code,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        fields = _exact_mapping(
+            value,
+            {
+                "assertion_id",
+                "kind",
+                "verifier_catalog_key",
+                "status",
+                "evidence_keys",
+                "result_code",
+            },
+            "assertion result",
+        )
+        return cls(
+            assertion_id=_string(fields["assertion_id"], "assertion id"),
+            kind=_enum_value(fields["kind"], AssertionKind, "assertion kind"),
+            verifier_catalog_key=_string(
+                fields["verifier_catalog_key"],
+                "verifier catalog key",
+            ),
+            status=_enum_value(
+                fields["status"],
+                AssertionResultStatus,
+                "assertion status",
+            ),
+            evidence_keys=_string_tuple(fields["evidence_keys"], "evidence keys"),
+            result_code=_string(fields["result_code"], "result code"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +508,82 @@ class ValidationEvidenceCollection:
             (item.assertion_id for item in self.assertion_results),
             "ASSERTION_RESULT_DUPLICATE",
         )
+        evidence_keys = {item.evidence_key for item in self.evidence}
+        referenced_keys = {
+            key
+            for result in self.operation_results
+            for key in result.evidence_keys
+        } | {
+            key
+            for result in self.assertion_results
+            for key in result.evidence_keys
+        }
+        if not referenced_keys.issubset(evidence_keys):
+            raise ValidationEvidenceError("EVIDENCE_REFERENCE_UNKNOWN")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "run_id": str(self.run_id),
+            "task_id": str(self.task_id),
+            "validation_contract_id": str(self.validation_contract_id),
+            "repository_configuration_id": str(self.repository_configuration_id),
+            "commit_sha": self.commit_sha,
+            "tree_sha": self.tree_sha,
+            "duration_ms": self.duration_ms,
+            "evidence": [item.to_dict() for item in self.evidence],
+            "operation_results": [
+                item.to_input_dict() for item in self.operation_results
+            ],
+            "assertion_results": [
+                item.to_input_dict() for item in self.assertion_results
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        fields = _exact_mapping(
+            value,
+            {
+                "run_id",
+                "task_id",
+                "validation_contract_id",
+                "repository_configuration_id",
+                "commit_sha",
+                "tree_sha",
+                "duration_ms",
+                "evidence",
+                "operation_results",
+                "assertion_results",
+            },
+            "validation evidence collection",
+        )
+        return cls(
+            run_id=_uuid(fields["run_id"], "run id"),
+            task_id=_uuid(fields["task_id"], "task id"),
+            validation_contract_id=_uuid(
+                fields["validation_contract_id"],
+                "validation contract id",
+            ),
+            repository_configuration_id=_uuid(
+                fields["repository_configuration_id"],
+                "repository configuration id",
+            ),
+            commit_sha=_string(fields["commit_sha"], "commit sha"),
+            tree_sha=_string(fields["tree_sha"], "tree sha"),
+            duration_ms=_integer(fields["duration_ms"], "collection duration"),
+            evidence=tuple(
+                ValidationEvidenceItem.from_dict(item)
+                for item in _sequence(fields["evidence"], "evidence")
+            ),
+            operation_results=tuple(
+                ValidationOperationResult.from_dict(item)
+                for item in _sequence(fields["operation_results"], "operation results")
+            ),
+            assertion_results=tuple(
+                TypedAssertionResult.from_dict(item)
+                for item in _sequence(fields["assertion_results"], "assertion results")
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,7 +620,12 @@ class ValidationEvidenceService:
             else configuration_digest
         )
 
-    def collect(self, collection: ValidationEvidenceCollection) -> ValidationEvidenceResult:
+    def collect(
+        self,
+        collection: ValidationEvidenceCollection,
+        *,
+        artifact_verifier: Callable[[ValidationEvidenceItem], None],
+    ) -> ValidationEvidenceResult:
         now = _as_utc(self._clock())
         with self._factory.begin() as session:
             replay = session.get(ValidationRun, collection.run_id)
@@ -407,6 +685,7 @@ class ValidationEvidenceService:
                 configuration_digest = self._configuration_digest(configuration)
             except ValueError:
                 raise ValidationEvidenceError("CONFIGURATION_BINDING_INVALID") from None
+            configured_operation_kinds = _configured_operation_kinds(configuration)
             for operation in collection.operation_results:
                 _validate_operation_binding(
                     operation,
@@ -414,6 +693,7 @@ class ValidationEvidenceService:
                     contract=contract,
                     configuration=configuration,
                     configuration_digest=configuration_digest,
+                    configured_operation_kinds=configured_operation_kinds,
                     evidence_by_key=evidence_by_key,
                 )
 
@@ -428,6 +708,9 @@ class ValidationEvidenceService:
                 if result.kind is not kind or result.verifier_catalog_key != catalog_key:
                     raise ValidationEvidenceError("ASSERTION_RESULT_MISMATCH")
                 _require_evidence_keys(result.evidence_keys, evidence_by_key)
+
+            for item in collection.evidence:
+                artifact_verifier(item)
 
             criterion_ids = _brief_criterion_ids(brief)
             criteria_by_assertion: dict[str, list[str]] = defaultdict(list)
@@ -606,6 +889,120 @@ class ValidationEvidenceService:
             )
 
 
+class ValidationHostGateway(Protocol):
+    def execute(self, request: HostRequestMessage) -> HostResponseMessage: ...
+
+
+class HostValidationArtifactVerifier:
+    """Verify host artifacts through the authenticated task-lease boundary."""
+
+    def __init__(
+        self,
+        host_gateway: ValidationHostGateway,
+        grant: JobLeaseGrant,
+        configuration: ValidatedRepositoryConfiguration,
+        *,
+        run_id: UUID,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._host = host_gateway
+        self._grant = grant
+        self._configuration = configuration
+        self._run_id = run_id
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    def verify(self, item: ValidationEvidenceItem) -> None:
+        now = _as_utc(self._clock())
+        request = HostRequestMessage(
+            request_id=uuid4(),
+            issued_at_ms=int(now.timestamp() * 1_000),
+            expires_at_ms=int((now + timedelta(seconds=30)).timestamp() * 1_000),
+            authority=authority_for_job_lease(
+                self._grant,
+                configuration=self._configuration,
+            ),
+            operation=HostOperation(
+                name="artifact.verify",
+                idempotency_key=f"validation-artifact:{self._run_id}:{item.evidence_id}",
+                arguments=cast(
+                    dict[str, JsonValue],
+                    {
+                        "address": item.content_address,
+                        "expected_size_bytes": item.size_bytes,
+                    },
+                ),
+            ),
+        )
+        try:
+            response = self._host.execute(request)
+        except HostGatewayError:
+            raise ValidationEvidenceError("HOST_ARTIFACT_UNAVAILABLE") from None
+        if (
+            response.status is not HostResponseStatus.OK
+            or response.result
+            != {
+                "address": item.content_address,
+                "size_bytes": item.size_bytes,
+                "verified": True,
+            }
+        ):
+            raise ValidationEvidenceError("HOST_ARTIFACT_UNVERIFIED")
+
+
+class ValidationEvidenceJobHandler:
+    """Decode and persist one lease-fenced validation-evidence collection job."""
+
+    def __init__(
+        self,
+        factory: SessionFactory,
+        artifact_store: ArtifactStore,
+        host_gateway: ValidationHostGateway,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._factory = factory
+        self._host = host_gateway
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._collector = ValidationEvidenceService(
+            factory,
+            artifact_store,
+            clock=self._clock,
+        )
+
+    def __call__(self, context: LeasedJobContext) -> dict[str, object]:
+        collection = ValidationEvidenceCollection.from_dict(context.grant.input_payload)
+        if collection.task_id != context.grant.task_id:
+            raise ValidationEvidenceError("VALIDATION_JOB_TASK_MISMATCH")
+        with self._factory() as session:
+            configuration = session.get(
+                RepositoryConfiguration,
+                collection.repository_configuration_id,
+            )
+            if configuration is None:
+                raise ValidationEvidenceError("VALIDATION_BINDING_MISMATCH")
+            try:
+                validated = validated_repository_configuration(configuration)
+            except ValueError:
+                raise ValidationEvidenceError("CONFIGURATION_BINDING_INVALID") from None
+        verifier = HostValidationArtifactVerifier(
+            self._host,
+            context.grant,
+            validated,
+            run_id=collection.run_id,
+            clock=self._clock,
+        )
+        result = self._collector.collect(
+            collection,
+            artifact_verifier=verifier.verify,
+        )
+        return {
+            "validation_run_id": str(result.validation_run_id),
+            "commit_sha": result.commit_sha,
+            "tree_sha": result.tree_sha,
+            "replayed": result.replayed,
+        }
+
+
 def _required_evidence_types(values: Sequence[object]) -> set[str]:
     result: set[str] = set()
     for value in values:
@@ -705,6 +1102,7 @@ def _validate_operation_binding(
     contract: ValidationContract,
     configuration: RepositoryConfiguration,
     configuration_digest: str,
+    configured_operation_kinds: Mapping[str, OperationKind],
     evidence_by_key: Mapping[str, ValidationEvidenceItem],
 ) -> None:
     if (
@@ -714,6 +1112,8 @@ def _validate_operation_binding(
         or result.configuration_version != configuration.version
         or result.configuration_digest != configuration_digest
         or result.validation_contract_version != contract.version
+        or configured_operation_kinds.get(result.operation_id)
+        is not result.operation_kind
     ):
         raise ValidationEvidenceError("OPERATION_BINDING_MISMATCH")
     _require_evidence_keys(result.evidence_keys, evidence_by_key)
@@ -780,6 +1180,27 @@ def _simulator_target(
     if len(targets) > 1:
         raise ValidationEvidenceError("SIMULATOR_TARGET_AMBIGUOUS")
     return targets[0] if targets else None
+
+
+def _configured_operation_kinds(
+    configuration: RepositoryConfiguration,
+) -> dict[str, OperationKind]:
+    result: dict[str, OperationKind] = {}
+    for value in configuration.operations:
+        if not isinstance(value, Mapping):
+            raise ValidationEvidenceError("CONFIGURED_OPERATION_INVALID")
+        operation_id = value.get("operation_id")
+        raw_kind = value.get("kind")
+        if not isinstance(operation_id, str) or not isinstance(raw_kind, str):
+            raise ValidationEvidenceError("CONFIGURED_OPERATION_INVALID")
+        try:
+            kind = OperationKind(raw_kind)
+        except ValueError:
+            raise ValidationEvidenceError("CONFIGURED_OPERATION_INVALID") from None
+        if operation_id in result:
+            raise ValidationEvidenceError("CONFIGURED_OPERATION_INVALID")
+        result[operation_id] = kind
+    return result
 
 
 def _validate_simulator_target(value: Mapping[str, object] | None) -> None:
@@ -861,7 +1282,10 @@ def _replayed_result(
         raise ValidationEvidenceError("VALIDATION_RUN_INCOMPLETE")
     stored_evidence_ids = set(
         session.scalars(
-            select(EvidenceRecord.id).where(EvidenceRecord.validation_run_id == run.id)
+            select(EvidenceRecord.id).where(
+                EvidenceRecord.validation_run_id == run.id,
+                EvidenceRecord.correction_of_id.is_(None),
+            )
         )
     )
     if stored_evidence_ids != set(evidence_ids):
@@ -943,6 +1367,94 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _exact_mapping(
+    value: object,
+    expected_keys: set[str],
+    field: str,
+) -> Mapping[str, object]:
+    normalized = _mapping(value, field)
+    if set(normalized) != expected_keys:
+        raise ValidationEvidenceError(
+            f"{field.upper().replace(' ', '_')}_INVALID"
+        )
+    return normalized
+
+
+def _mapping(value: object, field: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) for key in value
+    ):
+        raise ValidationEvidenceError(
+            f"{field.upper().replace(' ', '_')}_INVALID"
+        )
+    return cast(Mapping[str, object], value)
+
+
+def _sequence(value: object, field: str) -> Sequence[object]:
+    if not isinstance(value, Sequence) or isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        raise ValidationEvidenceError(
+            f"{field.upper().replace(' ', '_')}_INVALID"
+        )
+    return value
+
+
+def _string(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationEvidenceError(
+            f"{field.upper().replace(' ', '_')}_INVALID"
+        )
+    return value
+
+
+def _optional_string(value: object, field: str) -> str | None:
+    return None if value is None else _string(value, field)
+
+
+def _integer(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationEvidenceError(
+            f"{field.upper().replace(' ', '_')}_INVALID"
+        )
+    return value
+
+
+def _boolean(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationEvidenceError(
+            f"{field.upper().replace(' ', '_')}_INVALID"
+        )
+    return value
+
+
+def _uuid(value: object, field: str) -> UUID:
+    try:
+        return UUID(_string(value, field))
+    except ValueError:
+        raise ValidationEvidenceError(
+            f"{field.upper().replace(' ', '_')}_INVALID"
+        ) from None
+
+
+def _string_tuple(value: object, field: str) -> tuple[str, ...]:
+    return tuple(_string(item, field) for item in _sequence(value, field))
+
+
+def _enum_value[EnumValue: StrEnum](
+    value: object,
+    enum_type: type[EnumValue],
+    field: str,
+) -> EnumValue:
+    try:
+        return enum_type(_string(value, field))
+    except ValueError:
+        raise ValidationEvidenceError(
+            f"{field.upper().replace(' ', '_')}_INVALID"
+        ) from None
 
 
 def _collection_fingerprint(collection: ValidationEvidenceCollection) -> str:

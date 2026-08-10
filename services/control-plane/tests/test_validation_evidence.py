@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -47,6 +47,10 @@ _TREE_SHA = "b" * 40
 _CONFIGURATION_DIGEST = f"sha256:{'c' * 64}"
 
 
+def _accept_artifact(_item: ValidationEvidenceItem) -> None:
+    pass
+
+
 def _context(root_id: UUID) -> dict[str, object]:
     return {
         "owner_id": "local-user",
@@ -86,7 +90,11 @@ def _seed(factory: SessionFactory) -> tuple[UUID, UUID, UUID]:
                     "device_type_identifier": "com.apple.iPhone-16-Pro",
                 },
             },
-            operations=[],
+            operations=[
+                {"operation_id": "unit-tests", "kind": "UNIT_TEST"},
+                {"operation_id": "integration-tests", "kind": "INTEGRATION_TEST"},
+                {"operation_id": "simulator-e2e", "kind": "SIMULATOR_E2E"},
+            ],
             e2e_assertions=[],
             artifact_settings={"collection_paths": ["artifacts"]},
             prohibited_paths=[],
@@ -333,13 +341,19 @@ def test_collects_typed_direct_evidence_and_projects_each_criterion(
         configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
     )
 
-    result = service.collect(collection)
+    verified_artifacts: list[UUID] = []
+    result = service.collect(
+        collection,
+        artifact_verifier=lambda item: verified_artifacts.append(item.evidence_id),
+    )
 
     assert result.replayed is False
     assert result.contract_version == 4
     assert result.commit_sha == _COMMIT_SHA
     assert result.tree_sha == _TREE_SHA
     assert len(result.evidence_ids) == len(ValidationEvidenceType) + 1
+    assert verified_artifacts == [item.evidence_id for item in collection.evidence]
+    assert ValidationEvidenceCollection.from_dict(collection.to_dict()) == collection
     statuses = {
         value["criterion_id"]: value["status"] for value in result.criterion_results
     }
@@ -405,11 +419,167 @@ def test_rejects_mismatched_host_head_without_partial_records(
     )
 
     with pytest.raises(ValidationEvidenceError, match="OPERATION_BINDING_MISMATCH"):
-        service.collect(collection)
+        service.collect(collection, artifact_verifier=_accept_artifact)
 
     with factory() as session:
         assert session.scalar(select(func.count(ValidationRun.id))) == 0
         assert session.scalar(select(func.count(EvidenceRecord.id))) == 0
+
+
+def test_rejects_unverified_host_artifact_without_partial_records(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
+
+    def reject_artifact(_item: ValidationEvidenceItem) -> None:
+        raise ValidationEvidenceError("HOST_ARTIFACT_UNVERIFIED")
+
+    with pytest.raises(ValidationEvidenceError, match="HOST_ARTIFACT_UNVERIFIED"):
+        service.collect(collection, artifact_verifier=reject_artifact)
+
+    with factory() as session:
+        assert session.scalar(select(func.count(ValidationRun.id))) == 0
+        assert session.scalar(select(func.count(EvidenceRecord.id))) == 0
+
+
+def test_rejects_contradictory_pass_and_unknown_evidence_reference(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    _factory, _store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    with pytest.raises(
+        ValidationEvidenceError,
+        match="OPERATION_PASS_RESULT_CONTRADICTORY",
+    ):
+        replace(collection.operation_results[0], exit_status=1)
+    changed_assertion = replace(
+        collection.assertion_results[0],
+        evidence_keys=("evidence.missing",),
+    )
+    with pytest.raises(ValidationEvidenceError, match="EVIDENCE_REFERENCE_UNKNOWN"):
+        replace(
+            collection,
+            assertion_results=(changed_assertion, *collection.assertion_results[1:]),
+        )
+
+
+def test_rejects_operation_kind_and_simulator_lineage_mismatches(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
+    wrong_kind = replace(
+        collection.operation_results[0],
+        operation_kind=OperationKind.BUILD,
+    )
+    with pytest.raises(ValidationEvidenceError, match="OPERATION_BINDING_MISMATCH"):
+        service.collect(
+            replace(
+                collection,
+                operation_results=(wrong_kind, *collection.operation_results[1:]),
+            ),
+            artifact_verifier=_accept_artifact,
+        )
+    e2e = collection.operation_results[2]
+    assert e2e.simulator_target is not None
+    wrong_target = replace(
+        e2e,
+        simulator_target={
+            **e2e.simulator_target,
+            "runtime_identifier": "com.apple.iOS-17-0",
+        },
+    )
+    with pytest.raises(ValidationEvidenceError, match="SIMULATOR_BINDING_MISMATCH"):
+        service.collect(
+            replace(
+                collection,
+                operation_results=(*collection.operation_results[:2], wrong_target),
+            ),
+            artifact_verifier=_accept_artifact,
+        )
+    with pytest.raises(
+        ValidationEvidenceError,
+        match="OPERATION_SIMULATOR_TARGET_UNEXPECTED",
+    ):
+        replace(
+            collection.operation_results[0],
+            simulator_target=e2e.simulator_target,
+        )
+
+
+def test_rejects_ambiguous_simulator_targets(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    second_e2e = replace(
+        collection.operation_results[2],
+        operation_id="simulator-e2e-secondary",
+    )
+    with factory.begin() as session:
+        configuration = session.get(RepositoryConfiguration, configuration_id)
+        contract = session.get(ValidationContract, contract_id)
+        assert configuration is not None
+        assert contract is not None
+        configuration.operations = [
+            *configuration.operations,
+            {
+                "operation_id": "simulator-e2e-secondary",
+                "kind": "SIMULATOR_E2E",
+            },
+        ]
+        contract.required_operations = [
+            *contract.required_operations,
+            {"operation_id": "simulator-e2e-secondary"},
+        ]
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
+
+    with pytest.raises(ValidationEvidenceError, match="SIMULATOR_TARGET_AMBIGUOUS"):
+        service.collect(
+            replace(
+                collection,
+                operation_results=(*collection.operation_results, second_e2e),
+            ),
+            artifact_verifier=_accept_artifact,
+        )
 
 
 def test_rejects_digest_that_differs_from_authoritative_configuration(
@@ -430,7 +600,7 @@ def test_rejects_digest_that_differs_from_authoritative_configuration(
     )
 
     with pytest.raises(ValidationEvidenceError, match="OPERATION_BINDING_MISMATCH"):
-        service.collect(collection)
+        service.collect(collection, artifact_verifier=_accept_artifact)
 
     with factory() as session:
         assert session.scalar(select(func.count(ValidationRun.id))) == 0
@@ -454,8 +624,8 @@ def test_same_run_id_replays_without_duplicate_evidence(
         configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
     )
 
-    first = service.collect(collection)
-    replay = service.collect(collection)
+    first = service.collect(collection, artifact_verifier=_accept_artifact)
+    replay = service.collect(collection, artifact_verifier=_accept_artifact)
 
     assert first.validation_run_id == replay.validation_run_id
     assert replay.replayed is True
@@ -466,6 +636,53 @@ def test_same_run_id_replays_without_duplicate_evidence(
                 EvidenceRecord.validation_run_id == first.validation_run_id
             )
         ) == len(ValidationEvidenceType) + 1
+
+
+def test_replay_ignores_later_evidence_correction_records(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
+    first = service.collect(collection, artifact_verifier=_accept_artifact)
+    with factory.begin() as session:
+        original = session.get(EvidenceRecord, collection.evidence[0].evidence_id)
+        assert original is not None
+        session.add(
+            EvidenceRecord(
+                task_id=original.task_id,
+                validation_run_id=original.validation_run_id,
+                evidence_type=original.evidence_type,
+                origin="local-user:correction",
+                content_hash=f"sha256:{'e' * 64}",
+                content_address=f"sha256:{'e' * 64}",
+                captured_at=_NOW + timedelta(seconds=1),
+                access_classification=original.access_classification,
+                retention_policy=original.retention_policy,
+                correction_of_id=original.id,
+                owner_id=original.owner_id,
+                actor_id="local-user",
+                root_correlation_id=original.root_correlation_id,
+                causation_id=original.id,
+                parent_correlation_id=original.root_correlation_id,
+                created_at=_NOW + timedelta(seconds=1),
+                updated_at=_NOW + timedelta(seconds=1),
+            )
+        )
+    replay = service.collect(collection, artifact_verifier=_accept_artifact)
+
+    assert replay.validation_run_id == first.validation_run_id
+    assert replay.replayed is True
 
 
 def test_same_run_id_rejects_changed_evidence_metadata(
@@ -484,7 +701,7 @@ def test_same_run_id_rejects_changed_evidence_metadata(
         clock=lambda: _NOW,
         configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
     )
-    service.collect(collection)
+    service.collect(collection, artifact_verifier=_accept_artifact)
     changed_item = replace(
         collection.evidence[0],
         content_address=f"sha256:{'f' * 64}",
@@ -495,4 +712,4 @@ def test_same_run_id_rejects_changed_evidence_metadata(
     )
 
     with pytest.raises(ValidationEvidenceError, match="VALIDATION_RUN_ID_CONFLICT"):
-        service.collect(changed)
+        service.collect(changed, artifact_verifier=_accept_artifact)

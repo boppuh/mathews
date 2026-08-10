@@ -10,6 +10,7 @@ from typing import Annotated, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from mathews_configuration import AssertionKind
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -1491,13 +1492,7 @@ def _recorded_criterion_results(
         return {}
     result: dict[str, dict[str, object]] = {}
     allowed_statuses = {"PENDING", "PASSED", "FAILED", "BLOCKED"}
-    allowed_kinds = {
-        "ELEMENT_VALUE_PRESENT",
-        "NAVIGATION_STATE_REACHED",
-        "EXPECTED_NETWORK_RESPONSE",
-        "EXPECTED_LOG_EVENT",
-        "NO_CRASH",
-    }
+    allowed_kinds = {kind.value for kind in AssertionKind}
     for value in validation_run.acceptance_criterion_results:
         if not isinstance(value, dict):
             continue

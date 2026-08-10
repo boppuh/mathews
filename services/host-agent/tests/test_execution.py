@@ -576,11 +576,27 @@ def test_artifact_reads_are_bounded_and_task_scoped(tmp_path: Path) -> None:
         offset=9,
         length=256,
     )
+    verified = store.verify(
+        task_id,
+        address=reference.address,
+        expected_size_bytes=len(b"immutable-evidence"),
+    )
 
     assert first["data_base64"] == "aW1tdXRhYmxl"
     assert first["eof"] is False
     assert second["data_base64"] == "LWV2aWRlbmNl"
     assert second["eof"] is True
+    assert verified == {
+        "address": reference.address,
+        "size_bytes": len(b"immutable-evidence"),
+        "verified": True,
+    }
+    with pytest.raises(ConfiguredExecutionError, match="ARTIFACT_CORRUPT"):
+        store.verify(
+            task_id,
+            address=reference.address,
+            expected_size_bytes=1,
+        )
     with pytest.raises(ConfiguredExecutionError, match="ARTIFACT_UNAVAILABLE"):
         store.read_chunk(
             uuid4(),
