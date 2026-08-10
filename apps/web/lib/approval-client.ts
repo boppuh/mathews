@@ -348,3 +348,27 @@ export const approvalClient = {
     return parsed;
   },
 };
+
+export type ApprovalInboxClient = Pick<typeof approvalClient, "inbox">;
+
+export class LatestApprovalInboxLoader {
+  private generation = 0;
+
+  invalidate(): void {
+    this.generation += 1;
+  }
+
+  async load(
+    signal?: AbortSignal,
+    client: ApprovalInboxClient = approvalClient,
+  ): Promise<ApprovalInboxResponse | undefined> {
+    const requestGeneration = ++this.generation;
+    try {
+      const result = await client.inbox(signal);
+      return requestGeneration === this.generation ? result : undefined;
+    } catch (error) {
+      if (requestGeneration !== this.generation) return undefined;
+      throw error;
+    }
+  }
+}

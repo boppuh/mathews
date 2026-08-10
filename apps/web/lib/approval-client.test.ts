@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ApprovalRequestError, approvalClient, parseApprovalInbox } from "./approval-client";
+import {
+  ApprovalRequestError,
+  approvalClient,
+  LatestApprovalInboxLoader,
+  parseApprovalInbox,
+} from "./approval-client";
 
 const requestId = "11111111-1111-4111-8111-111111111111";
 const taskId = "22222222-2222-4222-8222-222222222222";
@@ -154,5 +159,38 @@ describe("approvalClient", () => {
       status: 409,
       message: expect.stringContaining("changed"),
     });
+  });
+});
+
+describe("LatestApprovalInboxLoader", () => {
+  it("drops an older response after a newer refresh wins", async () => {
+    let resolveOlder: ((value: ReturnType<typeof parseApprovalInbox>) => void) | undefined;
+    const older = new Promise<ReturnType<typeof parseApprovalInbox>>((resolve) => {
+      resolveOlder = resolve;
+    });
+    const latest = { approvals: [], rule_candidates: [] };
+    const client = {
+      inbox: vi.fn().mockReturnValueOnce(older).mockResolvedValueOnce(latest),
+    };
+    const loader = new LatestApprovalInboxLoader();
+
+    const first = loader.load(undefined, client);
+    await expect(loader.load(undefined, client)).resolves.toEqual(latest);
+    resolveOlder?.(parseApprovalInbox({ approvals: [approval], rule_candidates: [rule] }));
+    await expect(first).resolves.toBeUndefined();
+  });
+
+  it("drops stale failures and invalidates in-flight work on cleanup", async () => {
+    let rejectOlder: ((reason: Error) => void) | undefined;
+    const older = new Promise<ReturnType<typeof parseApprovalInbox>>((_resolve, reject) => {
+      rejectOlder = reject;
+    });
+    const client = { inbox: vi.fn().mockReturnValue(older) };
+    const loader = new LatestApprovalInboxLoader();
+
+    const pending = loader.load(undefined, client);
+    loader.invalidate();
+    rejectOlder?.(new Error("stale failure"));
+    await expect(pending).resolves.toBeUndefined();
   });
 });

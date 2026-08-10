@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   type ApprovalDecision,
@@ -9,6 +9,7 @@ import {
   type ApprovalInboxResponse,
   ApprovalRequestError,
   approvalClient,
+  LatestApprovalInboxLoader,
 } from "../../lib/approval-client";
 import { stageLabel } from "../../lib/stages";
 
@@ -65,11 +66,16 @@ export function DecisionInbox() {
   const [state, setState] = useState<InboxState>({ status: "loading" });
   const [pendingRequest, setPendingRequest] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const inboxLoader = useRef<LatestApprovalInboxLoader | null>(null);
+  if (inboxLoader.current === null) {
+    inboxLoader.current = new LatestApprovalInboxLoader();
+  }
 
   const load = useCallback(async (signal?: AbortSignal, background = false) => {
     if (!background) setState({ status: "loading" });
     try {
-      const inbox = await approvalClient.inbox(signal);
+      const inbox = await inboxLoader.current?.load(signal);
+      if (!inbox) return;
       setState({ status: "ready", inbox });
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") return;
@@ -83,6 +89,7 @@ export function DecisionInbox() {
     const interval = window.setInterval(() => void load(controller.signal, true), 30_000);
     return () => {
       controller.abort();
+      inboxLoader.current?.invalidate();
       window.clearInterval(interval);
     };
   }, [load]);
