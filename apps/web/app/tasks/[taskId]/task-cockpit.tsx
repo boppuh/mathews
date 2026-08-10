@@ -167,6 +167,20 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
     };
   }, [loadCockpit, readyTaskId, taskId]);
 
+  useEffect(() => {
+    if (readyTaskId !== taskId) {
+      return;
+    }
+    const controller = new AbortController();
+    const refreshInterval = window.setInterval(() => {
+      void loadCockpit(controller.signal, true);
+    }, 30_000);
+    return () => {
+      window.clearInterval(refreshInterval);
+      controller.abort();
+    };
+  }, [loadCockpit, readyTaskId, taskId]);
+
   if (state.status === "loading") {
     return (
       <main className="task-cockpit cockpit-centered" aria-busy="true">
@@ -371,7 +385,11 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
           </section>
         </aside>
       </div>
-      <EvidenceWorkbench criteria={acceptanceCriteria} evidence={evidence} />
+      <EvidenceWorkbench
+        criteria={acceptanceCriteria}
+        evidence={evidence}
+        onRefresh={() => loadCockpit(undefined, true)}
+      />
     </main>
   );
 }

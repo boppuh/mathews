@@ -8,6 +8,7 @@ import {
 } from "@mathews/contracts";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { AuthRequestError, authClient } from "../../../lib/auth-client";
 import {
   type EvidenceContent,
   evidenceClient,
@@ -38,6 +39,8 @@ type PreviewState =
   | { status: "loading" }
   | { status: "ready"; content: EvidenceContent }
   | { status: "failed"; message: string };
+
+type ReauthenticationState = "idle" | "submitting" | "failed";
 
 function title(value: string): string {
   return value
@@ -81,13 +84,18 @@ function previewFailure(error: unknown): string {
 function EvidenceCard({
   record,
   onRevealEvidence,
+  onReauthenticated,
 }: {
   record: TaskEvidenceSummary;
   onRevealEvidence: (evidenceId: string) => void;
+  onReauthenticated: () => Promise<unknown>;
 }) {
   const [preview, setPreview] = useState<PreviewState>({ status: "idle" });
   const [contentQuery, setContentQuery] = useState("");
   const controller = useRef<AbortController | null>(null);
+  const [password, setPassword] = useState("");
+  const [reauthenticationState, setReauthenticationState] = useState<ReauthenticationState>("idle");
+  const [reauthenticationError, setReauthenticationError] = useState("");
   const downloadUrl = evidenceDownloadUrl(record);
 
   useEffect(
@@ -132,6 +140,26 @@ function EvidenceCard({
     () => (preview.status === "ready" ? matchCount(preview.content.text, contentQuery) : 0),
     [contentQuery, preview],
   );
+  const reauthenticate = async () => {
+    if (!password || reauthenticationState === "submitting") {
+      return;
+    }
+    setReauthenticationError("");
+    setReauthenticationState("submitting");
+    try {
+      await authClient.reauthenticate(password);
+      setPassword("");
+      await onReauthenticated();
+      setReauthenticationState("idle");
+    } catch (error) {
+      setReauthenticationState("failed");
+      setReauthenticationError(
+        error instanceof AuthRequestError
+          ? error.message
+          : "Unable to unlock this evidence right now.",
+      );
+    }
+  };
 
   return (
     <article
@@ -183,9 +211,35 @@ function EvidenceCard({
           </small>
         </div>
       ) : record.content_access === "RECENT_PASSWORD_REQUIRED" ? (
-        <p className="evidence-restricted">
-          Re-enter your password to inspect this protected evidence.
-        </p>
+        <form
+          className="evidence-reauthentication"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void reauthenticate();
+          }}
+        >
+          <label>
+            Re-enter your password to inspect this protected evidence.
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(event) => {
+                setPassword(event.target.value);
+                setReauthenticationState("idle");
+                setReauthenticationError("");
+              }}
+            />
+          </label>
+          <button type="submit" disabled={!password || reauthenticationState === "submitting"}>
+            {reauthenticationState === "submitting" ? "Checking…" : "Unlock evidence"}
+          </button>
+          {reauthenticationState === "failed" ? (
+            <p className="task-error" role="alert">
+              {reauthenticationError}
+            </p>
+          ) : null}
+        </form>
       ) : (
         <details
           className="evidence-preview"
@@ -237,9 +291,11 @@ function EvidenceCard({
 export function EvidenceWorkbench({
   criteria,
   evidence,
+  onRefresh,
 }: {
   criteria: TaskAcceptanceCriterionSummary[];
   evidence: TaskEvidenceSummary[];
+  onRefresh: () => Promise<unknown>;
 }) {
   const [category, setCategory] = useState<TaskEvidenceCategory | "ALL">("ALL");
   const [query, setQuery] = useState("");
@@ -350,7 +406,12 @@ export function EvidenceWorkbench({
       ) : (
         <div className="evidence-grid">
           {visibleEvidence.map((record) => (
-            <EvidenceCard key={record.id} record={record} onRevealEvidence={revealEvidence} />
+            <EvidenceCard
+              key={record.id}
+              record={record}
+              onRevealEvidence={revealEvidence}
+              onReauthenticated={onRefresh}
+            />
           ))}
         </div>
       )}

@@ -1408,6 +1408,54 @@ section {
   font-size: 0.72rem;
 }
 
+.evidence-reauthentication {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.6rem;
+  align-items: end;
+  margin-top: 0.85rem;
+}
+
+.evidence-reauthentication label {
+  display: grid;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+
+.evidence-reauthentication input {
+  width: 100%;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  color: var(--foreground);
+  background: #090d13;
+  font: inherit;
+}
+
+.evidence-reauthentication button {
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.55rem;
+  color: #07120f;
+  background: var(--accent);
+  font: inherit;
+  font-size: 0.7rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.evidence-reauthentication button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.evidence-reauthentication .task-error {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
 .evidence-preview-error {
   display: flex;
   align-items: center;
