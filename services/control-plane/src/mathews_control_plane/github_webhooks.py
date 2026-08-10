@@ -38,8 +38,10 @@ from mathews_control_plane.domain_models import (
 )
 from mathews_control_plane.evidence import (
     EvidenceAccessClass,
+    EvidenceNotFoundError,
     EvidenceRetentionClass,
     EvidenceSourceKind,
+    EvidenceValidationError,
     capture_evidence,
     load_evidence,
 )
@@ -426,7 +428,15 @@ class GitHubWebhookService:
             evidence = session.get(EvidenceRecord, delivery.payload_evidence_id)
             if evidence is None:
                 return self._quarantine(session, delivery, "payload_evidence_missing", now)
-            loaded = load_evidence(session, self._store, evidence)
+            try:
+                loaded = load_evidence(session, self._store, evidence)
+            except (EvidenceNotFoundError, EvidenceValidationError):
+                return self._quarantine(
+                    session,
+                    delivery,
+                    "payload_evidence_unreadable",
+                    now,
+                )
             captured = cast(dict[str, object], loaded.content)
             event_name = cast(str, captured.get("event_name", ""))
             payload = cast(dict[str, object], captured.get("payload"))

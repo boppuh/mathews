@@ -646,3 +646,35 @@ def test_synchronized_pr_head_wakes_reconciliation_and_invalidates_projection(
     assert cockpit.github.ci_status == "NOT_RUN"
     with webhook_harness.factory() as session:
         assert session.scalar(select(func.count(BackgroundJob.id))) == 1
+
+
+def test_unreadable_committed_receipt_is_quarantined_without_blocking_drain(
+    webhook_harness: WebhookHarness,
+) -> None:
+    assert _post(
+        webhook_harness,
+        _check_payload(),
+        delivery="corrupt-receipt",
+    ).status_code == 202
+    with webhook_harness.factory.begin() as session:
+        delivery = session.scalar(
+            select(WebhookDelivery).where(
+                WebhookDelivery.provider_delivery_id == "corrupt-receipt"
+            )
+        )
+        assert delivery is not None
+        evidence = session.get(EvidenceRecord, delivery.payload_evidence_id)
+        assert evidence is not None
+        evidence.content_address = "sha256:" + "0" * 64
+        delivery.processed_at = None
+
+    assert webhook_harness.service.process_pending() == 1
+    with webhook_harness.factory() as session:
+        delivery = session.scalar(
+            select(WebhookDelivery).where(
+                WebhookDelivery.provider_delivery_id == "corrupt-receipt"
+            )
+        )
+        assert delivery is not None
+        assert delivery.quarantine_reason == "payload_evidence_unreadable"
+        assert delivery.processed_at is not None

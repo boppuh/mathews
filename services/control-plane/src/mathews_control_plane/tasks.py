@@ -1061,7 +1061,12 @@ def _github_status(events: Sequence[TaskEvent]) -> TaskGitHubStatusResponse:
             GITHUB_REVIEW_UPDATED_EVENT,
             GITHUB_PULL_REQUEST_UPDATED_EVENT,
             GITHUB_PR_HEAD_CHANGED_EVENT,
-        } or event.sequence < projection_start or event.payload.get("head_sha") != head_sha:
+        } or (
+            event.sequence < projection_start
+            or event.payload.get("head_sha") != head_sha
+            or event.payload.get("pull_request_number") != pull_request_number
+            or event.payload.get("task_branch") != task_branch
+        ):
             continue
         latest[
             (event.payload.get("resource_type"), event.payload.get("resource_id"))
