@@ -222,6 +222,8 @@ def create_repository_configuration(
 def get_latest_repository_configuration(
     session: Session,
     repository_key: str,
+    *,
+    for_update: bool = False,
 ) -> RepositoryConfigurationRecord | None:
     """Return the authoritative highest version, regardless of its readiness."""
 
@@ -230,13 +232,44 @@ def get_latest_repository_configuration(
         field="repository key",
         maximum=500,
     )
-    return session.scalar(_latest_query(normalized_repository_key))
+    return session.scalar(
+        _latest_query(normalized_repository_key, for_update=for_update)
+    )
 
 
 def repository_configuration_digest(configuration: RepositoryConfigurationRecord) -> str:
     """Hash the host/control-plane canonical execution-configuration payload."""
 
     return _validated_configuration(configuration).digest
+
+
+def validated_repository_configuration(
+    configuration: RepositoryConfigurationRecord,
+) -> ValidatedRepositoryConfiguration:
+    """Return the canonical shared configuration for a persisted version."""
+
+    return _validated_configuration(configuration)
+
+
+def get_repository_preflight_report(
+    session: Session,
+    artifact_store: ArtifactStore,
+    configuration: RepositoryConfigurationRecord,
+) -> ValidatedRepositoryPreflightReport | None:
+    """Return the attached completed report, or ``None`` for no active report."""
+
+    if configuration.preflight_evidence_id is None:
+        return None
+    evidence, payload = _load_attached_evidence(session, artifact_store, configuration)
+    if evidence.evidence_type == _PREFLIGHT_REQUEST_EVIDENCE_TYPE:
+        return None
+    repository_key, report = _decode_canonical_report(payload)
+    if repository_key != configuration.repository_key:
+        raise RepositoryPreflightNotReadyError(
+            "preflight evidence repository does not match the configuration"
+        )
+    _validated_report_binding(configuration, report)
+    return report
 
 
 def _validated_configuration(
