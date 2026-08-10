@@ -32,6 +32,8 @@ const approval = {
   operation_name: "host.mutate",
   operation_fingerprint: "a".repeat(64),
   supporting_evidence_ids: [evidenceId],
+  actionable: true,
+  unavailable_reason: null,
 };
 
 const rule = {
@@ -161,6 +163,23 @@ describe("approvalClient", () => {
     await expect(approvalClient.decide(requestId, "APPROVE")).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining("changed"),
+    });
+  });
+
+  it("explains when a protected decision needs reauthentication", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(JSON.stringify({ detail: "internal detail" }), { status: 403 }),
+        ),
+    );
+    vi.stubGlobal("document", { cookie: "__Host-mathews-csrf=token" });
+
+    await expect(approvalClient.decide(requestId, "APPROVE")).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Re-enter your password"),
     });
   });
 });

@@ -140,8 +140,12 @@ export function DecisionInbox() {
     );
   }
 
+  const projectedRuleRequestIds = new Set(
+    state.inbox.rule_candidates.map((rule) => rule.approval_request_id),
+  );
   const approvals = state.inbox.approvals.filter(
-    (approval) => approval.request_type !== "REVIEW_RULE",
+    (approval) =>
+      approval.request_type !== "REVIEW_RULE" || !projectedRuleRequestIds.has(approval.id),
   );
   const approvalById = new Map(state.inbox.approvals.map((approval) => [approval.id, approval]));
   const total = approvals.length + state.inbox.rule_candidates.length;
@@ -225,20 +229,28 @@ export function DecisionInbox() {
                   </div>
                 ) : null}
                 <EvidenceLinks approval={approval} />
+                {!approval.actionable ? (
+                  <p className="inbox-unavailable" role="status">
+                    This rule candidate changed or became unavailable. Inspect the task before
+                    creating a replacement approval request.
+                  </p>
+                ) : null}
                 <div className="inbox-card-footer">
                   <Link href={approval.task.cockpit_path}>Open task</Link>
                   <div className="decision-actions">
-                    {approval.options.map((option) => (
-                      <button
-                        className={option === "APPROVE" || option === "RETRY" ? "primary" : ""}
-                        disabled={pendingRequest !== null}
-                        key={option}
-                        onClick={() => void decide(approval.id, option)}
-                        type="button"
-                      >
-                        {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}
-                      </button>
-                    ))}
+                    {approval.actionable
+                      ? approval.options.map((option) => (
+                          <button
+                            className={option === "APPROVE" || option === "RETRY" ? "primary" : ""}
+                            disabled={pendingRequest !== null}
+                            key={option}
+                            onClick={() => void decide(approval.id, option)}
+                            type="button"
+                          >
+                            {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}
+                          </button>
+                        ))
+                      : null}
                   </div>
                 </div>
               </article>

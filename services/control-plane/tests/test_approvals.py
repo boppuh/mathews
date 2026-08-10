@@ -25,6 +25,7 @@ from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     CSRF_COOKIE_NAME,
     CSRF_HEADER_NAME,
+    AuthenticatedSession,
     AuthenticationService,
     generate_bootstrap_token,
 )
@@ -720,6 +721,8 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
                     "operation_name": "host.mutate",
                     "operation_fingerprint": "a" * 64,
                     "supporting_evidence_ids": [str(evidence_id)],
+                    "actionable": True,
+                    "unavailable_reason": None,
                 }
             ],
             "rule_candidates": [
@@ -906,6 +909,23 @@ def test_rule_promotion_rejects_changed_or_unbound_candidate_evidence(
     assert request is not None
     assert request.status is ApprovalStatus.PENDING
     assert rule_count == 0
+
+    authentication = AuthenticatedSession(
+        session_id=uuid4(),
+        user_id=1,
+        csrf_token_digest=b"test",
+        expires_at=_NOW + timedelta(hours=1),
+        absolute_expires_at=_NOW + timedelta(hours=1),
+        reauthenticated_until=_NOW + timedelta(hours=1),
+        evaluated_at=_NOW,
+        recent_password_verified=True,
+    )
+    inbox = service.inbox(authentication)
+    assert inbox.rule_candidates == []
+    assert len(inbox.approvals) == 1
+    assert inbox.approvals[0].id == request_id
+    assert inbox.approvals[0].actionable is False
+    assert inbox.approvals[0].unavailable_reason == "RULE_CANDIDATE_UNAVAILABLE"
 
 
 def test_rule_promotion_uses_current_policy_and_preserves_lineage_position(

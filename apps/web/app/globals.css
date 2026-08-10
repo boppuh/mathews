@@ -1671,6 +1671,17 @@ section {
   color: var(--danger);
 }
 
+.inbox-unavailable {
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid rgb(255 201 120 / 32%);
+  border-radius: 0.55rem;
+  background: rgb(255 201 120 / 7%);
+  color: #ffd59a;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
 .inbox-section {
   margin-top: clamp(4rem, 9vw, 7rem);
 }

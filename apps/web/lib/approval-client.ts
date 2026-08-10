@@ -53,6 +53,8 @@ export interface ApprovalInboxItem {
   operation_name: string | null;
   operation_fingerprint: string | null;
   supporting_evidence_ids: string[];
+  actionable: boolean;
+  unavailable_reason: "RULE_CANDIDATE_UNAVAILABLE" | null;
 }
 
 export interface RuleInboxItem {
@@ -235,6 +237,10 @@ function parseApproval(value: unknown): ApprovalInboxItem {
     !taskStates.has(value.requesting_state) ||
     !isTimestamp(value.created_at) ||
     !(value.expires_at === null || isTimestamp(value.expires_at)) ||
+    typeof value.actionable !== "boolean" ||
+    !(
+      value.unavailable_reason === null || value.unavailable_reason === "RULE_CANDIDATE_UNAVAILABLE"
+    ) ||
     !(
       value.operation_name === null ||
       (isBoundedString(value.operation_name, 255) &&
@@ -245,6 +251,12 @@ function parseApproval(value: unknown): ApprovalInboxItem {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   if (value.operation_name === null && value.operation_fingerprint !== null) {
+    throw new Error("The control plane returned an invalid approval inbox.");
+  }
+  if (
+    value.actionable === (value.unavailable_reason !== null) ||
+    (value.unavailable_reason !== null && value.request_type !== "REVIEW_RULE")
+  ) {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   const requestType = value.request_type as ApprovalRequestType;
@@ -266,6 +278,8 @@ function parseApproval(value: unknown): ApprovalInboxItem {
     operation_name: value.operation_name,
     operation_fingerprint: value.operation_fingerprint as string | null,
     supporting_evidence_ids: parseUuidList(value.supporting_evidence_ids),
+    actionable: value.actionable,
+    unavailable_reason: value.unavailable_reason,
   };
 }
 
@@ -356,13 +370,15 @@ async function request(path: string, init: RequestInit): Promise<Response> {
     const message =
       response.status === 401
         ? "Your session expired. Refresh the page and sign in again."
-        : response.status === 404
-          ? "This approval is no longer available."
-          : response.status === 409
-            ? "This approval changed. The inbox has been refreshed."
-            : response.status === 422
-              ? "That decision is not available for this approval."
-              : "Unable to update the approval inbox.";
+        : response.status === 403
+          ? "Re-enter your password, then try this protected decision again."
+          : response.status === 404
+            ? "This approval is no longer available."
+            : response.status === 409
+              ? "This approval changed. The inbox has been refreshed."
+              : response.status === 422
+                ? "That decision is not available for this approval."
+                : "Unable to update the approval inbox.";
     throw new ApprovalRequestError(message, response.status);
   }
   return response;

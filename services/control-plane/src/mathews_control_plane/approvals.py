@@ -182,6 +182,8 @@ class ApprovalInboxItem(BaseModel):
     operation_name: str | None = None
     operation_fingerprint: str | None = None
     supporting_evidence_ids: list[UUID]
+    actionable: bool = True
+    unavailable_reason: Literal["RULE_CANDIDATE_UNAVAILABLE"] | None = None
 
 
 class RuleInboxItem(BaseModel):
@@ -1077,35 +1079,30 @@ class ApprovalService:
                     repository=task.repository,
                     cockpit_path=f"/tasks/{task.id}",
                 )
-                approvals.append(
-                    ApprovalInboxItem(
-                        id=request.id,
-                        task=task_summary,
-                        request_type=request_type.value,
-                        type_label=_REQUEST_TYPE_LABELS[request_type],
-                        reason_code=_required_reason_code(request.reason),
-                        options=options,
-                        requesting_state=TaskState(request.requesting_state),
-                        resume_state=(
-                            None
-                            if request.resume_state is None
-                            else TaskState(request.resume_state)
-                        ),
-                        created_at=_as_utc(request.created_at),
-                        expires_at=(
-                            None if request.expires_at is None else _as_utc(request.expires_at)
-                        ),
-                        operation_name=(
-                            None if blocked_operation is None else blocked_operation.operation_name
-                        ),
-                        operation_fingerprint=(
-                            None
-                            if blocked_operation is None
-                            else blocked_operation.input_fingerprint
-                        ),
-                        supporting_evidence_ids=evidence_ids,
-                    )
+                approval_item = ApprovalInboxItem(
+                    id=request.id,
+                    task=task_summary,
+                    request_type=request_type.value,
+                    type_label=_REQUEST_TYPE_LABELS[request_type],
+                    reason_code=_required_reason_code(request.reason),
+                    options=options,
+                    requesting_state=TaskState(request.requesting_state),
+                    resume_state=(
+                        None if request.resume_state is None else TaskState(request.resume_state)
+                    ),
+                    created_at=_as_utc(request.created_at),
+                    expires_at=(
+                        None if request.expires_at is None else _as_utc(request.expires_at)
+                    ),
+                    operation_name=(
+                        None if blocked_operation is None else blocked_operation.operation_name
+                    ),
+                    operation_fingerprint=(
+                        None if blocked_operation is None else blocked_operation.input_fingerprint
+                    ),
+                    supporting_evidence_ids=evidence_ids,
                 )
+                approvals.append(approval_item)
                 if request_type is not ApprovalRequestType.REVIEW_RULE:
                     continue
                 candidate = session.scalar(
@@ -1121,6 +1118,8 @@ class ApprovalService:
                         "Skipped unavailable rule candidate for approval %s",
                         request.id,
                     )
+                    approval_item.actionable = False
+                    approval_item.unavailable_reason = "RULE_CANDIDATE_UNAVAILABLE"
                     continue
                 try:
                     rule = _evaluated_review_rule(candidate)
@@ -1130,6 +1129,8 @@ class ApprovalService:
                         "Skipped invalid rule candidate for approval %s",
                         request.id,
                     )
+                    approval_item.actionable = False
+                    approval_item.unavailable_reason = "RULE_CANDIDATE_UNAVAILABLE"
                     continue
                 rule_candidates.append(
                     RuleInboxItem(
