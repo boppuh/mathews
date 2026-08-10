@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,13 +35,17 @@ from mathews_control_plane.domain_models import (
     EvidenceDeletionRequest,
     EvidenceRecord,
     EvidenceTombstone,
+    PolicyVersion,
     ReconciliationStatus,
     ReconciliationTarget,
     ReconciliationTargetKind,
+    RepositoryConfiguration,
     Task,
+    TaskCancellation,
     TaskEvent,
     TaskEventEvidenceReference,
     TaskState,
+    ValidationContract,
 )
 from mathews_control_plane.evidence import (
     EvidenceAccessClass,
@@ -185,6 +189,25 @@ def _authenticated_context(harness: TaskHarness) -> AuthenticatedSession:
     authentication = harness.authentication_service.authenticate(session_token)
     assert authentication is not None
     return authentication
+
+
+def _seed_active_policy(harness: TaskHarness, task_id: UUID) -> None:
+    with harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        session.add(
+            PolicyVersion(
+                lineage_key="mvp",
+                version=1,
+                predecessor_id=None,
+                workflow_thresholds={},
+                approved_by=task.owner_id,
+                approved_at=harness.clock.now,
+                owner_id=task.owner_id,
+                actor_id="control-plane",
+                root_correlation_id=task.root_correlation_id,
+            )
+        )
 
 
 def test_task_api_requires_authentication_and_csrf(task_harness: TaskHarness) -> None:
@@ -937,3 +960,266 @@ def test_create_rejects_oversized_body_before_parsing(
     assert response.json() == {"detail": "task request body too large"}
     with task_harness.factory() as session:
         assert session.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_cosmetic_steering_revises_request_and_is_idempotently_audited(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    created = _create(task_harness, csrf_token)
+    task_id = UUID(str(created["id"]))
+    steering_id = uuid4()
+    payload = {
+        "steering_id": str(steering_id),
+        "expected_state": "INTAKE",
+        "message": "Use the existing empty-state wording.",
+        "impacts": [],
+    }
+
+    response = task_harness.client.post(
+        f"/api/tasks/{task_id}/steering",
+        json=payload,
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["classification"] == "CLARIFICATION"
+    assert body["task_state"] == "INTAKE"
+    assert body["replayed"] is False
+    assert body["invalidated_brief_id"] is None
+    assert body["invalidated_validation_contract_id"] is None
+    with task_harness.factory() as session:
+        task = session.get(Task, task_id)
+        steering_event = session.get(TaskEvent, UUID(body["event_id"]))
+        request_evidence = session.get(
+            EvidenceRecord,
+            UUID(body["request_evidence_id"]),
+        )
+        assert task is not None
+        assert request_evidence is not None
+        assert task.state is TaskState.INTAKE
+        assert task.summary == created["summary"]
+        assert task.raw_request == f"evidence://{request_evidence.id}"
+        assert steering_event is not None
+        assert request_evidence.correction_of_id is not None
+        revised_request = load_evidence(
+            session,
+            task_harness.store,
+            request_evidence,
+        )
+    assert isinstance(revised_request.content, str)
+    assert "Add offline support" in revised_request.content
+    assert "Use the existing empty-state wording." in revised_request.content
+    assert "Use the existing empty-state wording." not in str(steering_event.payload)
+
+    replay = task_harness.client.post(
+        f"/api/tasks/{task_id}/steering",
+        json=payload,
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+
+    conflict = task_harness.client.post(
+        f"/api/tasks/{task_id}/steering",
+        json={**payload, "message": "A different clarification."},
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+    assert conflict.status_code == 409
+
+    cockpit = task_harness.client.get(f"/api/tasks/{task_id}").json()
+    assert cockpit["events"][-1]["summary"] == "In-scope clarification recorded."
+
+
+def test_scope_steering_invalidates_execution_bindings_and_returns_to_briefing(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    created = _create(task_harness, csrf_token)
+    task_id = UUID(str(created["id"]))
+    _seed_active_policy(task_harness, task_id)
+    with task_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        context: _RecordContext = {
+            "owner_id": task.owner_id,
+            "actor_id": "control-plane",
+            "root_correlation_id": task.root_correlation_id,
+            "causation_id": task.id,
+            "parent_correlation_id": task.id,
+        }
+        brief = Brief(
+            task_id=task.id,
+            version=1,
+            scope={"objective": "Original scope"},
+            exclusions=[],
+            acceptance_criteria=[],
+            risks=[],
+            affected_flow={},
+            test_plan=[],
+            **context,
+        )
+        repository = RepositoryConfiguration(
+            repository_key=task.repository,
+            version=1,
+            repository_settings={},
+            git_settings={},
+            xcode_settings={},
+            operations=[],
+            e2e_assertions=[],
+            artifact_settings={},
+            prohibited_paths=[],
+            secret_references=[],
+            **context,
+        )
+        session.add_all([brief, repository])
+        session.flush()
+        contract = ValidationContract(
+            task_id=task.id,
+            version=1,
+            brief_id=brief.id,
+            repository_configuration_id=repository.id,
+            required_operations=[],
+            simulator_setup={},
+            clean_state_setup={},
+            e2e_flow={},
+            typed_assertions=[],
+            evidence_requirements=[],
+            timeouts={},
+            outcome_rules={},
+            **context,
+        )
+        session.add(contract)
+        session.flush()
+        task.state = TaskState.IMPLEMENTING
+        task.accepted_brief_id = brief.id
+        task.repository_configuration_id = repository.id
+        task.validation_contract_id = contract.id
+        brief_id = brief.id
+        contract_id = contract.id
+
+    response = task_harness.client.post(
+        f"/api/tasks/{task_id}/steering",
+        json={
+            "steering_id": str(uuid4()),
+            "expected_state": "IMPLEMENTING",
+            "message": "Also cover the retry screen and its simulator flow.",
+            "impacts": ["PATHS", "TESTS"],
+        },
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["classification"] == "SCOPE_CHANGE"
+    assert body["impacts"] == ["PATHS", "TESTS"]
+    assert body["task_state"] == "BRIEFING"
+    assert body["invalidated_brief_id"] == str(brief_id)
+    assert body["invalidated_validation_contract_id"] == str(contract_id)
+    with task_harness.factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        assert task.state is TaskState.BRIEFING
+        assert task.accepted_brief_id is None
+        assert task.brief_approval_decision_id is None
+        assert task.validation_contract_id is None
+        assert task.repository_configuration_id is not None
+        versions = session.scalar(
+            select(func.count()).select_from(Brief).where(Brief.task_id == task_id)
+        )
+        contracts = session.scalar(
+            select(func.count())
+            .select_from(ValidationContract)
+            .where(ValidationContract.task_id == task_id)
+        )
+    assert versions == 1
+    assert contracts == 1
+    cockpit = task_harness.client.get(f"/api/tasks/{task_id}").json()
+    assert [event["summary"] for event in cockpit["events"][-2:]] == [
+        "Scope-changing steering recorded.",
+        "Scope changed; a new brief and validation contract are required.",
+    ]
+
+
+def test_cancellation_requires_recent_password_and_is_durable(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    created = _create(task_harness, csrf_token)
+    task_id = UUID(str(created["id"]))
+    _seed_active_policy(task_harness, task_id)
+    with task_harness.factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.state = TaskState.IMPLEMENTING
+    task_harness.clock.advance(timedelta(minutes=6))
+    cancellation_id = uuid4()
+    payload = {
+        "cancellation_id": str(cancellation_id),
+        "expected_state": "IMPLEMENTING",
+        "reason_code": "USER_REQUEST",
+    }
+
+    stale = task_harness.client.post(
+        f"/api/tasks/{task_id}/cancellations",
+        json=payload,
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+    assert stale.status_code == 403
+    reauthenticated = task_harness.client.post(
+        "/api/auth/reauthenticate",
+        json={"password": _PASSWORD},
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+    assert reauthenticated.status_code == 200, reauthenticated.text
+    refreshed_csrf_token = task_harness.client.cookies.get(CSRF_COOKIE_NAME)
+    assert refreshed_csrf_token is not None
+
+    response = task_harness.client.post(
+        f"/api/tasks/{task_id}/cancellations",
+        json=payload,
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: refreshed_csrf_token},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task_state"] == "CANCELLED"
+    assert body["cleanup_complete"] is True
+    assert body["replayed"] is False
+    with task_harness.factory() as session:
+        task = session.get(Task, task_id)
+        cancellation = session.get(TaskCancellation, cancellation_id)
+        assert task is not None and task.state is TaskState.CANCELLED
+        assert cancellation is not None
+        assert cancellation.partial_evidence_id == UUID(body["partial_evidence_id"])
+
+    replay = task_harness.client.post(
+        f"/api/tasks/{task_id}/cancellations",
+        json=payload,
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: refreshed_csrf_token},
+    )
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    cockpit = task_harness.client.get(f"/api/tasks/{task_id}").json()
+    assert cockpit["events"][-1]["summary"] == (
+        "Task cancelled; active automation was fenced."
+    )
+
+
+@pytest.mark.parametrize("operation", ["steering", "cancellations"])
+def test_task_control_rejects_oversized_body_before_parsing(
+    task_harness: TaskHarness,
+    operation: str,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    task_id = UUID(str(_create(task_harness, csrf_token)["id"]))
+    response = task_harness.client.post(
+        f"/api/tasks/{task_id}/{operation}",
+        content=b"x" * (MAX_TASK_REQUEST_BYTES + 1),
+        headers={
+            "Content-Type": "application/json",
+            "Origin": _ORIGIN,
+            CSRF_HEADER_NAME: csrf_token,
+        },
+    )
+    assert response.status_code == 413

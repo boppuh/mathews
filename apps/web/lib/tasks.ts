@@ -14,10 +14,12 @@ import {
   TASK_EVIDENCE_STATUSES,
   TASK_STATE_CONTEXT_KINDS,
   TASK_STATES,
+  TASK_STEERING_IMPACTS,
   type TaskAcceptanceCriterionSummary,
   type TaskApprovalSummary,
   type TaskBlocker,
   type TaskBlockerCode,
+  type TaskCancellationResponse,
   type TaskCockpitResponse,
   type TaskEventKind,
   type TaskEventSummary,
@@ -29,6 +31,9 @@ import {
   type TaskState,
   type TaskStateContext,
   type TaskStateContextKind,
+  type TaskSteeringClassification,
+  type TaskSteeringImpact,
+  type TaskSteeringResponse,
   type TaskSummary,
 } from "@mathews/contracts";
 
@@ -43,6 +48,7 @@ const evidenceDeletionReasons = new Set<string>(EVIDENCE_DELETION_REASONS);
 const criterionStatuses = new Set<string>(ACCEPTANCE_CRITERION_STATUSES);
 const criterionVerifications = new Set<string>(ACCEPTANCE_CRITERION_VERIFICATIONS);
 const approvalStatuses = new Set<string>(APPROVAL_STATUSES);
+const steeringImpacts = new Set<string>(TASK_STEERING_IMPACTS);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const GIT_OBJECT_ID_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const EVIDENCE_TYPE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
@@ -124,6 +130,104 @@ export function parseTaskList(value: unknown): TaskListResponse {
     throw new Error("The control plane returned an invalid task list.");
   }
   return { tasks: value.tasks.map(parseTaskSummary) };
+}
+
+function parseUuid(value: unknown, message: string): string {
+  if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function parseNonNegativeInteger(value: unknown, message: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new Error(message);
+  }
+  return Number(value);
+}
+
+export function parseTaskSteeringResponse(value: unknown): TaskSteeringResponse {
+  if (
+    !isRecord(value) ||
+    (value.classification !== "CLARIFICATION" && value.classification !== "SCOPE_CHANGE") ||
+    !Array.isArray(value.impacts) ||
+    !value.impacts.every((impact) => typeof impact === "string" && steeringImpacts.has(impact)) ||
+    new Set(value.impacts).size !== value.impacts.length ||
+    typeof value.task_state !== "string" ||
+    !taskStates.has(value.task_state) ||
+    typeof value.replayed !== "boolean"
+  ) {
+    throw new Error("The control plane returned an invalid steering result.");
+  }
+  if (
+    (value.classification === "CLARIFICATION" && value.impacts.length !== 0) ||
+    (value.classification === "SCOPE_CHANGE" && value.impacts.length === 0)
+  ) {
+    throw new Error("The control plane returned an inconsistent steering result.");
+  }
+  return {
+    steering_id: parseUuid(
+      value.steering_id,
+      "The control plane returned invalid steering identity.",
+    ),
+    task_id: parseUuid(value.task_id, "The control plane returned invalid steering identity."),
+    classification: value.classification as TaskSteeringClassification,
+    impacts: value.impacts as TaskSteeringImpact[],
+    task_state: value.task_state as TaskState,
+    evidence_id: parseUuid(
+      value.evidence_id,
+      "The control plane returned invalid steering evidence.",
+    ),
+    request_evidence_id: parseUuid(
+      value.request_evidence_id,
+      "The control plane returned invalid steering evidence.",
+    ),
+    event_id: parseUuid(value.event_id, "The control plane returned invalid steering event."),
+    invalidated_brief_id: parseOptionalUuid(value.invalidated_brief_id),
+    invalidated_validation_contract_id: parseOptionalUuid(value.invalidated_validation_contract_id),
+    revoked_lease_count: parseNonNegativeInteger(
+      value.revoked_lease_count,
+      "The control plane returned an invalid steering fence.",
+    ),
+    revoked_tool_grant_count: parseNonNegativeInteger(
+      value.revoked_tool_grant_count,
+      "The control plane returned an invalid steering fence.",
+    ),
+    replayed: value.replayed,
+  };
+}
+
+export function parseTaskCancellationResponse(value: unknown): TaskCancellationResponse {
+  if (
+    !isRecord(value) ||
+    value.task_state !== "CANCELLED" ||
+    typeof value.cleanup_complete !== "boolean" ||
+    typeof value.replayed !== "boolean"
+  ) {
+    throw new Error("The control plane returned an invalid cancellation result.");
+  }
+  return {
+    cancellation_id: parseUuid(
+      value.cancellation_id,
+      "The control plane returned invalid cancellation identity.",
+    ),
+    task_id: parseUuid(value.task_id, "The control plane returned invalid cancellation identity."),
+    task_state: value.task_state,
+    partial_evidence_id: parseUuid(
+      value.partial_evidence_id,
+      "The control plane returned invalid cancellation evidence.",
+    ),
+    revoked_lease_count: parseNonNegativeInteger(
+      value.revoked_lease_count,
+      "The control plane returned an invalid cancellation fence.",
+    ),
+    revoked_tool_grant_count: parseNonNegativeInteger(
+      value.revoked_tool_grant_count,
+      "The control plane returned an invalid cancellation fence.",
+    ),
+    cleanup_complete: value.cleanup_complete,
+    replayed: value.replayed,
+  };
 }
 
 function parseOptionalState(value: unknown): TaskState | null {

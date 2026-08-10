@@ -181,6 +181,51 @@ export interface CreateTaskRequest {
   request: string;
 }
 
+export const TASK_STEERING_IMPACTS = ["ACCEPTANCE_CRITERIA", "PATHS", "RISK", "TESTS"] as const;
+
+export type TaskSteeringImpact = (typeof TASK_STEERING_IMPACTS)[number];
+export type TaskSteeringClassification = "CLARIFICATION" | "SCOPE_CHANGE";
+
+export interface TaskSteeringRequest {
+  steering_id: string;
+  expected_state: TaskState;
+  message: string;
+  impacts: TaskSteeringImpact[];
+}
+
+export interface TaskSteeringResponse {
+  steering_id: string;
+  task_id: string;
+  classification: TaskSteeringClassification;
+  impacts: TaskSteeringImpact[];
+  task_state: TaskState;
+  evidence_id: string;
+  request_evidence_id: string;
+  event_id: string;
+  invalidated_brief_id: string | null;
+  invalidated_validation_contract_id: string | null;
+  revoked_lease_count: number;
+  revoked_tool_grant_count: number;
+  replayed: boolean;
+}
+
+export interface TaskCancellationRequest {
+  cancellation_id: string;
+  expected_state: TaskState;
+  reason_code: "USER_REQUEST";
+}
+
+export interface TaskCancellationResponse {
+  cancellation_id: string;
+  task_id: string;
+  task_state: "CANCELLED";
+  partial_evidence_id: string;
+  revoked_lease_count: number;
+  revoked_tool_grant_count: number;
+  cleanup_complete: boolean;
+  replayed: boolean;
+}
+
 export interface ServiceHealth {
   service: "api" | "host-agent" | "web" | "worker";
   status: "ok";

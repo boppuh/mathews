@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   mergeLoadedTasks,
+  parseTaskCancellationResponse,
   parseTaskCockpit,
   parseTaskEvent,
   parseTaskList,
+  parseTaskSteeringResponse,
   parseTaskSummary,
   shortRevision,
 } from "./tasks";
@@ -48,6 +50,56 @@ describe("task response parsing", () => {
   it("rejects malformed list envelopes", () => {
     expect(() => parseTaskList([])).toThrow("invalid task list");
     expect(() => parseTaskList({ tasks: "not-an-array" })).toThrow("invalid task list");
+  });
+});
+
+describe("task control response parsing", () => {
+  const steering = {
+    steering_id: "22222222-2222-4222-8222-222222222222",
+    task_id: task.id,
+    classification: "SCOPE_CHANGE",
+    impacts: ["PATHS", "TESTS"],
+    task_state: "BRIEFING",
+    evidence_id: "33333333-3333-4333-8333-333333333333",
+    request_evidence_id: "44444444-4444-4444-8444-444444444444",
+    event_id: "55555555-5555-4555-8555-555555555555",
+    invalidated_brief_id: "66666666-6666-4666-8666-666666666666",
+    invalidated_validation_contract_id: "77777777-7777-4777-8777-777777777777",
+    revoked_lease_count: 1,
+    revoked_tool_grant_count: 2,
+    replayed: false,
+  };
+  const cancellation = {
+    cancellation_id: "88888888-8888-4888-8888-888888888888",
+    task_id: task.id,
+    task_state: "CANCELLED",
+    partial_evidence_id: "99999999-9999-4999-8999-999999999999",
+    revoked_lease_count: 1,
+    revoked_tool_grant_count: 2,
+    cleanup_complete: true,
+    replayed: false,
+  };
+
+  it("accepts bounded steering and cancellation results", () => {
+    expect(parseTaskSteeringResponse(steering)).toEqual(steering);
+    expect(parseTaskCancellationResponse(cancellation)).toEqual(cancellation);
+  });
+
+  it.each([
+    { ...steering, classification: "CLARIFICATION", impacts: ["PATHS"] },
+    { ...steering, impacts: ["SHELL"] },
+    { ...steering, revoked_lease_count: -1 },
+    { ...steering, request_evidence_id: "not-a-uuid" },
+  ])("rejects invalid steering results", (value) => {
+    expect(() => parseTaskSteeringResponse(value)).toThrow("control plane returned");
+  });
+
+  it.each([
+    { ...cancellation, task_state: "IMPLEMENTING" },
+    { ...cancellation, cleanup_complete: "yes" },
+    { ...cancellation, revoked_tool_grant_count: -1 },
+  ])("rejects invalid cancellation results", (value) => {
+    expect(() => parseTaskCancellationResponse(value)).toThrow("control plane returned");
   });
 });
 
