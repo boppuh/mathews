@@ -8,7 +8,7 @@ import type {
 } from "@mathews/contracts";
 import Link from "next/link";
 import type { FormEvent } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { AuthRequestError, authClient } from "../../lib/auth-client";
 import { formatConfigurationJson } from "../../lib/repositories";
@@ -317,6 +317,9 @@ export function RepositoryWorkspace() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const [saveCandidate, setSaveCandidate] = useState<RepositoryConfigurationWriteRequest | null>(
+    null,
+  );
   const [approved, setApproved] = useState(false);
   const [password, setPassword] = useState("");
 
@@ -340,19 +343,6 @@ export function RepositoryWorkspace() {
     return () => controller.abort();
   }, [load]);
 
-  const parsedDraft = useMemo(() => {
-    if (state.status !== "ready") return null;
-    try {
-      return writeRequest(
-        draft,
-        state.repository.repository_key,
-        state.repository.configuration?.version ?? null,
-      );
-    } catch {
-      return null;
-    }
-  }, [draft, state]);
-
   function update(field: keyof Draft, value: string) {
     setDraft((current) => ({ ...current, [field]: value }));
     setValidationError(null);
@@ -362,32 +352,35 @@ export function RepositoryWorkspace() {
     event.preventDefault();
     if (state.status !== "ready") return;
     try {
-      writeRequest(
+      const candidate = writeRequest(
         draft,
         state.repository.repository_key,
         state.repository.configuration?.version ?? null,
       );
+      setSaveCandidate(candidate);
       setValidationError(null);
       setActionError(null);
       setApproved(false);
       setPassword("");
       setConfirmationOpen(true);
     } catch (error) {
+      setSaveCandidate(null);
       setValidationError(messageFrom(error, "The configuration JSON is invalid."));
     }
   }
 
   async function confirmSave(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!parsedDraft || !approved || !password || pending !== null) return;
+    if (!saveCandidate || !approved || !password || pending !== null) return;
     setPending("save");
     setActionError(null);
     try {
       await authClient.reauthenticate(password);
-      const repository = await repositoryClient.save(parsedDraft);
+      const repository = await repositoryClient.save(saveCandidate);
       setState({ status: "ready", repository });
       setDraft(draftFrom(repository.configuration));
       setConfirmationOpen(false);
+      setSaveCandidate(null);
       setApproved(false);
       setPassword("");
       setEditorOpen(false);
@@ -728,6 +721,7 @@ export function RepositoryWorkspace() {
                   type="button"
                   onClick={() => {
                     setConfirmationOpen(false);
+                    setSaveCandidate(null);
                     setPassword("");
                     setActionError(null);
                   }}
@@ -735,7 +729,10 @@ export function RepositoryWorkspace() {
                 >
                   Go back
                 </button>
-                <button type="submit" disabled={!approved || !password || pending !== null}>
+                <button
+                  type="submit"
+                  disabled={!saveCandidate || !approved || !password || pending !== null}
+                >
                   {pending === "save" ? "Saving version..." : "Approve and save"}
                 </button>
               </div>
