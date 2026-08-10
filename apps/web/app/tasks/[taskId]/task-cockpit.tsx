@@ -232,6 +232,7 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
           ← Work
         </Link>
         <nav className="cockpit-nav" aria-label="Task cockpit sections">
+          <Link href="/inbox">Decision inbox</Link>
           <a href="#timeline">Timeline</a>
           <a href="#activity">Activity</a>
           <a href="#acceptance">Criteria</a>
