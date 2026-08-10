@@ -139,11 +139,36 @@ export const ACCEPTANCE_CRITERION_VERIFICATIONS = [
 
 export type AcceptanceCriterionVerification = (typeof ACCEPTANCE_CRITERION_VERIFICATIONS)[number];
 
+export const VALIDATION_ASSERTION_KINDS = [
+  "ELEMENT_VALUE_PRESENT",
+  "NAVIGATION_STATE_REACHED",
+  "EXPECTED_NETWORK_RESPONSE",
+  "EXPECTED_LOG_EVENT",
+  "NO_CRASH",
+] as const;
+
+export type ValidationAssertionKind = (typeof VALIDATION_ASSERTION_KINDS)[number];
+
+export interface TaskAcceptanceAssertionSummary {
+  assertion_id: string;
+  kind: ValidationAssertionKind;
+  verifier_catalog_key: string;
+  status: AcceptanceCriterionStatus;
+  result_code: string;
+  evidence_ids: string[];
+}
+
 export interface TaskAcceptanceCriterionSummary {
   id: string;
   requirement: string;
   verification: AcceptanceCriterionVerification;
   status: AcceptanceCriterionStatus;
+  validation_run_id: string | null;
+  validation_contract_version: number | null;
+  commit_sha: string | null;
+  tree_sha: string | null;
+  evidence_ids: string[];
+  assertions: TaskAcceptanceAssertionSummary[];
 }
 
 export const APPROVAL_STATUSES = [

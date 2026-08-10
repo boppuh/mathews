@@ -106,3 +106,33 @@ def test_default_worker_registers_the_fail_closed_hermes_handler(
         assert "no registered handlers" not in caplog.text
     finally:
         engine.dispose()
+
+
+def test_worker_registers_validation_evidence_handler_with_host_gateway(
+    tmp_path: Path,
+) -> None:
+    from mathews_configuration import HostRequestMessage, HostResponseMessage
+    from mathews_control_plane.settings import Settings
+    from mathews_control_plane.worker import build_worker
+
+    class FakeHostGateway:
+        def execute(self, _request: HostRequestMessage) -> HostResponseMessage:
+            raise AssertionError("handler registration must not call the host")
+
+    runtime_settings = Settings(
+        environment="test",
+        database_url=SecretStr(f"sqlite:///{tmp_path / 'worker.sqlite3'}"),
+        artifact_root=tmp_path / "artifacts",
+    )
+    worker, engine = build_worker(
+        runtime_settings,
+        host_gateway=FakeHostGateway(),
+    )
+    try:
+        assert set(worker._handlers) == {
+            "github-webhook",
+            "hermes-run",
+            "validation-evidence",
+        }
+    finally:
+        engine.dispose()

@@ -765,6 +765,21 @@ def default_operation_registry(
             raise HostOperationRejected(error.code) from None
         return cast(dict[str, JsonValue], result)
 
+    def artifact_verify(
+        context: HostOperationContext,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        authority = _task_authority(context)
+        try:
+            result = artifact_store.verify(
+                authority.task_id,
+                address=cast(str, arguments["address"]),
+                expected_size_bytes=cast(int, arguments["expected_size_bytes"]),
+            )
+        except ConfiguredExecutionError as error:
+            raise HostOperationRejected(error.code) from None
+        return cast(dict[str, JsonValue], result)
+
     def lease_probe(
         context: HostOperationContext,
         _arguments: dict[str, JsonValue],
@@ -809,6 +824,11 @@ def default_operation_registry(
                 authority=HostAuthorityKind.TASK_LEASE,
                 validate=_validate_artifact_read,
                 handle=artifact_read,
+            ),
+            "artifact.verify": HostOperationDefinition(
+                authority=HostAuthorityKind.TASK_LEASE,
+                validate=_validate_artifact_verify,
+                handle=artifact_verify,
             ),
             "git.commit": HostOperationDefinition(
                 authority=HostAuthorityKind.TASK_LEASE,
@@ -1113,6 +1133,24 @@ def _validate_artifact_read(
         or isinstance(length, bool)
         or not isinstance(length, int)
         or not 0 < length <= 256 * 1024
+    ):
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    return arguments
+
+
+def _validate_artifact_verify(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if set(arguments) != {"address", "expected_size_bytes"}:
+        raise HostOperationRejected("INVALID_ARGUMENTS")
+    address = arguments["address"]
+    expected_size = arguments["expected_size_bytes"]
+    if (
+        not isinstance(address, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", address) is None
+        or isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or not 0 <= expected_size <= 128 * 1024 * 1024
     ):
         raise HostOperationRejected("INVALID_ARGUMENTS")
     return arguments

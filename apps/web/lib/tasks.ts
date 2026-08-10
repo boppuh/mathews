@@ -40,6 +40,7 @@ import {
   type TaskSteeringImpact,
   type TaskSteeringResponse,
   type TaskSummary,
+  VALIDATION_ASSERTION_KINDS,
 } from "@mathews/contracts";
 
 const taskStates = new Set<string>(TASK_STATES);
@@ -54,6 +55,7 @@ const evidenceContentAccess = new Set<string>(TASK_EVIDENCE_CONTENT_ACCESS);
 const evidenceDeletionReasons = new Set<string>(EVIDENCE_DELETION_REASONS);
 const criterionStatuses = new Set<string>(ACCEPTANCE_CRITERION_STATUSES);
 const criterionVerifications = new Set<string>(ACCEPTANCE_CRITERION_VERIFICATIONS);
+const validationAssertionKinds = new Set<string>(VALIDATION_ASSERTION_KINDS);
 const approvalStatuses = new Set<string>(APPROVAL_STATUSES);
 const steeringImpacts = new Set<string>(TASK_STEERING_IMPACTS);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -364,15 +366,101 @@ function parseAcceptanceCriterion(value: unknown): TaskAcceptanceCriterionSummar
     typeof value.verification !== "string" ||
     !criterionVerifications.has(value.verification) ||
     typeof value.status !== "string" ||
-    !criterionStatuses.has(value.status)
+    !criterionStatuses.has(value.status) ||
+    !(
+      value.validation_run_id === null ||
+      (typeof value.validation_run_id === "string" && UUID_PATTERN.test(value.validation_run_id))
+    ) ||
+    !(
+      value.validation_contract_version === null ||
+      (Number.isSafeInteger(value.validation_contract_version) &&
+        Number(value.validation_contract_version) > 0)
+    ) ||
+    !(
+      value.commit_sha === null ||
+      (typeof value.commit_sha === "string" && GIT_OBJECT_ID_PATTERN.test(value.commit_sha))
+    ) ||
+    !(
+      value.tree_sha === null ||
+      (typeof value.tree_sha === "string" && GIT_OBJECT_ID_PATTERN.test(value.tree_sha))
+    ) ||
+    !Array.isArray(value.evidence_ids) ||
+    !value.evidence_ids.every((item) => typeof item === "string" && UUID_PATTERN.test(item)) ||
+    !Array.isArray(value.assertions)
   ) {
     throw new Error("The control plane returned an invalid acceptance criterion.");
+  }
+  const assertions = value.assertions.map((assertion) => {
+    if (
+      !isRecord(assertion) ||
+      typeof assertion.assertion_id !== "string" ||
+      assertion.assertion_id.length === 0 ||
+      typeof assertion.kind !== "string" ||
+      !validationAssertionKinds.has(assertion.kind) ||
+      typeof assertion.verifier_catalog_key !== "string" ||
+      assertion.verifier_catalog_key.length === 0 ||
+      typeof assertion.status !== "string" ||
+      !criterionStatuses.has(assertion.status) ||
+      typeof assertion.result_code !== "string" ||
+      assertion.result_code.length === 0 ||
+      !Array.isArray(assertion.evidence_ids) ||
+      !assertion.evidence_ids.every((item) => typeof item === "string" && UUID_PATTERN.test(item))
+    ) {
+      throw new Error("The control plane returned an invalid acceptance assertion.");
+    }
+    const assertionEvidenceIds = assertion.evidence_ids as string[];
+    if (
+      new Set(assertionEvidenceIds).size !== assertionEvidenceIds.length ||
+      (assertion.status === "PENDING" && assertionEvidenceIds.length > 0) ||
+      (assertion.status !== "PENDING" && assertionEvidenceIds.length === 0)
+    ) {
+      throw new Error("The control plane returned inconsistent acceptance assertion evidence.");
+    }
+    return {
+      assertion_id: assertion.assertion_id,
+      kind: assertion.kind as TaskAcceptanceCriterionSummary["assertions"][number]["kind"],
+      verifier_catalog_key: assertion.verifier_catalog_key,
+      status: assertion.status as AcceptanceCriterionStatus,
+      result_code: assertion.result_code,
+      evidence_ids: assertionEvidenceIds,
+    };
+  });
+  const hasRun = value.validation_run_id !== null;
+  const assertionEvidenceIds = new Set(assertions.flatMap((assertion) => assertion.evidence_ids));
+  const aggregateEvidenceIds = new Set(value.evidence_ids as string[]);
+  const assertionStatuses = new Set(assertions.map((assertion) => assertion.status));
+  const expectedStatus = assertionStatuses.has("FAILED")
+    ? "FAILED"
+    : assertionStatuses.has("BLOCKED")
+      ? "BLOCKED"
+      : assertionStatuses.has("PENDING")
+        ? "PENDING"
+        : "PASSED";
+  if (
+    hasRun !== (value.validation_contract_version !== null) ||
+    hasRun !== (value.commit_sha !== null) ||
+    hasRun !== (value.tree_sha !== null) ||
+    (!hasRun && (value.evidence_ids.length > 0 || assertions.length > 0)) ||
+    (hasRun && assertions.length === 0) ||
+    new Set(assertions.map((assertion) => assertion.assertion_id)).size !== assertions.length ||
+    (hasRun && value.status !== expectedStatus) ||
+    aggregateEvidenceIds.size !== value.evidence_ids.length ||
+    assertionEvidenceIds.size !== aggregateEvidenceIds.size ||
+    ![...assertionEvidenceIds].every((evidenceId) => aggregateEvidenceIds.has(evidenceId))
+  ) {
+    throw new Error("The control plane returned inconsistent validation evidence.");
   }
   return {
     id: value.id,
     requirement: value.requirement,
     verification: value.verification as AcceptanceCriterionVerification,
     status: value.status as AcceptanceCriterionStatus,
+    validation_run_id: value.validation_run_id as string | null,
+    validation_contract_version: value.validation_contract_version as number | null,
+    commit_sha: value.commit_sha as string | null,
+    tree_sha: value.tree_sha as string | null,
+    evidence_ids: value.evidence_ids as string[],
+    assertions,
   };
 }
 

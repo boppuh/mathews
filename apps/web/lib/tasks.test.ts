@@ -130,6 +130,12 @@ describe("task cockpit parsing", () => {
         requirement: "The task can be inspected without leaving the cockpit.",
         verification: "HUMAN_INSPECTION",
         status: "PENDING",
+        validation_run_id: null,
+        validation_contract_version: null,
+        commit_sha: null,
+        tree_sha: null,
+        evidence_ids: [],
+        assertions: [],
       },
     ],
     evidence: [
@@ -172,6 +178,53 @@ describe("task cockpit parsing", () => {
       last_updated_at: null,
     },
   };
+
+  it("accepts a populated validation result and rejects inconsistent derivations", () => {
+    const evidenceId = "44444444-4444-4444-8444-444444444444";
+    const populatedCriterion = {
+      ...cockpit.acceptance_criteria[0],
+      status: "PASSED",
+      validation_run_id: "55555555-5555-4555-8555-555555555555",
+      validation_contract_version: 4,
+      commit_sha: "a".repeat(40),
+      tree_sha: "b".repeat(40),
+      evidence_ids: [evidenceId],
+      assertions: [
+        {
+          assertion_id: "criterion-visible",
+          kind: "ELEMENT_VALUE_PRESENT",
+          verifier_catalog_key: "ui.criterion-visible",
+          status: "PASSED",
+          result_code: "EXPECTED_VALUE_PRESENT",
+          evidence_ids: [evidenceId],
+        },
+      ],
+    };
+
+    expect(
+      parseTaskCockpit({
+        ...cockpit,
+        acceptance_criteria: [populatedCriterion],
+      }).acceptance_criteria[0],
+    ).toEqual(populatedCriterion);
+    expect(() =>
+      parseTaskCockpit({
+        ...cockpit,
+        acceptance_criteria: [{ ...populatedCriterion, status: "FAILED" }],
+      }),
+    ).toThrow("inconsistent validation evidence");
+    expect(() =>
+      parseTaskCockpit({
+        ...cockpit,
+        acceptance_criteria: [
+          {
+            ...populatedCriterion,
+            evidence_ids: ["66666666-6666-4666-8666-666666666666"],
+          },
+        ],
+      }),
+    ).toThrow("inconsistent validation evidence");
+  });
 
   it("accepts a safe durable cockpit projection", () => {
     expect(parseTaskCockpit(cockpit)).toEqual(cockpit);
