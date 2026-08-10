@@ -74,6 +74,11 @@ from mathews_control_plane.host_gateway import (
     HostGatewayError,
     authority_for_job_lease,
 )
+from mathews_control_plane.repair_loop import (
+    RepairLoopError,
+    RepairScheduleResult,
+    ValidationRepairService,
+)
 from mathews_control_plane.repository_configuration import (
     repository_configuration_digest,
     validated_repository_configuration,
@@ -980,6 +985,10 @@ class ValidationDecisioner(Protocol):
     ) -> ValidationDecisionResult: ...
 
 
+class ValidationRepairScheduler(Protocol):
+    def schedule(self, validation_run_id: UUID) -> RepairScheduleResult: ...
+
+
 class HostValidationArtifactVerifier:
     """Verify host artifacts through the authenticated task-lease boundary."""
 
@@ -1223,6 +1232,7 @@ class ValidationEvidenceJobHandler:
         clock: Callable[[], datetime] | None = None,
         collector: ValidationEvidenceCollector | None = None,
         decision_service: ValidationDecisioner | None = None,
+        repair_scheduler: ValidationRepairScheduler | None = None,
     ) -> None:
         self._factory = factory
         self._host = host_gateway
@@ -1244,6 +1254,15 @@ class ValidationEvidenceJobHandler:
             )
             if decision_service is None
             else decision_service
+        )
+        self._repair_scheduler = (
+            ValidationRepairService(
+                factory,
+                artifact_store,
+                clock=self._clock,
+            )
+            if repair_scheduler is None
+            else repair_scheduler
         )
 
     def __call__(self, context: LeasedJobContext) -> dict[str, object]:
@@ -1287,7 +1306,7 @@ class ValidationEvidenceJobHandler:
                 result.validation_run_id,
                 lease_grant_supplier=lambda: context.grant,
             )
-            return {
+            checkpoint: dict[str, object] = {
                 "validation_run_id": str(result.validation_run_id),
                 "commit_sha": result.commit_sha,
                 "tree_sha": result.tree_sha,
@@ -1296,6 +1315,22 @@ class ValidationEvidenceJobHandler:
                 "reason_code": decision.reason_code,
                 "decision_evidence_id": str(decision.decision_evidence_id),
             }
+            if decision.outcome is ValidationOutcome.FAILED:
+                repair = self._repair_scheduler.schedule(result.validation_run_id)
+                checkpoint.update(
+                    {
+                        "repair_status": repair.status.value,
+                        "repair_job_id": (
+                            None if repair.job_id is None else str(repair.job_id)
+                        ),
+                        "repair_approval_request_id": (
+                            None
+                            if repair.approval_request_id is None
+                            else str(repair.approval_request_id)
+                        ),
+                    }
+                )
+            return checkpoint
         except ValidationEvidenceError as error:
             if error.code == "TASK_VALIDATION_PAUSED":
                 raise PausedBackgroundJobError(error.code) from None
@@ -1303,6 +1338,8 @@ class ValidationEvidenceJobHandler:
         except ValidationDecisionError as error:
             if error.code == "TASK_VALIDATION_PAUSED":
                 raise PausedBackgroundJobError(error.code) from None
+            raise TerminalBackgroundJobError(error.code) from None
+        except RepairLoopError as error:
             raise TerminalBackgroundJobError(error.code) from None
 
 

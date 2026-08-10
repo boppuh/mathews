@@ -673,6 +673,41 @@ def test_candidate_commit_uses_configured_identity_and_returns_exact_clean_state
     }
 
 
+def test_repair_replaces_the_host_owned_candidate_with_a_new_clean_commit(
+    tmp_path: Path,
+) -> None:
+    repository, base = _repository(tmp_path)
+    lifecycle = GitWorkspaceLifecycle((tmp_path / "registry").resolve())
+    authority = _authority()
+    configuration = _configuration(repository)
+    created = lifecycle.create(authority, configuration)
+    workspace = Path(cast(str, created["workspace_path"]))
+    (workspace / "feature.txt").write_text("broken candidate\n")
+    first = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=base,
+        message="Add candidate feature",
+    )
+    first_head = cast(str, first["head_sha"])
+    (workspace / "feature.txt").write_text("repaired candidate\n")
+
+    repaired = lifecycle.commit_candidate(
+        authority,
+        configuration,
+        expected_head_sha=first_head,
+        message="Repair candidate feature",
+    )
+
+    assert repaired["head_sha"] not in {base, first_head}
+    assert repaired["parent_shas"] == [base]
+    assert repaired["changed_paths"] == ["feature.txt"]
+    assert repaired["clean"] is True
+    assert _git(workspace, "show", f"{repaired['head_sha']}:feature.txt") == (
+        "repaired candidate"
+    )
+
+
 def test_candidate_commit_preserves_repository_info_excludes(
     tmp_path: Path,
 ) -> None:

@@ -53,6 +53,7 @@ from mathews_control_plane.task_state_machine import (
     TaskTransitionGateEvaluator,
     TaskTransitionKind,
     TaskTransitionResult,
+    ValidationCandidate,
     _transition_task,
 )
 
@@ -2147,14 +2148,22 @@ class BackgroundJobService:
         kind: TaskTransitionKind,
         reason_code: str,
         evidence_ids: Sequence[UUID],
+        validation_candidate: ValidationCandidate | None = None,
         active_policy_lineage: str = "mvp",
     ) -> TaskTransitionResult:
         if kind in {
             TaskTransitionKind.BEGIN_VALIDATION,
             TaskTransitionKind.REVALIDATE,
-        }:
+        } and validation_candidate is None:
             raise InvalidBackgroundJobError(
                 "background jobs cannot issue validation transitions without a candidate"
+            )
+        if kind not in {
+            TaskTransitionKind.BEGIN_VALIDATION,
+            TaskTransitionKind.REVALIDATE,
+        } and validation_candidate is not None:
+            raise InvalidBackgroundJobError(
+                "background job transition cannot carry a validation candidate"
             )
         with self._factory() as session, session.begin():
             _begin_serialized(session)
@@ -2185,7 +2194,7 @@ class BackgroundJobService:
                 reason_code=reason_code,
                 actor_id=self._principal_id,
                 evidence_ids=evidence_ids,
-                validation_candidate=None,
+                validation_candidate=validation_candidate,
                 gate_evaluator=self._gate_evaluator,
                 active_policy_lineage=active_policy_lineage,
                 occurred_at=now,

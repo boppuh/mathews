@@ -54,7 +54,9 @@ second event.
 The final write is protected by the background job's current lease and fencing
 token. The validation-evidence worker renews its lease after collection and
 invokes decisioning immediately, so a reclaimed worker cannot publish a late
-outcome.
+outcome. A `FAILED` outcome then schedules the bounded, evidence-backed flow
+documented in [`VALIDATION_REPAIR_LOOP.md`](VALIDATION_REPAIR_LOOP.md); other
+outcomes cannot enter automatic implementation repair.
 
 ## Exact-SHA query
 

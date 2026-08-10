@@ -39,6 +39,10 @@ from mathews_control_plane.reliability import (
     StartupRecoveryResult,
     StartupRecoveryService,
 )
+from mathews_control_plane.repair_loop import (
+    VALIDATION_REPAIR_JOB_TYPE,
+    RepairJobHandler,
+)
 from mathews_control_plane.settings import Settings, settings
 from mathews_control_plane.validation_evidence import (
     LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,
@@ -78,13 +82,14 @@ def build_worker(
         tool_execution = (
             None if gateway is None else ScopedCodeExecutionService(factory, store, gateway)
         )
+        hermes_handler = HermesRunJobHandler(
+            factory,
+            store,
+            runtime,
+            tool_execution,
+        )
         handler_registry: dict[str, BackgroundJobHandler] = {
-            "hermes-run": HermesRunJobHandler(
-                factory,
-                store,
-                runtime,
-                tool_execution,
-            ),
+            "hermes-run": hermes_handler,
             "github-webhook": GitHubWebhookJobHandler(),
         }
         if gateway is not None:
@@ -95,6 +100,12 @@ def build_worker(
             )
             handler_registry[LEGACY_VALIDATION_EVIDENCE_JOB_TYPE] = validation_handler
             handler_registry[VALIDATION_EVIDENCE_JOB_TYPE] = validation_handler
+            handler_registry[VALIDATION_REPAIR_JOB_TYPE] = RepairJobHandler(
+                factory,
+                store,
+                gateway,
+                hermes_handler,
+            )
     else:
         handler_registry = dict(handlers)
     if not handler_registry:
