@@ -29,7 +29,15 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from mathews_control_plane.artifacts import ArtifactStore
-from mathews_control_plane.background_jobs import JobLeaseGrant, LeasedJobContext
+from mathews_control_plane.background_jobs import (
+    BackgroundJobService,
+    JobLeaseGrant,
+    LeasedJobContext,
+    RetryableBackgroundJobError,
+    RetryPolicy,
+    ScheduledJob,
+    TerminalBackgroundJobError,
+)
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
     Brief,
@@ -60,6 +68,7 @@ from mathews_control_plane.repository_configuration import (
 )
 
 VALIDATION_EVIDENCE_EVENT_TYPE = "VALIDATION_EVIDENCE_COLLECTED"
+VALIDATION_EVIDENCE_JOB_TYPE = "validation-evidence"
 VALIDATION_EVIDENCE_SCHEMA_VERSION = 1
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,254}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -451,6 +460,7 @@ class TypedAssertionResult:
 class ValidationEvidenceCollection:
     run_id: UUID
     task_id: UUID
+    validation_attempt_id: UUID
     validation_contract_id: UUID
     repository_configuration_id: UUID
     commit_sha: str
@@ -466,6 +476,7 @@ class ValidationEvidenceCollection:
             for value in (
                 self.run_id,
                 self.task_id,
+                self.validation_attempt_id,
                 self.validation_contract_id,
                 self.repository_configuration_id,
             )
@@ -525,6 +536,7 @@ class ValidationEvidenceCollection:
         return {
             "run_id": str(self.run_id),
             "task_id": str(self.task_id),
+            "validation_attempt_id": str(self.validation_attempt_id),
             "validation_contract_id": str(self.validation_contract_id),
             "repository_configuration_id": str(self.repository_configuration_id),
             "commit_sha": self.commit_sha,
@@ -546,6 +558,7 @@ class ValidationEvidenceCollection:
             {
                 "run_id",
                 "task_id",
+                "validation_attempt_id",
                 "validation_contract_id",
                 "repository_configuration_id",
                 "commit_sha",
@@ -560,6 +573,10 @@ class ValidationEvidenceCollection:
         return cls(
             run_id=_uuid(fields["run_id"], "run id"),
             task_id=_uuid(fields["task_id"], "task id"),
+            validation_attempt_id=_uuid(
+                fields["validation_attempt_id"],
+                "validation attempt id",
+            ),
             validation_contract_id=_uuid(
                 fields["validation_contract_id"],
                 "validation contract id",
@@ -632,13 +649,21 @@ class ValidationEvidenceService:
             if replay is not None:
                 return _replayed_result(session, replay, collection)
 
+        for item in collection.evidence:
+            artifact_verifier(item)
+
+        with self._factory.begin() as session:
             task = session.scalar(
                 select(Task).where(Task.id == collection.task_id).with_for_update()
             )
             if task is None or task.owner_id != self._principal_id:
                 raise ValidationEvidenceError("TASK_UNAVAILABLE")
+            replay = session.get(ValidationRun, collection.run_id)
+            if replay is not None:
+                return _replayed_result(session, replay, collection)
             if TaskState(task.state) is not TaskState.VALIDATING:
                 raise ValidationEvidenceError("TASK_NOT_VALIDATING")
+            _require_current_validation_attempt(session, collection)
             contract = session.get(ValidationContract, collection.validation_contract_id)
             configuration = session.get(
                 RepositoryConfiguration,
@@ -709,9 +734,6 @@ class ValidationEvidenceService:
                     raise ValidationEvidenceError("ASSERTION_RESULT_MISMATCH")
                 _require_evidence_keys(result.evidence_keys, evidence_by_key)
 
-            for item in collection.evidence:
-                artifact_verifier(item)
-
             criterion_ids = _brief_criterion_ids(brief)
             criteria_by_assertion: dict[str, list[str]] = defaultdict(list)
             for assertion_id, (_kind, _catalog_key, criterion_id) in requirements.items():
@@ -729,6 +751,7 @@ class ValidationEvidenceService:
                 tree_sha=collection.tree_sha,
                 configured_test_plan=list(contract.required_operations),
                 operation_results=[],
+                assertion_results=[],
                 simulator_target=_simulator_target(collection.operation_results),
                 outcome=ValidationOutcome.PENDING,
                 duration_ms=collection.duration_ms,
@@ -790,6 +813,7 @@ class ValidationEvidenceService:
                 operation.to_dict(evidence_ids)
                 for operation in collection.operation_results
             ]
+            run.assertion_results = list(assertion_payloads.values())
             run.acceptance_criterion_results = list(criterion_results)
             application_logs = [
                 evidence_ids[item.evidence_key]
@@ -813,6 +837,7 @@ class ValidationEvidenceService:
                     "collection_fingerprint": _collection_fingerprint(collection),
                     "evidence_ids": [str(value) for value in evidence_ids.values()],
                     "operation_results": run.operation_results,
+                    "assertion_results": run.assertion_results,
                     "acceptance_criterion_results": run.acceptance_criterion_results,
                 },
                 media_type="application/json",
@@ -899,26 +924,27 @@ class HostValidationArtifactVerifier:
     def __init__(
         self,
         host_gateway: ValidationHostGateway,
-        grant: JobLeaseGrant,
+        grant_supplier: Callable[[], JobLeaseGrant],
         configuration: ValidatedRepositoryConfiguration,
         *,
         run_id: UUID,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._host = host_gateway
-        self._grant = grant
+        self._grant_supplier = grant_supplier
         self._configuration = configuration
         self._run_id = run_id
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def verify(self, item: ValidationEvidenceItem) -> None:
         now = _as_utc(self._clock())
+        grant = self._grant_supplier()
         request = HostRequestMessage(
             request_id=uuid4(),
             issued_at_ms=int(now.timestamp() * 1_000),
             expires_at_ms=int((now + timedelta(seconds=30)).timestamp() * 1_000),
             authority=authority_for_job_lease(
-                self._grant,
+                grant,
                 configuration=self._configuration,
             ),
             operation=HostOperation(
@@ -936,7 +962,7 @@ class HostValidationArtifactVerifier:
         try:
             response = self._host.execute(request)
         except HostGatewayError:
-            raise ValidationEvidenceError("HOST_ARTIFACT_UNAVAILABLE") from None
+            raise RetryableBackgroundJobError("HOST_ARTIFACT_UNAVAILABLE") from None
         if (
             response.status is not HostResponseStatus.OK
             or response.result
@@ -947,6 +973,48 @@ class HostValidationArtifactVerifier:
             }
         ):
             raise ValidationEvidenceError("HOST_ARTIFACT_UNVERIFIED")
+
+
+class ValidationEvidenceJobScheduler:
+    """Schedule one exact attempt-bound collection for the production worker."""
+
+    def __init__(
+        self,
+        factory: SessionFactory,
+        artifact_store: ArtifactStore,
+        *,
+        principal_id: str = "control-plane",
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        effective_clock = clock or (lambda: datetime.now(UTC))
+        self._factory = factory
+        self._jobs = BackgroundJobService(
+            factory,
+            artifact_store,
+            principal_id=principal_id,
+            clock=effective_clock,
+        )
+
+    def schedule(self, collection: ValidationEvidenceCollection) -> ScheduledJob:
+        with self._factory.begin() as session:
+            task = session.get(Task, collection.task_id)
+            if task is None or TaskState(task.state) is not TaskState.VALIDATING:
+                raise ValidationEvidenceError("TASK_NOT_VALIDATING")
+            _require_current_validation_attempt(session, collection)
+        return self._jobs.schedule(
+            task_id=collection.task_id,
+            job_type=VALIDATION_EVIDENCE_JOB_TYPE,
+            idempotency_key=(
+                f"validation-evidence:{collection.validation_attempt_id}:"
+                f"{collection.run_id}"
+            ),
+            input_payload=collection.to_dict(),
+            retry_policy=RetryPolicy(
+                max_attempts=3,
+                base_delay_seconds=2,
+                max_delay_seconds=30,
+            ),
+        )
 
 
 class ValidationEvidenceJobHandler:
@@ -970,37 +1038,75 @@ class ValidationEvidenceJobHandler:
         )
 
     def __call__(self, context: LeasedJobContext) -> dict[str, object]:
-        collection = ValidationEvidenceCollection.from_dict(context.grant.input_payload)
-        if collection.task_id != context.grant.task_id:
-            raise ValidationEvidenceError("VALIDATION_JOB_TASK_MISMATCH")
-        with self._factory() as session:
-            configuration = session.get(
-                RepositoryConfiguration,
-                collection.repository_configuration_id,
+        try:
+            collection = ValidationEvidenceCollection.from_dict(
+                context.grant.input_payload
             )
-            if configuration is None:
-                raise ValidationEvidenceError("VALIDATION_BINDING_MISMATCH")
-            try:
-                validated = validated_repository_configuration(configuration)
-            except ValueError:
-                raise ValidationEvidenceError("CONFIGURATION_BINDING_INVALID") from None
-        verifier = HostValidationArtifactVerifier(
-            self._host,
-            context.grant,
-            validated,
-            run_id=collection.run_id,
-            clock=self._clock,
+            if collection.task_id != context.grant.task_id:
+                raise ValidationEvidenceError("VALIDATION_JOB_TASK_MISMATCH")
+            with self._factory() as session:
+                configuration = session.get(
+                    RepositoryConfiguration,
+                    collection.repository_configuration_id,
+                )
+                if configuration is None:
+                    raise ValidationEvidenceError("VALIDATION_BINDING_MISMATCH")
+                try:
+                    validated = validated_repository_configuration(configuration)
+                except ValueError:
+                    raise ValidationEvidenceError(
+                        "CONFIGURATION_BINDING_INVALID"
+                    ) from None
+
+            def renewed_grant() -> JobLeaseGrant:
+                context.heartbeat(timedelta(seconds=30))
+                return context.grant
+
+            verifier = HostValidationArtifactVerifier(
+                self._host,
+                renewed_grant,
+                validated,
+                run_id=collection.run_id,
+                clock=self._clock,
+            )
+            result = self._collector.collect(
+                collection,
+                artifact_verifier=verifier.verify,
+            )
+            return {
+                "validation_run_id": str(result.validation_run_id),
+                "commit_sha": result.commit_sha,
+                "tree_sha": result.tree_sha,
+                "replayed": result.replayed,
+            }
+        except ValidationEvidenceError as error:
+            raise TerminalBackgroundJobError(error.code) from None
+
+
+def _require_current_validation_attempt(
+    session: Session,
+    collection: ValidationEvidenceCollection,
+) -> None:
+    attempt = session.scalar(
+        select(TaskEvent)
+        .where(
+            TaskEvent.task_id == collection.task_id,
+            TaskEvent.transition_to_state == TaskState.VALIDATING,
+            TaskEvent.transition_kind.in_(("BEGIN_VALIDATION", "REVALIDATE")),
         )
-        result = self._collector.collect(
-            collection,
-            artifact_verifier=verifier.verify,
-        )
-        return {
-            "validation_run_id": str(result.validation_run_id),
-            "commit_sha": result.commit_sha,
-            "tree_sha": result.tree_sha,
-            "replayed": result.replayed,
-        }
+        .order_by(TaskEvent.sequence.desc())
+        .limit(1)
+    )
+    candidate = None if attempt is None else attempt.payload.get("validation_candidate")
+    if (
+        attempt is None
+        or attempt.transition_id != collection.validation_attempt_id
+        or not isinstance(candidate, Mapping)
+        or set(candidate) != {"commit_sha", "tree_sha"}
+        or candidate.get("commit_sha") != collection.commit_sha
+        or candidate.get("tree_sha") != collection.tree_sha
+    ):
+        raise ValidationEvidenceError("VALIDATION_ATTEMPT_STALE")
 
 
 def _required_evidence_types(values: Sequence[object]) -> set[str]:
@@ -1465,6 +1571,7 @@ def _collection_fingerprint(collection: ValidationEvidenceCollection) -> str:
         "schema_version": VALIDATION_EVIDENCE_SCHEMA_VERSION,
         "run_id": str(collection.run_id),
         "task_id": str(collection.task_id),
+        "validation_attempt_id": str(collection.validation_attempt_id),
         "validation_contract_id": str(collection.validation_contract_id),
         "repository_configuration_id": str(collection.repository_configuration_id),
         "commit_sha": collection.commit_sha,

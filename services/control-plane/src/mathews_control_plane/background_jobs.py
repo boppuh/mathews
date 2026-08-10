@@ -2126,6 +2126,7 @@ class BackgroundJobService:
                 reason_code=reason_code,
                 actor_id=self._principal_id,
                 evidence_ids=evidence_ids,
+                validation_candidate=None,
                 gate_evaluator=self._gate_evaluator,
                 active_policy_lineage=active_policy_lineage,
                 occurred_at=now,

@@ -15,6 +15,11 @@ stored relationships still agree:
 - every configured operation result, validation-contract version, repository
   configuration version, candidate commit SHA, and candidate tree SHA.
 
+The `BEGIN_VALIDATION` or `REVALIDATE` transition issues the attempt identity
+and records its exact commit/tree pair. Collection jobs carry that identity,
+and both scheduling and persistence reject a delayed result when a newer
+attempt has become current.
+
 One collection ID identifies one immutable input. Reusing that ID with changed
 artifact metadata, operation output, assertion output, or Git bindings is a
 conflict. An exact replay returns the original run without duplicating evidence.
@@ -40,6 +45,12 @@ an aggregate validation manifest in the evidence ledger. The source artifact's
 host address remains content-addressed; credentials and raw agent prose are not
 accepted as verifier results.
 
+`ValidationEvidenceJobScheduler` is the production handoff from configured
+validation execution to the durable `validation-evidence` worker. Before every
+source descriptor is committed, the worker renews its lease and verifies the
+task-scoped host content address and byte size. Deterministic malformed or
+stale jobs fail terminally with their stable refusal code.
+
 ## Typed results
 
 Each configured operation records its operation kind, exit status, duration,
@@ -52,6 +63,10 @@ Each assertion result must exactly match an assertion ID, kind, and verifier
 catalog key in the active contract. Its status is one of `PENDING`, `PASSED`,
 `FAILED`, or `BLOCKED`. Every non-pending result has direct evidence references;
 a pending result cannot claim evidence.
+
+All assertion results are stored once at run level and in the immutable
+manifest, including global assertions such as `NO_CRASH` that intentionally do
+not bind to one acceptance criterion.
 
 Criterion status is derived deterministically from its bound assertions:
 

@@ -107,6 +107,18 @@ class DraftPrGateFacts:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationCandidate:
+    """Exact Git objects fenced to one validation transition."""
+
+    commit_sha: str
+    tree_sha: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "commit_sha", _normalized_git_sha(self.commit_sha))
+        object.__setattr__(self, "tree_sha", _normalized_git_sha(self.tree_sha))
+
+
+@dataclass(frozen=True, slots=True)
 class ReadinessGateFacts:
     """Server-built facts required to offer one exact head for human action."""
 
@@ -481,8 +493,9 @@ def _command_fingerprint(
     reason_code: str,
     actor_id: str,
     evidence_ids: Sequence[UUID],
+    validation_candidate: ValidationCandidate | None,
 ) -> str:
-    command = {
+    command: dict[str, object] = {
         "actor_id": actor_id,
         "evidence_ids": sorted(str(evidence_id) for evidence_id in evidence_ids),
         "expected_state": expected_state.value,
@@ -491,6 +504,11 @@ def _command_fingerprint(
         "task_id": str(task_id),
         "transition_id": str(transition_id),
     }
+    if validation_candidate is not None:
+        command["validation_candidate"] = {
+            "commit_sha": validation_candidate.commit_sha,
+            "tree_sha": validation_candidate.tree_sha,
+        }
     payload = json.dumps(
         command,
         sort_keys=True,
@@ -642,6 +660,7 @@ def _transition_task(
     reason_code: str,
     actor_id: str,
     evidence_ids: Sequence[UUID],
+    validation_candidate: ValidationCandidate | None,
     gate_evaluator: TaskTransitionGateEvaluator,
     active_policy_lineage: str,
     occurred_at: datetime,
@@ -666,6 +685,7 @@ def _transition_task(
         reason_code=normalized_reason,
         actor_id=normalized_actor,
         evidence_ids=unique_evidence_ids,
+        validation_candidate=validation_candidate,
     )
 
     task = session.scalar(select(Task).where(Task.id == task_id).with_for_update())
@@ -713,6 +733,18 @@ def _transition_task(
         now=now,
     )
     plan = evaluate_task_transition(snapshot, kind, guards)
+    if kind in {
+        TaskTransitionKind.BEGIN_VALIDATION,
+        TaskTransitionKind.REVALIDATE,
+    }:
+        if validation_candidate is None:
+            raise InvalidTaskTransitionError(
+                "validation transition requires exact candidate Git objects"
+            )
+    elif validation_candidate is not None:
+        raise InvalidTaskTransitionError(
+            "validation candidate is not allowed for this transition"
+        )
     sequence = _next_event_sequence(session, task.id)
     invalidated_ids = (
         {
@@ -750,6 +782,11 @@ def _transition_task(
             else None
         ),
     }
+    if validation_candidate is not None:
+        payload["validation_candidate"] = {
+            "commit_sha": validation_candidate.commit_sha,
+            "tree_sha": validation_candidate.tree_sha,
+        }
     event = TaskEvent(
         task_id=task.id,
         sequence=sequence,
@@ -843,6 +880,7 @@ class TaskTransitionService:
         kind: TaskTransitionKind,
         reason_code: str,
         evidence_ids: Sequence[UUID],
+        validation_candidate: ValidationCandidate | None = None,
     ) -> TaskTransitionResult:
         with self._factory() as session, session.begin():
             if session.get_bind().dialect.name == "sqlite":
@@ -859,6 +897,7 @@ class TaskTransitionService:
                         reason_code=reason_code,
                         actor_id=self._principal_id,
                         evidence_ids=evidence_ids,
+                        validation_candidate=validation_candidate,
                         gate_evaluator=self._gate_evaluator,
                         active_policy_lineage=self._active_policy_lineage,
                         occurred_at=_as_utc(self._clock()),
@@ -879,6 +918,7 @@ class TaskTransitionService:
                     reason_code=_required_reason_code(reason_code),
                     actor_id=self._principal_id,
                     evidence_ids=tuple(dict.fromkeys(evidence_ids)),
+                    validation_candidate=validation_candidate,
                 )
                 return _replayed_result(
                     existing,

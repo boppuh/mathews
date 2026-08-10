@@ -615,6 +615,7 @@ class SteeringService:
                     reason_code="USER_SCOPE_STEERING",
                     actor_id=owner_id,
                     evidence_ids=(captured.record.id,),
+                    validation_candidate=None,
                     gate_evaluator=_ScopeSteeringGates(),
                     active_policy_lineage=self._active_policy_lineage,
                     occurred_at=now,

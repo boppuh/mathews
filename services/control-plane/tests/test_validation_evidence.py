@@ -1,14 +1,30 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 from uuid import UUID, uuid4
 
+import mathews_control_plane.validation_evidence as validation_evidence_module
 import pytest
-from mathews_configuration import AssertionKind, OperationKind
+from mathews_configuration import (
+    AssertionKind,
+    HostRequestMessage,
+    HostResponseMessage,
+    HostResponseStatus,
+    OperationKind,
+    TaskLeaseHostAuthority,
+)
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.background_jobs import (
+    BackgroundJobService,
+    JobLeaseGrant,
+    LeasedJobContext,
+    TerminalBackgroundJobError,
+)
 from mathews_control_plane.database import (
     Base,
     SessionFactory,
@@ -16,10 +32,12 @@ from mathews_control_plane.database import (
     create_session_factory,
 )
 from mathews_control_plane.domain_models import (
+    BackgroundJob,
     Brief,
     BriefApprovalDecision,
     BriefDecisionDisposition,
     EvidenceRecord,
+    PolicyVersion,
     RepositoryConfiguration,
     Task,
     TaskEvent,
@@ -35,6 +53,9 @@ from mathews_control_plane.validation_evidence import (
     ValidationEvidenceCollection,
     ValidationEvidenceError,
     ValidationEvidenceItem,
+    ValidationEvidenceJobHandler,
+    ValidationEvidenceJobScheduler,
+    ValidationEvidenceResult,
     ValidationEvidenceService,
     ValidationEvidenceType,
     ValidationOperationResult,
@@ -45,6 +66,7 @@ _NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 _COMMIT_SHA = "a" * 40
 _TREE_SHA = "b" * 40
 _CONFIGURATION_DIGEST = f"sha256:{'c' * 64}"
+_VALIDATION_ATTEMPT_ID = UUID("77777777-7777-4777-8777-777777777777")
 
 
 def _accept_artifact(_item: ValidationEvidenceItem) -> None:
@@ -188,6 +210,41 @@ def _seed(factory: SessionFactory) -> tuple[UUID, UUID, UUID]:
         task.brief_approval_decision_id = decision.id
         task.repository_configuration_id = configuration.id
         task.validation_contract_id = contract.id
+        policy = PolicyVersion(
+            lineage_key="mvp",
+            version=1,
+            workflow_thresholds={},
+            approved_by="local-user",
+            approved_at=_NOW,
+            **_context(root_id),
+        )
+        session.add(policy)
+        session.flush()
+        session.add(
+            TaskEvent(
+                task_id=task.id,
+                sequence=1,
+                event_type="TASK_STATE_TRANSITION",
+                payload={
+                    "schema_version": 1,
+                    "kind": "BEGIN_VALIDATION",
+                    "validation_candidate": {
+                        "commit_sha": _COMMIT_SHA,
+                        "tree_sha": _TREE_SHA,
+                    },
+                },
+                occurred_at=_NOW,
+                transition_id=_VALIDATION_ATTEMPT_ID,
+                transition_fingerprint="f" * 64,
+                transition_kind="BEGIN_VALIDATION",
+                transition_from_state=TaskState.IMPLEMENTING,
+                transition_to_state=TaskState.VALIDATING,
+                transition_reason_code="BEGIN_VALIDATION",
+                policy_lineage_key=policy.lineage_key,
+                policy_version_id=policy.id,
+                **_context(root_id),
+            )
+        )
         session.flush()
         return task.id, configuration.id, contract.id
 
@@ -298,6 +355,7 @@ def _collection(
     return ValidationEvidenceCollection(
         run_id=run_id or uuid4(),
         task_id=task_id,
+        validation_attempt_id=_VALIDATION_ATTEMPT_ID,
         validation_contract_id=contract_id,
         repository_configuration_id=configuration_id,
         commit_sha=_COMMIT_SHA,
@@ -366,6 +424,19 @@ def test_collects_typed_direct_evidence_and_projects_each_criterion(
         run = session.get(ValidationRun, result.validation_run_id)
         assert run is not None
         assert run.outcome is ValidationOutcome.PENDING
+        stored_assertions = [
+            cast(Mapping[str, object], value) for value in run.assertion_results
+        ]
+        assert {value["assertion_id"] for value in stored_assertions} == {
+            "no-crash",
+            "visible-title",
+            "created-response",
+        }
+        assert next(
+            value
+            for value in stored_assertions
+            if value["assertion_id"] == "no-crash"
+        )["result_code"] == "ZERO_CRASHES_OBSERVED"
         assert run.log_evidence_id is not None
         assert run.simulator_target == {
             "device_id": "SIMULATOR-1",
@@ -607,6 +678,196 @@ def test_rejects_digest_that_differs_from_authoritative_configuration(
         assert session.scalar(select(func.count(EvidenceRecord.id))) == 0
 
 
+def test_rejects_collection_from_stale_validation_attempt(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
+
+    with pytest.raises(ValidationEvidenceError, match="VALIDATION_ATTEMPT_STALE"):
+        service.collect(
+            replace(collection, validation_attempt_id=uuid4()),
+            artifact_verifier=_accept_artifact,
+        )
+
+    with factory() as session:
+        assert session.scalar(select(func.count(ValidationRun.id))) == 0
+
+
+def test_scheduler_enqueues_one_exact_attempt_bound_collection(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    scheduler = ValidationEvidenceJobScheduler(
+        factory,
+        store,
+        clock=lambda: _NOW,
+    )
+
+    first = scheduler.schedule(collection)
+    replay = scheduler.schedule(collection)
+
+    assert replay == replace(first, replayed=True)
+    with factory() as session:
+        job = session.get(BackgroundJob, first.job_id)
+        assert job is not None
+        assert job.job_type == "validation-evidence"
+        assert job.input_payload == collection.to_dict()
+
+
+def test_handler_classifies_malformed_collection_as_terminal(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, _configuration_id, _contract_id = validation_harness
+    jobs = BackgroundJobService(factory, store, clock=lambda: _NOW)
+    jobs.schedule(
+        task_id=task_id,
+        job_type="validation-evidence",
+        idempotency_key=f"validation-evidence:malformed:{uuid4()}",
+        input_payload={},
+    )
+    grant = jobs.claim_next(
+        worker_id="validation-worker",
+        lease_duration=timedelta(seconds=30),
+        job_types=("validation-evidence",),
+    )
+    assert grant is not None
+
+    class UnusedHost:
+        def execute(self, _request: HostRequestMessage) -> HostResponseMessage:
+            raise AssertionError("malformed input must fail before host access")
+
+    handler = ValidationEvidenceJobHandler(factory, store, UnusedHost())
+    with pytest.raises(
+        TerminalBackgroundJobError,
+        match="VALIDATION_EVIDENCE_COLLECTION_INVALID",
+    ):
+        handler(LeasedJobContext(jobs, grant))
+
+
+def test_handler_renews_lease_before_each_artifact_verification(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    monkeypatch.setattr(
+        validation_evidence_module,
+        "validated_repository_configuration",
+        lambda _record: SimpleNamespace(
+            repository_key="boppuh/mathews",
+            configuration_id=configuration_id,
+            digest=_CONFIGURATION_DIGEST,
+        ),
+    )
+
+    class RecordingHost:
+        def __init__(self) -> None:
+            self.expires_at_ms: list[int] = []
+
+        def execute(self, request: HostRequestMessage) -> HostResponseMessage:
+            authority = cast(TaskLeaseHostAuthority, request.authority)
+            self.expires_at_ms.append(authority.lease_expires_at_ms)
+            return HostResponseMessage(
+                request_id=request.request_id,
+                operation_name=request.operation.name,
+                idempotency_key=request.operation.idempotency_key,
+                host_id="host-1",
+                host_version="0.1.0",
+                status=HostResponseStatus.OK,
+                code="OK",
+                replayed=False,
+                completed_at_ms=1_800_000_000_000,
+                execution_fencing_token=authority.fencing_token,
+                result={
+                    "address": cast(str, request.operation.arguments["address"]),
+                    "size_bytes": cast(
+                        int,
+                        request.operation.arguments["expected_size_bytes"],
+                    ),
+                    "verified": True,
+                },
+            )
+
+    class RecordingCollector:
+        def collect(
+            self,
+            submitted: ValidationEvidenceCollection,
+            *,
+            artifact_verifier: Callable[[ValidationEvidenceItem], None],
+        ) -> ValidationEvidenceResult:
+            artifact_verifier(submitted.evidence[0])
+            artifact_verifier(submitted.evidence[1])
+            return ValidationEvidenceResult(
+                validation_run_id=submitted.run_id,
+                task_id=submitted.task_id,
+                contract_version=4,
+                commit_sha=submitted.commit_sha,
+                tree_sha=submitted.tree_sha,
+                evidence_ids=(),
+                criterion_results=(),
+                replayed=False,
+            )
+
+    class RecordingContext:
+        def __init__(self) -> None:
+            self.grant = JobLeaseGrant(
+                job_id=uuid4(),
+                task_id=task_id,
+                lease_id=uuid4(),
+                worker_id="validation-worker",
+                attempt=1,
+                fencing_token=1,
+                expires_at=_NOW + timedelta(seconds=1),
+                job_type="validation-evidence",
+                input_payload=collection.to_dict(),
+                checkpoint=None,
+                checkpoint_version=0,
+                recovered=False,
+            )
+            self.heartbeats: list[timedelta] = []
+
+        def heartbeat(self, duration: timedelta) -> JobLeaseGrant:
+            self.heartbeats.append(duration)
+            self.grant = replace(
+                self.grant,
+                expires_at=self.grant.expires_at + duration,
+            )
+            return self.grant
+
+    host = RecordingHost()
+    context = RecordingContext()
+    handler = ValidationEvidenceJobHandler(factory, store, host)
+    handler._collector = cast(ValidationEvidenceService, RecordingCollector())
+
+    handler(cast(LeasedJobContext, context))
+
+    assert context.heartbeats == [timedelta(seconds=30), timedelta(seconds=30)]
+    assert host.expires_at_ms[1] > host.expires_at_ms[0]
+
+
 def test_same_run_id_replays_without_duplicate_evidence(
     validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
 ) -> None:
@@ -636,6 +897,43 @@ def test_same_run_id_replays_without_duplicate_evidence(
                 EvidenceRecord.validation_run_id == first.validation_run_id
             )
         ) == len(ValidationEvidenceType) + 1
+
+
+def test_rechecks_replay_after_artifact_verification_and_task_lock(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collection = _collection(
+        task_id,
+        configuration_id,
+        contract_id,
+        configuration_digest=_CONFIGURATION_DIGEST,
+    )
+    service = ValidationEvidenceService(
+        factory,
+        store,
+        clock=lambda: _NOW,
+        configuration_digest=lambda _configuration: _CONFIGURATION_DIGEST,
+    )
+    competing_result = None
+
+    def verify_with_competing_commit(_item: ValidationEvidenceItem) -> None:
+        nonlocal competing_result
+        if competing_result is None:
+            competing_result = service.collect(
+                collection,
+                artifact_verifier=_accept_artifact,
+            )
+
+    result = service.collect(
+        collection,
+        artifact_verifier=verify_with_competing_commit,
+    )
+
+    assert competing_result is not None
+    assert competing_result.replayed is False
+    assert result.replayed is True
+    assert result.validation_run_id == competing_result.validation_run_id
 
 
 def test_replay_ignores_later_evidence_correction_records(

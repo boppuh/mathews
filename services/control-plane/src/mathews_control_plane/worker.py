@@ -40,7 +40,10 @@ from mathews_control_plane.reliability import (
     StartupRecoveryService,
 )
 from mathews_control_plane.settings import Settings, settings
-from mathews_control_plane.validation_evidence import ValidationEvidenceJobHandler
+from mathews_control_plane.validation_evidence import (
+    VALIDATION_EVIDENCE_JOB_TYPE,
+    ValidationEvidenceJobHandler,
+)
 
 logger = logging.getLogger("mathews.worker")
 
@@ -84,7 +87,7 @@ def build_worker(
             "github-webhook": GitHubWebhookJobHandler(),
         }
         if gateway is not None:
-            handler_registry["validation-evidence"] = ValidationEvidenceJobHandler(
+            handler_registry[VALIDATION_EVIDENCE_JOB_TYPE] = ValidationEvidenceJobHandler(
                 factory,
                 store,
                 gateway,

@@ -750,6 +750,12 @@ class ValidationRun(RecordContext, Base):
     tree_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     configured_test_plan: Mapped[list[object]] = mapped_column(JSON, nullable=False)
     operation_results: Mapped[list[object]] = mapped_column(JSON, nullable=False)
+    assertion_results: Mapped[list[object]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
     simulator_target: Mapped[dict[str, object] | None] = mapped_column(JSON)
     outcome: Mapped[ValidationOutcome] = mapped_column(
         _enum(ValidationOutcome, name="validation_run_outcome"),

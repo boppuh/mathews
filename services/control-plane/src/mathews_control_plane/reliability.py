@@ -561,6 +561,7 @@ class CancellationService:
                         reason_code=normalized_reason,
                         actor_id=self._principal_id,
                         evidence_ids=(partial_evidence_id,),
+                        validation_candidate=None,
                         gate_evaluator=ClosedTaskTransitionGateEvaluator(),
                         active_policy_lineage=self._active_policy_lineage,
                         occurred_at=now,

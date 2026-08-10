@@ -53,6 +53,7 @@ from mathews_control_plane.task_state_machine import (
     TaskTransitionResult,
     TaskTransitionService,
     TaskTransitionSnapshot,
+    ValidationCandidate,
     evaluate_task_transition,
 )
 from sqlalchemy import Engine, func, select, text
@@ -1071,6 +1072,11 @@ def test_full_verified_draft_readiness_and_handoff_path_records_exact_head(
             kind=kind,
             reason_code=kind.value,
             evidence_ids=(evidence_id,),
+            validation_candidate=(
+                ValidationCandidate("a" * 40, "b" * 40)
+                if kind is TaskTransitionKind.BEGIN_VALIDATION
+                else None
+            ),
         )
 
     with state_machine_harness.factory() as session:
@@ -1091,6 +1097,10 @@ def test_full_verified_draft_readiness_and_handoff_path_records_exact_head(
     assert events[-1].payload["meaning"] == (
         "automation responsibility handed off; not merged, deployed, or released"
     )
+    assert events[2].payload["validation_candidate"] == {
+        "commit_sha": "a" * 40,
+        "tree_sha": "b" * 40,
+    }
 
 
 def test_escalation_resumes_only_to_recorded_state_after_trusted_recheck(

@@ -1525,6 +1525,7 @@ class ApprovalService:
                     reason_code=normalized_reason,
                     actor_id=self._principal_id,
                     evidence_ids=normalized_evidence_ids,
+                    validation_candidate=None,
                     gate_evaluator=_TransitionGates(
                         brief_approval_required=(request_type is ApprovalRequestType.BRIEF),
                         expected_policy_version_id=(expected_policy_version_id),
@@ -1747,6 +1748,7 @@ class ApprovalService:
                     reason_code=f"APPROVAL_{effective_decision.value}",
                     actor_id=normalized_actor,
                     evidence_ids=combined_evidence_ids,
+                    validation_candidate=None,
                     gate_evaluator=gates,
                     active_policy_lineage=self._active_policy_lineage,
                     occurred_at=now,
