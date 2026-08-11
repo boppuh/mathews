@@ -1090,6 +1090,7 @@ def register_evidence_derivative(
     payload: object,
     media_type: Literal["application/json", "text/plain; charset=utf-8"],
     actor_id: str,
+    derivative_id: UUID | None = None,
     captured_at: datetime | None = None,
     secrets: Sequence[SecretValue] = (),
 ) -> EvidenceDerivative:
@@ -1103,10 +1104,10 @@ def register_evidence_derivative(
         maximum=255,
     )
     prepared = redact_evidence_content(payload, media_type=media_type, secrets=secrets)
-    derivative_id = uuid4()
+    resolved_derivative_id = derivative_id or uuid4()
     derivative_envelope = {
         "schema_version": 1,
-        "derivative_id": str(derivative_id),
+        "derivative_id": str(resolved_derivative_id),
         "evidence_id": str(record.id),
         "derivative_type": _required_metadata_identifier(
             derivative_type,
@@ -1122,7 +1123,7 @@ def register_evidence_derivative(
     }
     artifact = artifact_store.put_bytes(_canonical_json_bytes(derivative_envelope))
     derivative = EvidenceDerivative(
-        id=derivative_id,
+        id=resolved_derivative_id,
         evidence_id=record.id,
         derivative_type=derivative_envelope["derivative_type"],
         content_hash=artifact.address,

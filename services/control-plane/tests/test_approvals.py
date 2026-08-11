@@ -55,6 +55,12 @@ from mathews_control_plane.domain_models import (
     TaskEvent,
     TaskState,
 )
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+)
 from mathews_control_plane.settings import Settings
 from pydantic import SecretStr
 from sqlalchemy import Engine, func, select
@@ -1045,6 +1051,57 @@ def test_rule_promotion_rejects_changed_or_unbound_candidate_evidence(
     assert inbox.approvals[0].id == request_id
     assert inbox.approvals[0].actionable is False
     assert inbox.approvals[0].unavailable_reason == "RULE_CANDIDATE_UNAVAILABLE"
+
+
+def test_rule_promotion_rejects_a_superseded_candidate_citation(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+    with approval_harness.factory.begin() as session:
+        source = session.get(EvidenceRecord, evidence_id)
+        assert source is not None
+        capture_evidence(
+            session,
+            approval_harness.store,
+            payload="Corrected task request",
+            media_type="text/plain; charset=utf-8",
+            source_kind=EvidenceSourceKind.REQUEST,
+            evidence_type=source.evidence_type,
+            origin="local-user:correction",
+            access_classification=EvidenceAccessClass(source.access_classification),
+            retention_policy=EvidenceRetentionClass(source.retention_policy),
+            owner_id=source.owner_id,
+            actor_id=source.owner_id,
+            root_correlation_id=source.root_correlation_id,
+            task_id=source.task_id,
+            validation_run_id=source.validation_run_id,
+            correction_of_id=source.id,
+        )
+
+    with pytest.raises(ApprovalPreconditionError):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+        )
+
+    with approval_harness.factory() as session:
+        assert session.scalar(select(func.count(ReviewRule.id))) == 0
 
 
 def test_rule_approval_is_bound_to_the_evaluated_definition(

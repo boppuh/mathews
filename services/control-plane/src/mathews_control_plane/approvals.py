@@ -38,6 +38,7 @@ from mathews_control_plane.domain_models import (
     BriefApprovalDecision,
     BriefDecisionDisposition,
     DependencyOutageAttempt,
+    EvidenceDeletionRequest,
     EvidenceRecord,
     PolicyVersion,
     PolicyVersionPromptTemplate,
@@ -890,7 +891,20 @@ def _candidate_evidence_ids(
             EvidenceRecord.deleted_at.is_(None),
         )
     ).all()
-    if len(records) != len(values):
+    invalidated_ids = set(
+        session.scalars(
+            select(EvidenceRecord.correction_of_id).where(
+                EvidenceRecord.correction_of_id.in_(values)
+            )
+        )
+    ) | set(
+        session.scalars(
+            select(EvidenceDeletionRequest.evidence_id).where(
+                EvidenceDeletionRequest.evidence_id.in_(values)
+            )
+        )
+    )
+    if len(records) != len(values) or any(value in invalidated_ids for value in values):
         raise ApprovalConflictError("rule candidate evidence is unavailable")
     return values
 
