@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 import jwt
@@ -546,6 +546,37 @@ def test_installation_token_accepts_only_implicit_metadata_in_addition_to_purpos
         "metadata": "read",
         "pull_requests": "write",
     }
+
+
+def test_installation_token_can_be_explicitly_revoked_after_bounded_use() -> None:
+    purpose = GitHubCredentialPurpose.PULL_REQUEST_WRITE
+    transport = _token_transport(
+        _json_response(201, _token_response(purpose)),
+        cleanup=True,
+    )
+    broker, _signed = _broker(transport)
+    credential = broker.mint_installation_token(purpose)
+
+    broker.revoke_installation_token(credential)
+
+    assert transport.requests[-1].method == "DELETE"
+    assert transport.requests[-1].path == "/installation/token"
+    assert transport.requests[-1].headers["Authorization"] == (
+        "Bearer ghs_test_installation_token"
+    )
+
+
+def test_installation_token_revocation_rejects_a_different_repository() -> None:
+    purpose = GitHubCredentialPurpose.PULL_REQUEST_WRITE
+    transport = _token_transport(_json_response(201, _token_response(purpose)))
+    broker, _signed = _broker(transport)
+    credential = broker.mint_installation_token(purpose)
+    request_count = len(transport.requests)
+
+    with pytest.raises(GitHubPermissionError, match="repository mismatch"):
+        broker.revoke_installation_token(replace(credential, repository_id=404))
+
+    assert len(transport.requests) == request_count
 
 
 def test_real_signer_uses_rs256_with_bounded_github_claims() -> None:
