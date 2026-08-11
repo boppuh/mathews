@@ -237,6 +237,14 @@ def test_internal_task_view_classifies_all_verified_sources_without_copying(
             content={"event_name": "pull_request_review", "payload": {}},
             access=EvidenceAccessClass.INTERNAL,
         )
+        schema_free = _capture(
+            projection_harness,
+            session,
+            task_id=task.id,
+            evidence_type="schema-free-result",
+            source_kind=EvidenceSourceKind.RESULT,
+            content={"event_name": ["not", "a", "string"]},
+        )
         _link_to_task(
             session,
             task=task,
@@ -261,6 +269,7 @@ def test_internal_task_view_classifies_all_verified_sources_without_copying(
         EvidenceProjectionClass.TEST_ARTIFACT,
         EvidenceProjectionClass.CI,
         EvidenceProjectionClass.REVIEW,
+        EvidenceProjectionClass.RESULT,
     }
     assert all(
         item.verification_status is EvidenceVerificationStatus.VERIFIED
@@ -278,8 +287,11 @@ def test_internal_task_view_classifies_all_verified_sources_without_copying(
     assert repository.parent_correlation_id == request.id
     ci_view = next(item for item in result.projections if item.evidence_id == ci.id)
     assert len(ci_view.task_event_references) == 1
+    assert next(
+        item for item in result.projections if item.evidence_id == schema_free.id
+    ).projection_class is EvidenceProjectionClass.RESULT
     with projection_harness.factory() as session:
-        assert session.scalar(select(func.count()).select_from(EvidenceRecord)) == 6
+        assert session.scalar(select(func.count()).select_from(EvidenceRecord)) == 7
         assert session.scalar(select(func.count()).select_from(EvidenceDerivative)) == 0
 
 
@@ -348,6 +360,17 @@ def test_browser_views_preserve_each_original_access_class(
     )
     assert len(limited.projections) == 1
     assert limited.truncated is True
+    assert limited.next_cursor == limited.projections[-1].evidence_id
+    final_page = service.task_projections(
+        task_id,
+        _authentication(projection_harness.now),
+        limit=1,
+        after=limited.next_cursor,
+    )
+    assert len(final_page.projections) == 1
+    assert final_page.projections[0].evidence_id != limited.projections[0].evidence_id
+    assert final_page.truncated is False
+    assert final_page.next_cursor is None
 
 
 def test_corrections_deletions_and_derivatives_propagate_to_provenance(
@@ -414,8 +437,12 @@ def test_corrections_deletions_and_derivatives_propagate_to_provenance(
     assert original_view.corrected_by_id == correction.record.id
     assert original_view.content_hash is None
     assert original_view.deletion_reason == EvidenceDeletionReason.USER_REQUEST.value
+    assert original_view.captured_at.tzinfo == UTC
+    assert original_view.deleted_at is not None
+    assert original_view.deleted_at.tzinfo == UTC
     assert original_view.derivatives[0].derivative_id == derivative.id
     assert original_view.derivatives[0].status is EvidenceDerivativeStatus.DELETED
+    assert original_view.derivatives[0].captured_at.tzinfo == UTC
     assert correction_view.correction_of_id == original.id
 
     provenance = projection_service.provenance(correction.record.id, authentication)
@@ -485,6 +512,13 @@ def test_provenance_navigation_omits_inaccessible_related_nodes(
         and edge.kind is ProvenanceEdgeKind.PARENT
         for edge in result.edges
     )
+    limited = service.provenance(
+        parent.id,
+        _authentication(projection_harness.now),
+        limit=1,
+    )
+    assert [item.evidence_id for item in limited.nodes] == [parent.id]
+    assert limited.truncated is True
 
 
 def test_projection_routes_require_authentication_and_disable_caching(
@@ -538,6 +572,9 @@ def test_projection_routes_require_authentication_and_disable_caching(
         assert response.status_code == 200, response.text
         assert response.headers["cache-control"] == "no-store"
         assert response.json()["projections"][0]["projection_class"] == "REQUEST"
+        assert response.json()["projections"][0]["captured_at"].endswith(
+            ("Z", "+00:00")
+        )
         provenance = client.get(provenance_path)
         assert provenance.status_code == 200, provenance.text
         assert provenance.headers["cache-control"] == "no-store"

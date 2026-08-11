@@ -157,6 +157,7 @@ class TaskEvidenceProjectionView:
     task_id: UUID
     projections: tuple[VerifiedEvidenceProjection, ...]
     truncated: bool
+    next_cursor: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +230,7 @@ class TaskEvidenceProjectionResponse(BaseModel):
     task_id: UUID
     projections: tuple[VerifiedEvidenceProjectionResponse, ...]
     truncated: bool
+    next_cursor: UUID | None
 
 
 class ProvenanceEdgeResponse(BaseModel):
@@ -277,6 +279,7 @@ class EvidenceProjectionService:
         authentication: AuthenticatedSession,
         *,
         limit: int = 100,
+        after: UUID | None = None,
     ) -> TaskEvidenceProjectionView:
         limit = _bounded_limit(limit)
         now = self._clock()
@@ -291,6 +294,7 @@ class EvidenceProjectionService:
                 limit=limit + 1,
                 browser_authentication=authentication,
                 now=now,
+                after=after,
             )
             fetched_full_page = len(records) > limit
             authorized = tuple(
@@ -309,7 +313,12 @@ class EvidenceProjectionService:
                 view="task-projections",
                 now=now,
             )
-            return TaskEvidenceProjectionView(task_id, projections, truncated)
+            return TaskEvidenceProjectionView(
+                task_id,
+                projections,
+                truncated,
+                selected[-1].id if truncated and selected else None,
+            )
 
     def task_projections_internal(
         self,
@@ -317,6 +326,7 @@ class EvidenceProjectionService:
         *,
         actor_id: str,
         limit: int = 100,
+        after: UUID | None = None,
     ) -> TaskEvidenceProjectionView:
         """Trusted worker view, including INTERNAL CI and review evidence."""
 
@@ -326,7 +336,9 @@ class EvidenceProjectionService:
             task = session.get(Task, task_id)
             if task is None:
                 raise EvidenceNotFoundError("task evidence is unavailable")
-            records = self._task_records(session, task, limit=limit + 1)
+            records = self._task_records(
+                session, task, limit=limit + 1, after=after
+            )
             truncated = len(records) > limit
             selected = records[:limit]
             projections = self._project(session, selected)
@@ -338,7 +350,12 @@ class EvidenceProjectionService:
                 view="internal-task-projections",
                 now=now,
             )
-            return TaskEvidenceProjectionView(task_id, projections, truncated)
+            return TaskEvidenceProjectionView(
+                task_id,
+                projections,
+                truncated,
+                selected[-1].id if truncated and selected else None,
+            )
 
     def provenance(
         self,
@@ -428,6 +445,7 @@ class EvidenceProjectionService:
         limit: int,
         browser_authentication: AuthenticatedSession | None = None,
         now: datetime | None = None,
+        after: UUID | None = None,
     ) -> tuple[EvidenceRecord, ...]:
         referenced_ids = select(TaskEventEvidenceReference.evidence_id).where(
             TaskEventEvidenceReference.task_id == task.id
@@ -458,6 +476,24 @@ class EvidenceProjectionService:
                         EvidenceRecord.access_classification
                         == EvidenceAccessClass.TASK_OWNER.value,
                         EvidenceRecord.task_id == task.id,
+                    ),
+                )
+            )
+        if after is not None:
+            cursor = session.scalar(
+                select(EvidenceRecord).where(
+                    EvidenceRecord.id == after,
+                    *filters,
+                )
+            )
+            if cursor is None:
+                raise EvidenceNotFoundError("evidence projection cursor is unavailable")
+            filters.append(
+                or_(
+                    EvidenceRecord.captured_at > cursor.captured_at,
+                    and_(
+                        EvidenceRecord.captured_at == cursor.captured_at,
+                        EvidenceRecord.id > cursor.id,
                     ),
                 )
             )
@@ -513,7 +549,11 @@ class EvidenceProjectionService:
             content_hash = hash_value
             content = loaded.content
 
-        deleted_at = tombstone.deleted_at if tombstone is not None else None
+        deleted_at = (
+            normalize_evidence_timestamp(tombstone.deleted_at)
+            if tombstone is not None
+            else None
+        )
         deletion_reason = (
             tombstone.reason_code
             if tombstone is not None
@@ -531,7 +571,7 @@ class EvidenceProjectionService:
             actor_id=record.actor_id,
             task_id=record.task_id,
             validation_run_id=record.validation_run_id,
-            captured_at=record.captured_at,
+            captured_at=normalize_evidence_timestamp(record.captured_at),
             root_correlation_id=record.root_correlation_id,
             causation_id=record.causation_id,
             parent_correlation_id=record.parent_correlation_id,
@@ -554,7 +594,9 @@ class EvidenceProjectionService:
                     derivative_id=derivative.id,
                     derivative_type=derivative.derivative_type,
                     content_hash=derivative.content_hash,
-                    captured_at=derivative.captured_at,
+                    captured_at=normalize_evidence_timestamp(
+                        derivative.captured_at
+                    ),
                     status=(
                         EvidenceDerivativeStatus.DELETED
                         if derivative.deleted_at is not None
@@ -619,7 +661,7 @@ class EvidenceProjectionService:
                     task_id=event.task_id,
                     sequence=event.sequence,
                     event_type=event.event_type,
-                    occurred_at=event.occurred_at,
+                    occurred_at=normalize_evidence_timestamp(event.occurred_at),
                 )
             )
         return _ProjectionState(
@@ -674,22 +716,36 @@ class EvidenceProjectionService:
                 for record in frontier
                 if record.parent_correlation_id is not None
             )
-            related = tuple(
+            direct_related = tuple(
                 session.scalars(
                     select(EvidenceRecord).where(
                         EvidenceRecord.owner_id == root.owner_id,
+                        EvidenceRecord.id.in_(relation_ids),
+                    )
+                )
+            )
+            remaining_capacity = limit - len(nodes)
+            children = tuple(
+                session.scalars(
+                    select(EvidenceRecord)
+                    .where(
+                        EvidenceRecord.owner_id == root.owner_id,
                         or_(
-                            EvidenceRecord.id.in_(relation_ids),
                             EvidenceRecord.correction_of_id.in_(frontier_ids),
                             EvidenceRecord.parent_correlation_id.in_(frontier_ids),
                         ),
                     )
+                    .order_by(EvidenceRecord.captured_at, EvidenceRecord.id)
+                    .limit(remaining_capacity + 1)
                 )
             )
-            for record in frontier:
-                for candidate in related:
-                    if candidate.id != record.id:
-                        queue.append(candidate)
+            related = tuple(
+                {record.id: record for record in (*direct_related, *children)}.values()
+            )
+            for candidate in related:
+                if candidate.id not in frontier_ids:
+                    queue.append(candidate)
+                for record in frontier:
                     _add_relation_edges(edges, record, candidate)
         visible = set(nodes)
         visible_edges = tuple(
@@ -754,7 +810,8 @@ def _classify(
     references: tuple[TaskEventReferenceProjection, ...],
 ) -> EvidenceProjectionClass:
     evidence_type = record.evidence_type.lower()
-    event_name = content.get("event_name") if isinstance(content, dict) else None
+    event_name_value = content.get("event_name") if isinstance(content, dict) else None
+    event_name = event_name_value if isinstance(event_name_value, str) else None
     event_types = {reference.event_type for reference in references}
     if event_name in {
             "check_run",
@@ -829,9 +886,15 @@ def create_evidence_projection_router(service: EvidenceProjectionService) -> API
         response: Response,
         authentication: AuthenticatedEvidenceSession,
         limit: Annotated[int, Query(ge=1, le=MAX_PROJECTION_RESULTS)] = 100,
+        after: UUID | None = None,
     ) -> TaskEvidenceProjectionResponse:
         try:
-            result = service.task_projections(task_id, authentication, limit=limit)
+            result = service.task_projections(
+                task_id,
+                authentication,
+                limit=limit,
+                after=after,
+            )
         except EvidenceError as error:
             raise _http_error(error) from None
         response.headers["Cache-Control"] = "no-store"
