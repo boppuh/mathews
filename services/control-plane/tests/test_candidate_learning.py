@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
+from mathews_control_plane.approvals import ApprovalService
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.authentication import AuthenticatedSession
 from mathews_control_plane.candidate_learning import (
     NON_AUTHORITATIVE,
     CandidateLearningError,
@@ -26,7 +28,9 @@ from mathews_control_plane.database import (
 )
 from mathews_control_plane.domain_models import (
     ApprovalRequest,
+    EvidenceDeletionRequest,
     EvidenceDerivative,
+    EvidenceDerivativeCitation,
     EvidenceRecord,
     PolicyVersion,
     PolicyVersionPromptTemplate,
@@ -42,6 +46,7 @@ from mathews_control_plane.evidence import (
     EvidenceAccessClass,
     EvidenceRetentionClass,
     EvidenceSourceKind,
+    _finalize_deletion,
     capture_evidence,
     load_evidence_derivative,
 )
@@ -186,6 +191,13 @@ def test_cited_summary_is_redacted_non_authoritative_and_replayable(
     with learning_harness.factory() as session:
         derivative = session.get(EvidenceDerivative, summary_id)
         assert derivative is not None
+        lineage = tuple(
+            session.scalars(
+                select(EvidenceDerivativeCitation)
+                .where(EvidenceDerivativeCitation.derivative_id == summary_id)
+                .order_by(EvidenceDerivativeCitation.created_at, EvidenceDerivativeCitation.id)
+            )
+        )
         content = load_evidence_derivative(
             session,
             learning_harness.store,
@@ -201,6 +213,9 @@ def test_cited_summary_is_redacted_non_authoritative_and_replayable(
         str(value) for value in learning_harness.source_ids
     ]
     assert len(cast(str, content["summary_fingerprint"])) == 64
+    assert {item.evidence_id: item.source_hash for item in lineage} == dict(
+        zip(learning_harness.source_ids, created.source_hashes, strict=True)
+    )
 
 
 def test_rule_candidate_cannot_create_authority_or_approval(
@@ -251,6 +266,28 @@ def test_rule_candidate_cannot_create_authority_or_approval(
         ):
             assert session.scalar(select(func.count()).select_from(model)) == 0
 
+    inbox = ApprovalService(
+        learning_harness.factory,
+        learning_harness.store,
+        clock=lambda: _NOW,
+    ).inbox(
+        AuthenticatedSession(
+            session_id=uuid4(),
+            user_id=1,
+            csrf_token_digest=b"test",
+            expires_at=_NOW + timedelta(hours=1),
+            absolute_expires_at=_NOW + timedelta(hours=1),
+            reauthenticated_until=_NOW + timedelta(hours=1),
+            evaluated_at=_NOW,
+            recent_password_verified=True,
+        )
+    )
+    assert inbox.approvals == []
+    assert len(inbox.rule_candidates) == 1
+    assert inbox.rule_candidates[0].candidate_id == candidate_id
+    assert inbox.rule_candidates[0].approval_request_id is None
+    assert inbox.rule_candidates[0].authority == NON_AUTHORITATIVE
+
 
 def test_summary_id_conflict_and_cross_task_citations_fail_closed(
     learning_harness: LearningHarness,
@@ -265,6 +302,7 @@ def test_summary_id_conflict_and_cross_task_citations_fail_closed(
     )
 
     with pytest.raises(CandidateLearningError, match="LEARNING_SUMMARY_CONFLICT"):
+        artifact_count = sum(path.is_file() for path in learning_harness.store.root.rglob("*"))
         service.create_summary(
             learning_harness.task_id,
             summary_id=summary_id,
@@ -273,6 +311,7 @@ def test_summary_id_conflict_and_cross_task_citations_fail_closed(
             ),
             actor_id="candidate-learning",
         )
+    assert sum(path.is_file() for path in learning_harness.store.root.rglob("*")) == artifact_count
 
     other_task_id = uuid4()
     with learning_harness.factory.begin() as session:
@@ -339,3 +378,93 @@ def test_corrected_source_revokes_summary_and_candidate_eligibility(
             draft=_candidate(summary_id),
             actor_id="candidate-learning",
         )
+
+
+def test_inaccessible_source_cannot_be_cited(
+    learning_harness: LearningHarness,
+) -> None:
+    with learning_harness.factory.begin() as session:
+        source = session.get(EvidenceRecord, learning_harness.source_ids[0])
+        assert source is not None
+        source.access_classification = EvidenceAccessClass.INTERNAL.value
+
+    with pytest.raises(CandidateLearningError, match="LEARNING_CITATION_UNAVAILABLE"):
+        _service(learning_harness).create_summary(
+            learning_harness.task_id,
+            summary_id=uuid4(),
+            draft=_summary(learning_harness),
+            actor_id="candidate-learning",
+        )
+
+
+def test_deleting_any_cited_source_destroys_the_summary(
+    learning_harness: LearningHarness,
+) -> None:
+    summary_id = uuid4()
+    _service(learning_harness).create_summary(
+        learning_harness.task_id,
+        summary_id=summary_id,
+        draft=_summary(learning_harness),
+        actor_id="candidate-learning",
+    )
+    with learning_harness.factory.begin() as session:
+        source = session.get(EvidenceRecord, learning_harness.source_ids[1])
+        assert source is not None
+        deletion = EvidenceDeletionRequest(
+            evidence_id=source.id,
+            reason_code="SOURCE_REVOKED",
+            requested_at=_NOW,
+            owner_id=source.owner_id,
+            actor_id="candidate-learning",
+            root_correlation_id=source.root_correlation_id,
+            causation_id=source.id,
+            parent_correlation_id=source.parent_correlation_id,
+        )
+        session.add(deletion)
+        session.flush()
+        _finalize_deletion(
+            session,
+            learning_harness.store,
+            deletion_request_id=deletion.id,
+            now=_NOW,
+        )
+
+    with learning_harness.factory() as session:
+        derivative = session.get(EvidenceDerivative, summary_id)
+        assert derivative is not None
+        assert derivative.content_address is None
+        assert derivative.deleted_at is not None
+        assert derivative.deleted_at.replace(tzinfo=UTC) == _NOW
+
+
+def test_candidate_replay_preserves_a_terminal_review_status(
+    learning_harness: LearningHarness,
+) -> None:
+    service = _service(learning_harness)
+    summary_id = uuid4()
+    candidate_id = uuid4()
+    service.create_summary(
+        learning_harness.task_id,
+        summary_id=summary_id,
+        draft=_summary(learning_harness),
+        actor_id="candidate-learning",
+    )
+    service.create_rule_candidate(
+        learning_harness.task_id,
+        candidate_id=candidate_id,
+        draft=_candidate(summary_id),
+        actor_id="candidate-learning",
+    )
+    with learning_harness.factory.begin() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+        assert candidate is not None
+        candidate.status = RuleCandidateStatus.REJECTED
+
+    replayed = service.create_rule_candidate(
+        learning_harness.task_id,
+        candidate_id=candidate_id,
+        draft=_candidate(summary_id),
+        actor_id="candidate-learning",
+    )
+    assert replayed.replayed
+    assert replayed.status is RuleCandidateStatus.REJECTED

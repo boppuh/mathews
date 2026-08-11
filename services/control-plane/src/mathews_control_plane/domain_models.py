@@ -629,6 +629,36 @@ class EvidenceDerivative(RecordContext, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class EvidenceDerivativeCitation(RecordContext, Base):
+    """Exact source lineage for a multi-source rebuildable derivative."""
+
+    __tablename__ = "evidence_derivative_citations"
+    __table_args__ = (
+        UniqueConstraint(
+            "derivative_id",
+            "evidence_id",
+            name="uq_evidence_derivative_citation_source",
+        ),
+        CheckConstraint(
+            "length(source_hash) = 71",
+            name="source_hash_length",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    derivative_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_derivatives.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+
+
 class TaskEventEvidenceReference(RecordContext, Base):
     """Ordered, task-bound evidence provenance for one transition event."""
 

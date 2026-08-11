@@ -73,7 +73,9 @@ export interface ApprovalInboxItem {
 
 export interface RuleInboxItem {
   candidate_id: string;
-  approval_request_id: string;
+  approval_request_id: string | null;
+  authority: "NON_AUTHORITATIVE";
+  status: "EVALUATED";
   task: ApprovalTask;
   proposed_rule: string;
   recurrence_assessment: string;
@@ -353,13 +355,18 @@ function parseRule(value: unknown): RuleInboxItem {
     !isBoundedString(value.severity_assessment, 100) ||
     !isBoundedString(value.lineage_key, 255) ||
     !isBoundedString(value.permitted_action, 255) ||
-    !isBoundedString(value.risk_class, 100)
+    !isBoundedString(value.risk_class, 100) ||
+    value.authority !== "NON_AUTHORITATIVE" ||
+    value.status !== "EVALUATED"
   ) {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   return {
     candidate_id: parseUuid(value.candidate_id),
-    approval_request_id: parseUuid(value.approval_request_id),
+    approval_request_id:
+      value.approval_request_id === null ? null : parseUuid(value.approval_request_id),
+    authority: value.authority,
+    status: value.status,
     task: parseTask(value.task),
     proposed_rule: value.proposed_rule,
     recurrence_assessment: value.recurrence_assessment,
@@ -387,6 +394,7 @@ export function parseApprovalInbox(value: unknown): ApprovalInboxResponse {
   const byId = new Map(approvals.map((approval) => [approval.id, approval]));
   const ruleCandidates = value.rule_candidates.map(parseRule);
   for (const rule of ruleCandidates) {
+    if (rule.approval_request_id === null) continue;
     const approval = byId.get(rule.approval_request_id);
     if (
       approval?.request_type !== "REVIEW_RULE" ||

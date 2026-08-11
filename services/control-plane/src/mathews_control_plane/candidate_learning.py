@@ -14,7 +14,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from mathews_control_plane.artifacts import ArtifactStore
@@ -22,12 +22,14 @@ from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
     EvidenceDeletionRequest,
     EvidenceDerivative,
+    EvidenceDerivativeCitation,
     EvidenceRecord,
     RuleCandidate,
     RuleCandidateStatus,
     Task,
 )
 from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
     EvidenceError,
     load_evidence,
     load_evidence_derivative,
@@ -192,6 +194,7 @@ class CandidateLearningService:
     ) -> CitedSummaryResult:
         actor = _identifier(actor_id, "learning actor")
         now = normalize_evidence_timestamp(self._clock())
+        artifact_addresses: list[str] = []
         try:
             with self._factory.begin() as session:
                 task = _task(session, task_id)
@@ -212,7 +215,7 @@ class CandidateLearningService:
                 )
                 source_hashes = tuple(record.content_hash for record in records)
                 payload = _summary_payload(task.id, draft, source_hashes)
-                register_evidence_derivative(
+                derivative = register_evidence_derivative(
                     session,
                     self._store,
                     evidence_id=records[0].id,
@@ -222,7 +225,24 @@ class CandidateLearningService:
                     actor_id=actor,
                     derivative_id=summary_id,
                     captured_at=now,
+                    artifact_observer=artifact_addresses.append,
                 )
+                session.add_all(
+                    EvidenceDerivativeCitation(
+                        derivative_id=derivative.id,
+                        evidence_id=record.id,
+                        source_hash=record.content_hash,
+                        owner_id=task.owner_id,
+                        actor_id=actor,
+                        root_correlation_id=task.root_correlation_id,
+                        causation_id=derivative.id,
+                        parent_correlation_id=record.id,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    for record in records
+                )
+                session.flush()
                 return CitedSummaryResult(
                     task.id,
                     summary_id,
@@ -230,7 +250,30 @@ class CandidateLearningService:
                     source_hashes,
                 )
         except IntegrityError:
+            self._delete_unreferenced_artifact(
+                artifact_addresses[-1] if artifact_addresses else None
+            )
             raise CandidateLearningError("LEARNING_SUMMARY_CONFLICT") from None
+        except SQLAlchemyError:
+            self._delete_unreferenced_artifact(
+                artifact_addresses[-1] if artifact_addresses else None
+            )
+            raise CandidateLearningError("LEARNING_SUMMARY_PERSISTENCE_FAILED") from None
+
+    def _delete_unreferenced_artifact(self, address: str | None) -> None:
+        if address is None:
+            return
+        with self._factory() as session:
+            referenced = session.scalar(
+                select(EvidenceDerivative.id)
+                .where(
+                    EvidenceDerivative.content_address == address,
+                    EvidenceDerivative.deleted_at.is_(None),
+                )
+                .limit(1)
+            )
+        if referenced is None:
+            self._store.delete_bytes(address)
 
     def create_rule_candidate(
         self,
@@ -313,7 +356,9 @@ def _citation_records(
 ) -> tuple[EvidenceRecord, ...]:
     records = tuple(
         session.scalars(
-            select(EvidenceRecord).where(EvidenceRecord.id.in_(evidence_ids))
+            select(EvidenceRecord)
+            .where(EvidenceRecord.id.in_(evidence_ids))
+            .with_for_update()
         )
     )
     by_id = {record.id: record for record in records}
@@ -340,6 +385,11 @@ def _citation_records(
             or record.owner_id != task.owner_id
             or record.root_correlation_id != task.root_correlation_id
             or record.deleted_at is not None
+            or record.access_classification
+            not in {
+                EvidenceAccessClass.TASK_OWNER.value,
+                EvidenceAccessClass.OWNER.value,
+            }
             or record.id in corrected
             or record.id in deletion_requested
         ):
@@ -427,9 +477,22 @@ def _validated_summary(
         raise CandidateLearningError("LEARNING_SUMMARY_INVALID") from None
     records = _citation_records(session, store, task, ids)
     current_hashes = tuple(record.content_hash for record in records)
+    lineage = tuple(
+        session.scalars(
+            select(EvidenceDerivativeCitation)
+            .where(EvidenceDerivativeCitation.derivative_id == summary.id)
+            .order_by(EvidenceDerivativeCitation.created_at, EvidenceDerivativeCitation.id)
+        )
+    )
+    lineage_hashes = {
+        item.evidence_id: item.source_hash
+        for item in lineage
+    }
     identity = {key: value for key, value in content.items() if key != "summary_fingerprint"}
     if (
         tuple(hashes) != current_hashes
+        or lineage_hashes
+        != dict(zip(ids, current_hashes, strict=True))
         or content.get("summary_fingerprint") != _fingerprint(identity)
     ):
         raise CandidateLearningError("LEARNING_SUMMARY_STALE")
@@ -477,7 +540,12 @@ def _require_same_candidate(
         or candidate.severity_assessment != draft.severity_assessment
         or candidate.false_positive_risks != list(draft.false_positive_risks)
         or candidate.evaluation_result != expected_evaluation
-        or candidate.status is not RuleCandidateStatus.EVALUATED
+        or candidate.status
+        not in {
+            RuleCandidateStatus.EVALUATED,
+            RuleCandidateStatus.APPROVED,
+            RuleCandidateStatus.REJECTED,
+        }
     ):
         raise CandidateLearningError("RULE_CANDIDATE_CONFLICT")
 

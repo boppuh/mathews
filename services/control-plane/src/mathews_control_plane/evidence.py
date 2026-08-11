@@ -32,6 +32,7 @@ from mathews_control_plane.domain_models import (
     EvidenceAuditEvent,
     EvidenceDeletionRequest,
     EvidenceDerivative,
+    EvidenceDerivativeCitation,
     EvidenceRecord,
     EvidenceTombstone,
     RetrievalIndexChunk,
@@ -1093,6 +1094,7 @@ def register_evidence_derivative(
     derivative_id: UUID | None = None,
     captured_at: datetime | None = None,
     secrets: Sequence[SecretValue] = (),
+    artifact_observer: Callable[[str], None] | None = None,
 ) -> EvidenceDerivative:
     """Register rebuildable content so source deletion can destroy it."""
 
@@ -1122,6 +1124,8 @@ def register_evidence_derivative(
         "content": prepared.value,
     }
     artifact = artifact_store.put_bytes(_canonical_json_bytes(derivative_envelope))
+    if artifact_observer is not None:
+        artifact_observer(artifact.address)
     derivative = EvidenceDerivative(
         id=resolved_derivative_id,
         evidence_id=record.id,
@@ -1288,7 +1292,7 @@ def _finalize_deletion(
     )
     if record is None:
         raise EvidenceNotFoundError("evidence is unavailable")
-    derivatives = list(
+    direct_derivatives = tuple(
         session.scalars(
             select(EvidenceDerivative)
             .where(
@@ -1298,6 +1302,25 @@ def _finalize_deletion(
             .with_for_update()
         )
     )
+    cited_derivatives = tuple(
+        session.scalars(
+            select(EvidenceDerivative)
+            .join(
+                EvidenceDerivativeCitation,
+                EvidenceDerivativeCitation.derivative_id == EvidenceDerivative.id,
+            )
+            .where(
+                EvidenceDerivativeCitation.evidence_id == record.id,
+                EvidenceDerivative.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+    )
+    unique_derivatives = {
+        derivative.id: derivative
+        for derivative in (*direct_derivatives, *cited_derivatives)
+    }
+    derivatives = list(unique_derivatives.values())
     for derivative in derivatives:
         destroy_evidence_derivative(
             artifact_store,

@@ -51,6 +51,7 @@ from mathews_control_plane.domain_models import (
     TaskEventEvidenceReference,
     TaskState,
 )
+from mathews_control_plane.evidence import EvidenceAccessClass
 from mathews_control_plane.task_state_machine import (
     TaskTransitionError,
     TaskTransitionGateEvaluator,
@@ -209,7 +210,9 @@ class ApprovalInboxItem(BaseModel):
 
 class RuleInboxItem(BaseModel):
     candidate_id: UUID
-    approval_request_id: UUID
+    approval_request_id: UUID | None
+    authority: Literal["NON_AUTHORITATIVE"] = "NON_AUTHORITATIVE"
+    status: Literal["EVALUATED"] = "EVALUATED"
     task: ApprovalTaskSummary
     proposed_rule: str
     recurrence_assessment: str
@@ -891,6 +894,15 @@ def _candidate_evidence_ids(
             EvidenceRecord.deleted_at.is_(None),
         )
     ).all()
+    if any(
+        record.access_classification
+        not in {
+            EvidenceAccessClass.TASK_OWNER.value,
+            EvidenceAccessClass.OWNER.value,
+        }
+        for record in records
+    ):
+        raise ApprovalConflictError("rule candidate evidence is unavailable")
     invalidated_ids = set(
         session.scalars(
             select(EvidenceRecord.correction_of_id).where(
@@ -1363,6 +1375,56 @@ class ApprovalService:
                             field="rule candidate risks",
                         ),
                         cited_evidence_ids=cited_evidence_ids,
+                        lineage_key=rule.lineage_key,
+                        permitted_action=rule.permitted_action,
+                        risk_class=rule.risk_class,
+                        scope=rule.scope,
+                        matcher=rule.matcher,
+                        evidence_requirements=rule.evidence_requirements,
+                    )
+                )
+            projected_candidate_ids = {item.candidate_id for item in rule_candidates}
+            candidate_rows = session.execute(
+                select(RuleCandidate, Task)
+                .join(Task, Task.id == RuleCandidate.task_id)
+                .where(
+                    RuleCandidate.owner_id == owner_id,
+                    Task.owner_id == owner_id,
+                    RuleCandidate.status == RuleCandidateStatus.EVALUATED,
+                )
+                .order_by(RuleCandidate.created_at, RuleCandidate.id)
+            ).all()
+            for candidate, task in candidate_rows:
+                if candidate.id in projected_candidate_ids:
+                    continue
+                try:
+                    rule, candidate_evidence_ids, _candidate_fingerprint = (
+                        _validated_rule_candidate(session, task, candidate)
+                    )
+                except ApprovalConflictError:
+                    _LOGGER.warning(
+                        "Skipped invalid candidate-only rule %s",
+                        candidate.id,
+                    )
+                    continue
+                rule_candidates.append(
+                    RuleInboxItem(
+                        candidate_id=candidate.id,
+                        approval_request_id=None,
+                        task=ApprovalTaskSummary(
+                            id=task.id,
+                            summary=task.summary,
+                            repository=task.repository,
+                            cockpit_path=f"/tasks/{task.id}",
+                        ),
+                        proposed_rule=candidate.proposed_rule,
+                        recurrence_assessment=candidate.recurrence_assessment,
+                        severity_assessment=candidate.severity_assessment,
+                        false_positive_risks=_stored_string_list(
+                            candidate.false_positive_risks,
+                            field="rule candidate risks",
+                        ),
+                        cited_evidence_ids=list(candidate_evidence_ids),
                         lineage_key=rule.lineage_key,
                         permitted_action=rule.permitted_action,
                         risk_class=rule.risk_class,

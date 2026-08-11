@@ -764,9 +764,11 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
             ],
             "rule_candidates": [
                 {
-                    "candidate_id": str(candidate_id),
-                    "approval_request_id": str(request_id),
-                    "task": {
+                        "candidate_id": str(candidate_id),
+                        "approval_request_id": str(request_id),
+                        "authority": "NON_AUTHORITATIVE",
+                        "status": "EVALUATED",
+                        "task": {
                         "id": str(task_id),
                         "summary": "Implement approvals",
                         "repository": "boppuh/mathews",

@@ -62,6 +62,7 @@ EXPECTED_HEAD_TABLES = {
     "evidence_audit_events",
     "evidence_deletion_requests",
     "evidence_derivatives",
+    "evidence_derivative_citations",
     "evidence_records",
     "evidence_tombstones",
     "evaluation_contract_versions",
@@ -114,6 +115,7 @@ EVALUATION_TELEMETRY_TABLES = {
     "agent_run_evaluations",
     "evaluation_contract_versions",
 }
+CANDIDATE_LEARNING_TABLES = {"evidence_derivative_citations"}
 
 
 def _migration_config(database_url: str) -> Config:
@@ -1015,6 +1017,7 @@ def test_job_loop_migration_enforces_fenced_provenance_and_guarded_downgrade(
         - HERMES_TABLES
         - RETRIEVAL_INDEX_TABLES
         - EVALUATION_TELEMETRY_TABLES
+        - CANDIDATE_LEARNING_TABLES
     )
 
 
@@ -1177,6 +1180,7 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         - HERMES_TABLES
         - RETRIEVAL_INDEX_TABLES
         - EVALUATION_TELEMETRY_TABLES
+        - CANDIDATE_LEARNING_TABLES
     )
 
 
