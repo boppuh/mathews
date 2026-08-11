@@ -511,6 +511,20 @@ class GitHubAppCredentialBroker:
             self._revoke_installation_token(raw_token)
             raise
 
+    def revoke_installation_token(
+        self,
+        credential: GitHubInstallationCredential,
+    ) -> None:
+        """Revoke a credential minted by this exact repository broker."""
+
+        if (
+            not isinstance(credential, GitHubInstallationCredential)
+            or credential.repository_id != self._configuration.repository_id
+            or credential.repository_key != self._configuration.repository_key
+        ):
+            raise GitHubPermissionError("github credential repository mismatch")
+        self._revoke_installation_token(credential._token.reveal())
+
     def _app_jwt(self) -> str:
         now = _aware_utc(self._clock())
         claims: dict[str, int | str] = {

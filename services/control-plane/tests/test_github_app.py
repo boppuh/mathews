@@ -548,6 +548,24 @@ def test_installation_token_accepts_only_implicit_metadata_in_addition_to_purpos
     }
 
 
+def test_installation_token_can_be_explicitly_revoked_after_bounded_use() -> None:
+    purpose = GitHubCredentialPurpose.PULL_REQUEST_WRITE
+    transport = _token_transport(
+        _json_response(201, _token_response(purpose)),
+        cleanup=True,
+    )
+    broker, _signed = _broker(transport)
+    credential = broker.mint_installation_token(purpose)
+
+    broker.revoke_installation_token(credential)
+
+    assert transport.requests[-1].method == "DELETE"
+    assert transport.requests[-1].path == "/installation/token"
+    assert transport.requests[-1].headers["Authorization"] == (
+        "Bearer ghs_test_installation_token"
+    )
+
+
 def test_real_signer_uses_rs256_with_bounded_github_claims() -> None:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     private_pem = private_key.private_bytes(
