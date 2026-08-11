@@ -39,6 +39,7 @@ from sqlalchemy import inspect, select
 from sqlalchemy.exc import IntegrityError
 
 EXPECTED_DOMAIN_TABLES = {
+    "agent_run_evaluations",
     "approval_requests",
     "background_job_checkpoints",
     "background_job_effects",
@@ -53,6 +54,7 @@ EXPECTED_DOMAIN_TABLES = {
     "evidence_derivatives",
     "evidence_records",
     "evidence_tombstones",
+    "evaluation_contract_versions",
     "hermes_tool_decisions",
     "hermes_tool_proposals",
     "hermes_tool_results",

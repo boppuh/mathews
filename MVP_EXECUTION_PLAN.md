@@ -34,11 +34,11 @@ complete here unless its backlog definition of done is satisfied on `main`.
   repair,
   `6.1` least-privilege GitHub App authentication, and `6.3` signed,
   idempotent CI and review webhook ingestion,
-  `7.1` verified-source projections and provenance views, and `7.2` rebuildable
-  retrieval index.
-- Remaining: 6 of 40 MVP tasks.
+  `7.1` verified-source projections and provenance views, `7.2` rebuildable
+  retrieval index, and `7.3` version-bound retrieval and prompt telemetry.
+- Remaining: 5 of 40 MVP tasks.
 - Active next wave: Wave 6 validation, repair, and evidence intelligence.
-- Next completion target: `7.3`.
+- Next completion target: `6.2`.
 
 ## Operating model
 

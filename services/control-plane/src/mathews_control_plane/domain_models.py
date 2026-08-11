@@ -752,6 +752,120 @@ class RetrievalIndexChunk(RecordContext, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class EvaluationContractVersion(RecordContext, Base):
+    """Immutable thresholds and regression cases for run evaluation."""
+
+    __tablename__ = "evaluation_contract_versions"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="version_positive"),
+        CheckConstraint(
+            "predecessor_id IS NULL OR predecessor_id <> id",
+            name="predecessor_not_self",
+        ),
+        CheckConstraint(
+            "active = false OR activated_at IS NOT NULL",
+            name="active_requires_timestamp",
+        ),
+        CheckConstraint("length(contract_fingerprint) = 64", name="fingerprint_length"),
+        UniqueConstraint("lineage_key", "version", name="uq_evaluation_contract_lineage_version"),
+        UniqueConstraint("lineage_key", "id", name="uq_evaluation_contract_lineage_id"),
+        ForeignKeyConstraint(
+            ["lineage_key", "predecessor_id"],
+            ["evaluation_contract_versions.lineage_key", "evaluation_contract_versions.id"],
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        Index(
+            "uq_evaluation_contract_active_lineage",
+            "lineage_key",
+            unique=True,
+            sqlite_where=text("active = true"),
+            postgresql_where=text("active = true"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    lineage_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    predecessor_id: Mapped[UUID | None] = mapped_column(Uuid)
+    promotion_thresholds: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    regression_cases: Mapped[list[object]] = mapped_column(JSON, nullable=False)
+    contract_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentRunEvaluation(RecordContext, Base):
+    """Immutable, version-bound retrieval and prompt telemetry for one run."""
+
+    __tablename__ = "agent_run_evaluations"
+    __table_args__ = (
+        CheckConstraint("input_tokens >= 0", name="input_tokens_non_negative"),
+        CheckConstraint("output_tokens >= 0", name="output_tokens_non_negative"),
+        CheckConstraint("cached_tokens >= 0", name="cached_tokens_non_negative"),
+        CheckConstraint("cached_tokens <= input_tokens", name="cached_tokens_bounded"),
+        CheckConstraint("total_tokens >= 0", name="total_tokens_non_negative"),
+        CheckConstraint(
+            "total_tokens = input_tokens + output_tokens",
+            name="total_tokens_consistent",
+        ),
+        CheckConstraint("cost_microusd >= 0", name="cost_non_negative"),
+        CheckConstraint(
+            "quality_score >= 0 AND quality_score <= 1",
+            name="quality_score_bounded",
+        ),
+        CheckConstraint("length(evaluation_fingerprint) = 64", name="fingerprint_length"),
+        UniqueConstraint("run_id", name="uq_agent_run_evaluations_run"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("hermes_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    evaluation_contract_version_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evaluation_contract_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    retrieval_generation_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("retrieval_index_generations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    retrieval_index_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    retrieval_chunker_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    retrieval_verifier_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    retrieval_set: Mapped[list[object]] = mapped_column(JSON, nullable=False)
+    prompt_template_version_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("prompt_template_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    prompt_template_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    policy_version_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("policy_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    model_provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    cached_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    quality_outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    quality_score: Mapped[float] = mapped_column(Float, nullable=False)
+    regression_results: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    evaluation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ValidationContract(RecordContext, Base):
     """Immutable validation definition bound to exact brief and repository versions."""
 

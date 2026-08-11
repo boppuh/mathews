@@ -44,6 +44,7 @@ from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 EXPECTED_HEAD_TABLES = {
+    "agent_run_evaluations",
     "alembic_version",
     "approval_requests",
     "auth_sessions",
@@ -63,6 +64,7 @@ EXPECTED_HEAD_TABLES = {
     "evidence_derivatives",
     "evidence_records",
     "evidence_tombstones",
+    "evaluation_contract_versions",
     "hermes_run_events",
     "hermes_runs",
     "hermes_tool_decisions",
@@ -107,6 +109,10 @@ HERMES_TABLES = {
 RETRIEVAL_INDEX_TABLES = {
     "retrieval_index_chunks",
     "retrieval_index_generations",
+}
+EVALUATION_TELEMETRY_TABLES = {
+    "agent_run_evaluations",
+    "evaluation_contract_versions",
 }
 
 
@@ -1008,6 +1014,7 @@ def test_job_loop_migration_enforces_fenced_provenance_and_guarded_downgrade(
         - RELIABILITY_TABLES
         - HERMES_TABLES
         - RETRIEVAL_INDEX_TABLES
+        - EVALUATION_TELEMETRY_TABLES
     )
 
 
@@ -1166,7 +1173,10 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
     ):
         command.downgrade(config, "0007")
     assert _table_names(database_url) == (
-        EXPECTED_HEAD_TABLES - HERMES_TABLES - RETRIEVAL_INDEX_TABLES
+        EXPECTED_HEAD_TABLES
+        - HERMES_TABLES
+        - RETRIEVAL_INDEX_TABLES
+        - EVALUATION_TELEMETRY_TABLES
     )
 
 

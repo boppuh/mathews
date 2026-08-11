@@ -32,6 +32,7 @@ from mathews_control_plane.database import (
     create_session_factory,
 )
 from mathews_control_plane.domain_models import ReconciliationTargetKind
+from mathews_control_plane.evaluation_telemetry import EvaluationTelemetryService
 from mathews_control_plane.evidence import (
     EvidenceBodyLimitMiddleware,
     EvidenceService,
@@ -108,6 +109,7 @@ def create_app(
     evidence_service: EvidenceService | None = None,
     evidence_projection_service: EvidenceProjectionService | None = None,
     retrieval_index_service: RetrievalIndexService | None = None,
+    evaluation_telemetry_service: EvaluationTelemetryService | None = None,
     task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
     repository_service: RepositoryService | None = None,
@@ -159,6 +161,8 @@ def create_app(
             artifact_store,
             evidence_projection_service,
         )
+    if evaluation_telemetry_service is None:
+        evaluation_telemetry_service = EvaluationTelemetryService(session_factory)
     if task_service is None:
         task_service = TaskService(
             session_factory,
@@ -319,6 +323,7 @@ def create_app(
     application.state.evidence_service = evidence_service
     application.state.evidence_projection_service = evidence_projection_service
     application.state.retrieval_index_service = retrieval_index_service
+    application.state.evaluation_telemetry_service = evaluation_telemetry_service
     application.state.task_service = task_service
     application.state.approval_service = approval_service
     application.state.repository_service = repository_service
