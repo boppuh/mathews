@@ -458,7 +458,12 @@ class GitWorkspaceLifecycle:
             before = self._git_boundary_state(ownership, configuration)
             if before["head_sha"] != expected_head_sha:
                 raise WorkspaceLifecycleError("HEAD_MISMATCH")
-            if expected_head_sha != ownership.base_sha:
+            # This legacy code now rejects heads matching neither the frozen base
+            # nor the current host-owned candidate.
+            if expected_head_sha not in {
+                ownership.base_sha,
+                ownership.candidate_head_sha,
+            }:
                 raise WorkspaceLifecycleError("CANDIDATE_PARENT_NOT_FROZEN_BASE")
             changed_paths = self._changed_paths(ownership)
             if not changed_paths:
@@ -474,6 +479,7 @@ class GitWorkspaceLifecycle:
             candidate_head_sha, staged_paths = self._create_isolated_commit(
                 ownership,
                 expected_head_sha=expected_head_sha,
+                parent_sha=ownership.base_sha,
                 message=message,
                 changed_paths=changed_paths,
                 identity_environment=identity_environment,
@@ -527,7 +533,7 @@ class GitWorkspaceLifecycle:
                 not after["clean"]
                 or after["head_sha"] == expected_head_sha
                 or not isinstance(parents, list)
-                or parents != [expected_head_sha]
+                or parents != [ownership.base_sha]
             ):
                 if after["head_sha"] == candidate_head_sha:
                     self._run_git(
@@ -548,10 +554,12 @@ class GitWorkspaceLifecycle:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
             if after["head_sha"] != candidate_head_sha:
                 raise WorkspaceLifecycleError("CANDIDATE_COMMIT_INVALID")
+            candidate_changed_paths = self._candidate_history_paths(ownership)
+            self._assert_paths_allowed(candidate_changed_paths, configuration)
             return {
                 **after,
                 "committed": True,
-                "changed_paths": list(staged_paths),
+                "changed_paths": list(candidate_changed_paths),
             }
 
     def push_candidate(
@@ -897,6 +905,7 @@ class GitWorkspaceLifecycle:
         ownership: WorkspaceOwnership,
         *,
         expected_head_sha: str,
+        parent_sha: str,
         message: str,
         changed_paths: tuple[str, ...],
         identity_environment: Mapping[str, str],
@@ -959,7 +968,7 @@ class GitWorkspaceLifecycle:
                         "commit-tree",
                         tree_sha,
                         "-p",
-                        expected_head_sha,
+                        parent_sha,
                         "-m",
                         message,
                         failure_code="GIT_COMMIT_FAILED",

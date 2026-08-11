@@ -132,6 +132,7 @@ def test_worker_registers_validation_evidence_handler_with_host_gateway(
         assert set(worker._handlers) == {
             "github-webhook",
             "hermes-run",
+            "validation-repair",
             "validation-evidence",
             "validation-evidence-v2",
         }

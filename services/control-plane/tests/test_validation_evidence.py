@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from typing import cast
 from uuid import UUID, uuid4
 
+import mathews_control_plane.repair_loop as repair_loop_module
 import mathews_control_plane.validation_evidence as validation_evidence_module
 import pytest
 from mathews_configuration import (
@@ -18,8 +20,10 @@ from mathews_configuration import (
     OperationKind,
     TaskLeaseHostAuthority,
 )
+from mathews_control_plane.approvals import ApprovalConflictError, ApprovalService
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.background_jobs import (
+    BackgroundJobConflictError,
     BackgroundJobLeaseLostError,
     BackgroundJobService,
     JobLeaseGrant,
@@ -34,12 +38,17 @@ from mathews_control_plane.database import (
     create_session_factory,
 )
 from mathews_control_plane.domain_models import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ApprovalStatus,
     BackgroundJob,
     Brief,
     BriefApprovalDecision,
     BriefDecisionDisposition,
     EvidenceRecord,
     PolicyVersion,
+    PolicyVersionPromptTemplate,
+    PromptTemplateVersion,
     RepositoryConfiguration,
     Task,
     TaskEvent,
@@ -48,6 +57,21 @@ from mathews_control_plane.domain_models import (
     ValidationContract,
     ValidationOutcome,
     ValidationRun,
+)
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+)
+from mathews_control_plane.repair_loop import (
+    VALIDATION_REPAIR_JOB_TYPE,
+    VALIDATION_RERUN_REQUESTED_EVENT_TYPE,
+    RepairJobHandler,
+    RepairLoopError,
+    RepairScheduleResult,
+    RepairScheduleStatus,
+    ValidationRepairService,
 )
 from mathews_control_plane.tasks import _acceptance_criteria_response
 from mathews_control_plane.validation_decisioning import (
@@ -230,6 +254,40 @@ def _seed(factory: SessionFactory) -> tuple[UUID, UUID, UUID]:
         )
         session.add(policy)
         session.flush()
+        decision.policy_version_id = policy.id
+        prompt = PromptTemplateVersion(
+            lineage_key="mvp-implementer",
+            role="implementer",
+            version=1,
+            predecessor_id=None,
+            structured_template={
+                "schema_version": 1,
+                "role": "implementer",
+                "instructions": [
+                    "Repair only the cited validation failure within the accepted scope.",
+                    "Use the smallest change and leave validation decisions to the control plane.",
+                ],
+                "evidence_limit": 4,
+                "max_prompt_characters": 16000,
+            },
+            evaluation_threshold_passed=True,
+            regression_reviewed=True,
+            promoted=True,
+            approved_by="local-user",
+            approved_at=_NOW,
+            **_context(root_id),
+        )
+        session.add(prompt)
+        session.flush()
+        session.add(
+            PolicyVersionPromptTemplate(
+                policy_version_id=policy.id,
+                prompt_template_version_id=prompt.id,
+                prompt_promoted=True,
+                position=1,
+                **_context(root_id),
+            )
+        )
         session.add(
             TaskEvent(
                 task_id=task.id,
@@ -600,6 +658,548 @@ def test_candidate_change_invalidates_a_pending_pass_decision(
     assert decided.outcome is ValidationOutcome.BLOCKED
     assert decided.reason_code == "VALIDATION_BINDING_STALE"
     assert exact.is_current is False
+
+
+def test_failed_decision_schedules_one_evidence_backed_repair_job(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        collected.validation_run_id
+    )
+    service = ValidationRepairService(factory, store, clock=lambda: _NOW)
+
+    scheduled = service.schedule(collected.validation_run_id)
+    replayed = service.schedule(collected.validation_run_id)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.state = TaskState.REPAIRING
+    recovered_replay = service.schedule(collected.validation_run_id)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.state = TaskState.VALIDATING
+
+    assert scheduled.status is RepairScheduleStatus.SCHEDULED
+    assert scheduled.job_id is not None
+    assert scheduled.replayed is False
+    assert replayed.job_id == scheduled.job_id
+    assert replayed.replayed is True
+    assert recovered_replay.job_id == scheduled.job_id
+    assert recovered_replay.replayed is True
+    with factory() as session:
+        task = session.get(Task, task_id)
+        job = session.get(BackgroundJob, scheduled.job_id)
+        assert task is not None
+        assert task.state is TaskState.VALIDATING
+        assert task.retry_count == 0
+        assert job is not None
+        assert job.job_type == VALIDATION_REPAIR_JOB_TYPE
+        assert job.input_payload["validation_run_id"] == str(collected.validation_run_id)
+        prompt = cast(dict[str, object], job.input_payload["prompt"])
+        content = json.loads(cast(str, prompt["content"]))
+        assert content["role"] == "implementer"
+        assert len(content["verified_evidence"]) == 2
+
+
+def test_repair_budget_exhaustion_creates_resumable_retry_decision(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        collected.validation_run_id
+    )
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.retry_count = 2
+
+    result = ValidationRepairService(factory, store, clock=lambda: _NOW).schedule(
+        collected.validation_run_id
+    )
+
+    assert result.status is RepairScheduleStatus.ESCALATED
+    assert result.approval_request_id is not None
+    with factory() as session:
+        task = session.get(Task, task_id)
+        request = session.get(ApprovalRequest, result.approval_request_id)
+        assert task is not None
+        assert task.state is TaskState.ESCALATED
+        assert task.escalation_resume_state is TaskState.VALIDATING
+        assert request is not None
+        assert request.status is ApprovalStatus.PENDING
+        assert request.reason == "REPAIR_BUDGET_EXHAUSTED"
+        assert request.options == ["RETRY", "ABANDON", "CANCEL"]
+        retry = cast(dict[str, object], request.retry_history[0])
+        assert retry["error_code"] == "REPAIR_BUDGET_EXHAUSTED"
+
+    retry_decision_id = uuid4()
+    resumed = ApprovalService(factory, store, clock=lambda: _NOW).decide(
+        result.approval_request_id,
+        decision_id=retry_decision_id,
+        decision=ApprovalDecision.RETRY,
+        actor_id="local-user",
+    )
+    scheduled = ValidationRepairService(factory, store, clock=lambda: _NOW).schedule(
+        collected.validation_run_id
+    )
+
+    assert resumed.task_state is TaskState.VALIDATING
+    assert scheduled.status is RepairScheduleStatus.SCHEDULED
+    assert scheduled.job_id is not None
+    with factory() as session:
+        job = session.get(BackgroundJob, scheduled.job_id)
+        assert job is not None
+        assert job.input_payload["retry_approval_decision_id"] == str(
+            retry_decision_id
+        )
+
+    jobs = BackgroundJobService(factory, store, clock=lambda: _NOW)
+    grant = jobs.claim_next(
+        worker_id="approved-repair-worker",
+        lease_duration=timedelta(seconds=30),
+        job_types=(VALIDATION_REPAIR_JOB_TYPE,),
+    )
+    assert grant is not None
+
+    class ApprovedRetryHermes:
+        def __call__(
+            self,
+            context: LeasedJobContext,
+        ) -> Mapping[str, object] | None:
+            del context
+            raise TerminalBackgroundJobError("APPROVED_RETRY_TEST_STOP")
+
+    class UnusedHost:
+        def execute(self, _request: HostRequestMessage) -> HostResponseMessage:
+            raise AssertionError("the test stops before the Git boundary")
+
+    with pytest.raises(TerminalBackgroundJobError, match="APPROVED_RETRY_TEST_STOP"):
+        RepairJobHandler(
+            factory,
+            store,
+            UnusedHost(),
+            ApprovedRetryHermes(),
+            clock=lambda: _NOW,
+        )(LeasedJobContext(jobs, grant))
+    with factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        assert task.retry_count == 3
+        assert task.state is TaskState.FAILED
+
+
+def test_consumed_retry_decision_does_not_authorize_an_equivalent_failure(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    first_run = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        first_run.validation_run_id
+    )
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.retry_count = 2
+
+    service = ValidationRepairService(factory, store, clock=lambda: _NOW)
+    first_escalation = service.schedule(first_run.validation_run_id)
+    assert first_escalation.approval_request_id is not None
+    retry_decision_id = uuid4()
+    ApprovalService(factory, store, clock=lambda: _NOW).decide(
+        first_escalation.approval_request_id,
+        decision_id=retry_decision_id,
+        decision=ApprovalDecision.RETRY,
+        actor_id="local-user",
+    )
+    approved_retry = service.schedule(first_run.validation_run_id)
+    assert approved_retry.job_id is not None
+
+    next_run = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        next_run.validation_run_id
+    )
+    next_escalation = service.schedule(next_run.validation_run_id)
+
+    assert next_escalation.status is RepairScheduleStatus.ESCALATED
+    assert next_escalation.approval_request_id is not None
+    assert next_escalation.approval_request_id != first_escalation.approval_request_id
+    with factory() as session:
+        repair_jobs = tuple(
+            session.scalars(
+                select(BackgroundJob).where(
+                    BackgroundJob.task_id == task_id,
+                    BackgroundJob.job_type == VALIDATION_REPAIR_JOB_TYPE,
+                )
+            )
+        )
+        assert len(repair_jobs) == 1
+        assert repair_jobs[0].input_payload["retry_approval_decision_id"] == str(
+            retry_decision_id
+        )
+
+
+def test_equivalent_failure_escalates_instead_of_looping(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        collected.validation_run_id
+    )
+    service = ValidationRepairService(factory, store, clock=lambda: _NOW)
+    first = service.schedule(collected.validation_run_id)
+    assert first.job_id is not None
+    with factory.begin() as session:
+        prior = session.get(BackgroundJob, first.job_id)
+        assert prior is not None
+        prior_decision_id = UUID(cast(str, prior.input_payload["decision_evidence_id"]))
+        prior_manifest_id = UUID(cast(str, prior.input_payload["manifest_evidence_id"]))
+        checkpoint = session.scalar(
+            select(EvidenceRecord)
+            .where(
+                EvidenceRecord.task_id == task_id,
+                EvidenceRecord.id.not_in((prior_decision_id, prior_manifest_id)),
+            )
+            .order_by(EvidenceRecord.created_at, EvidenceRecord.id)
+            .limit(1)
+        )
+        assert checkpoint is not None
+        prior.input_payload = {
+            **prior.input_payload,
+            "validation_run_id": str(uuid4()),
+            "decision_evidence_id": str(checkpoint.id),
+        }
+
+    repeated = service.schedule(collected.validation_run_id)
+
+    assert repeated.status is RepairScheduleStatus.ESCALATED
+    assert repeated.approval_request_id is not None
+    with factory() as session:
+        request = session.get(ApprovalRequest, repeated.approval_request_id)
+        task = session.get(Task, task_id)
+        assert request is not None
+        assert request.reason == "EQUIVALENT_VALIDATION_FAILURE"
+        assert str(checkpoint.id) in request.supporting_evidence_ids
+        assert task is not None
+        assert task.state is TaskState.ESCALATED
+        assert task.escalation_resume_state is TaskState.VALIDATING
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_reason"),
+    (
+        (RepairLoopError("REPAIR_CONTEXT_STALE"), "UNSCHEDULED", "REPAIR_CONTEXT_STALE"),
+        (
+            ApprovalConflictError("pending approval"),
+            "ESCALATED",
+            "REPAIR_APPROVAL_CONFLICT",
+        ),
+        (
+            BackgroundJobConflictError("job conflict"),
+            "UNSCHEDULED",
+            "REPAIR_JOB_CONFLICT",
+        ),
+    ),
+)
+def test_repair_scheduling_failure_preserves_the_validation_checkpoint(
+    error: Exception,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    decision = cast(ValidationDecisionResult, SimpleNamespace())
+
+    class FailingScheduler:
+        def schedule(
+            self,
+            validation_run_id: UUID,
+            *,
+            decision: ValidationDecisionResult | None = None,
+        ) -> RepairScheduleResult:
+            assert validation_run_id == _VALIDATION_ATTEMPT_ID
+            assert decision is not None
+            raise error
+
+    checkpoint = validation_evidence_module._repair_schedule_checkpoint(
+        FailingScheduler(),
+        _VALIDATION_ATTEMPT_ID,
+        decision,
+    )
+
+    assert checkpoint == {
+        "repair_status": expected_status,
+        "repair_reason_code": expected_reason,
+    }
+
+
+def test_repair_evidence_replay_compares_redacted_canonical_content(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, _configuration_id, _contract_id = validation_harness
+    payload = {"password": "sensitive", "status": "recorded"}
+    with factory.begin() as session:
+        captured = capture_evidence(
+            session,
+            store,
+            payload=payload,
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.RESULT,
+            evidence_type="validation-repair-test",
+            origin="test:repair-loop",
+            access_classification=EvidenceAccessClass.INTERNAL,
+            retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+            owner_id="local-user",
+            actor_id="control-plane",
+            root_correlation_id=uuid4(),
+            task_id=task_id,
+            captured_at=_NOW,
+        )
+        record_id = captured.record.id
+
+    with factory() as session:
+        record = session.get(EvidenceRecord, record_id)
+        assert record is not None
+        repair_loop_module._require_evidence_payload(
+            session,
+            store,
+            record,
+            payload,
+            task_id=task_id,
+            evidence_type="validation-repair-test",
+        )
+
+
+def test_repair_job_commits_new_candidate_and_requests_the_complete_contract(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        collected.validation_run_id
+    )
+    scheduled = ValidationRepairService(factory, store, clock=lambda: _NOW).schedule(
+        collected.validation_run_id
+    )
+    assert scheduled.job_id is not None
+    current_time = [_NOW]
+    jobs = BackgroundJobService(factory, store, clock=lambda: current_time[0])
+    prior_grant = jobs.claim_next(
+        worker_id="repair-worker",
+        lease_duration=timedelta(seconds=30),
+        job_types=(VALIDATION_REPAIR_JOB_TYPE,),
+    )
+    assert prior_grant is not None
+    prior_fencing_token = prior_grant.fencing_token
+    current_time[0] += timedelta(seconds=31)
+    grant = jobs.claim_next(
+        worker_id="repair-worker-recovered",
+        lease_duration=timedelta(seconds=30),
+        job_types=(VALIDATION_REPAIR_JOB_TYPE,),
+    )
+    assert grant is not None
+    assert grant.recovered is True
+    assert grant.fencing_token > prior_fencing_token
+
+    class ValidatedConfiguration:
+        repository_key = "boppuh/mathews"
+        digest = _CONFIGURATION_DIGEST
+
+        def __init__(self, bound_configuration_id: UUID) -> None:
+            self.configuration_id = bound_configuration_id
+
+        @staticmethod
+        def to_dict() -> dict[str, object]:
+            return {"repository_key": "boppuh/mathews"}
+
+    monkeypatch.setattr(
+        repair_loop_module,
+        "validated_repository_configuration",
+        lambda _configuration: ValidatedConfiguration(configuration_id),
+    )
+
+    class SuccessfulHermes:
+        def __call__(
+            self,
+            context: LeasedJobContext,
+        ) -> Mapping[str, object] | None:
+            del context
+            return {"hermes_run_id": str(uuid4()), "status": "SUCCEEDED"}
+
+    class SuccessfulHost:
+        def execute(self, request: HostRequestMessage) -> HostResponseMessage:
+            assert request.operation.name == "git.commit"
+            assert request.operation.arguments["expected_head_sha"] == _COMMIT_SHA
+            return HostResponseMessage(
+                request_id=request.request_id,
+                operation_name=request.operation.name,
+                idempotency_key=request.operation.idempotency_key,
+                host_id="host-1",
+                host_version="0.1.0",
+                status=HostResponseStatus.OK,
+                code="OK",
+                replayed=True,
+                completed_at_ms=1_800_000_000_000,
+                execution_fencing_token=prior_fencing_token,
+                result={
+                    "committed": True,
+                    "clean": True,
+                    "head_sha": "c" * 40,
+                    "tree_sha": "d" * 40,
+                    "changed_paths": ["Sources/Feature.swift"],
+                },
+            )
+
+    checkpoint = RepairJobHandler(
+        factory,
+        store,
+        SuccessfulHost(),
+        SuccessfulHermes(),
+        clock=lambda: _NOW,
+    )(LeasedJobContext(jobs, grant))
+
+    assert checkpoint["status"] == "REVALIDATION_REQUESTED"
+    assert checkpoint["candidate_commit_sha"] == "c" * 40
+    assert checkpoint["candidate_tree_sha"] == "d" * 40
+    with factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        assert task.state is TaskState.VALIDATING
+        assert task.retry_count == 1
+        transitions = tuple(
+            session.scalars(
+                select(TaskEvent)
+                .where(
+                    TaskEvent.task_id == task_id,
+                    TaskEvent.transition_kind.in_(("BEGIN_REPAIR", "REVALIDATE")),
+                )
+                .order_by(TaskEvent.sequence)
+            )
+        )
+        assert [event.transition_kind for event in transitions] == [
+            "BEGIN_REPAIR",
+            "REVALIDATE",
+        ]
+        assert transitions[-1].payload["validation_candidate"] == {
+            "commit_sha": "c" * 40,
+            "tree_sha": "d" * 40,
+        }
+        rerun = session.scalar(
+            select(TaskEvent).where(
+                TaskEvent.task_id == task_id,
+                TaskEvent.event_type == VALIDATION_RERUN_REQUESTED_EVENT_TYPE,
+            )
+        )
+        assert rerun is not None
+        assert rerun.payload["required_operations"] == [
+            {"operation_id": "unit-tests"},
+            {"operation_id": "integration-tests"},
+            {"operation_id": "simulator-e2e"},
+        ]
+        assert len(cast(list[object], rerun.payload["typed_assertions"])) == 3
+        assert len(cast(list[object], rerun.payload["evidence_requirements"])) == len(
+            ValidationEvidenceType
+        )
+
+
+def test_unrecoverable_repair_failure_moves_task_to_explicit_failed_state(
+    validation_harness: tuple[SessionFactory, ArtifactStore, UUID, UUID, UUID],
+) -> None:
+    factory, store, task_id, configuration_id, contract_id = validation_harness
+    collected = _collect_for_decision(
+        factory,
+        store,
+        task_id,
+        configuration_id,
+        contract_id,
+        assertion_status=AssertionResultStatus.FAILED,
+    )
+    ValidationDecisionService(factory, store, clock=lambda: _NOW).decide(
+        collected.validation_run_id
+    )
+    scheduled = ValidationRepairService(factory, store, clock=lambda: _NOW).schedule(
+        collected.validation_run_id
+    )
+    assert scheduled.job_id is not None
+    jobs = BackgroundJobService(factory, store, clock=lambda: _NOW)
+    grant = jobs.claim_next(
+        worker_id="repair-worker",
+        lease_duration=timedelta(seconds=30),
+        job_types=(VALIDATION_REPAIR_JOB_TYPE,),
+    )
+    assert grant is not None
+
+    class FailedHermes:
+        def __call__(
+            self,
+            context: LeasedJobContext,
+        ) -> Mapping[str, object] | None:
+            del context
+            raise TerminalBackgroundJobError("HERMES_RUN_FAILED")
+
+    class UnusedHost:
+        def execute(self, _request: HostRequestMessage) -> HostResponseMessage:
+            raise AssertionError("terminal Hermes failure must not reach Git")
+
+    with pytest.raises(TerminalBackgroundJobError, match="HERMES_RUN_FAILED"):
+        RepairJobHandler(
+            factory,
+            store,
+            UnusedHost(),
+            FailedHermes(),
+            clock=lambda: _NOW,
+        )(LeasedJobContext(jobs, grant))
+
+    with factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        assert task.state is TaskState.FAILED
+        assert task.terminal_outcome == "FAILED"
 
 
 def test_collects_typed_direct_evidence_and_projects_each_criterion(

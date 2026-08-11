@@ -302,6 +302,13 @@ def test_promotion_creates_immutable_prompt_and_policy_successors(
         role=PromptRole.IMPLEMENTER,
     )
     assert compiled.template_id == promoted_id
+    bound = service.compile(
+        prompt_harness.task_id,
+        role=PromptRole.IMPLEMENTER,
+        policy_version_id=prompt_harness.policy_id,
+    )
+    assert bound.policy_version_id == prompt_harness.policy_id
+    assert bound.template_id == prompt_harness.prompt_ids[PromptRole.IMPLEMENTER]
     with prompt_harness.factory() as session:
         stored_candidate = session.get(PromptTemplateVersion, candidate.id)
         promoted = session.get(PromptTemplateVersion, promoted_id)

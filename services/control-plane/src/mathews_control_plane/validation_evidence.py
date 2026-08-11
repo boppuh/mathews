@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from mathews_control_plane.approvals import ApprovalConflictError
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
     AuthenticatedSession,
@@ -73,6 +74,11 @@ from mathews_control_plane.evidence import (
 from mathews_control_plane.host_gateway import (
     HostGatewayError,
     authority_for_job_lease,
+)
+from mathews_control_plane.repair_loop import (
+    RepairLoopError,
+    RepairScheduleResult,
+    ValidationRepairService,
 )
 from mathews_control_plane.repository_configuration import (
     repository_configuration_digest,
@@ -980,6 +986,15 @@ class ValidationDecisioner(Protocol):
     ) -> ValidationDecisionResult: ...
 
 
+class ValidationRepairScheduler(Protocol):
+    def schedule(
+        self,
+        validation_run_id: UUID,
+        *,
+        decision: ValidationDecisionResult | None = None,
+    ) -> RepairScheduleResult: ...
+
+
 class HostValidationArtifactVerifier:
     """Verify host artifacts through the authenticated task-lease boundary."""
 
@@ -1223,6 +1238,7 @@ class ValidationEvidenceJobHandler:
         clock: Callable[[], datetime] | None = None,
         collector: ValidationEvidenceCollector | None = None,
         decision_service: ValidationDecisioner | None = None,
+        repair_scheduler: ValidationRepairScheduler | None = None,
     ) -> None:
         self._factory = factory
         self._host = host_gateway
@@ -1244,6 +1260,15 @@ class ValidationEvidenceJobHandler:
             )
             if decision_service is None
             else decision_service
+        )
+        self._repair_scheduler = (
+            ValidationRepairService(
+                factory,
+                artifact_store,
+                clock=self._clock,
+            )
+            if repair_scheduler is None
+            else repair_scheduler
         )
 
     def __call__(self, context: LeasedJobContext) -> dict[str, object]:
@@ -1287,7 +1312,7 @@ class ValidationEvidenceJobHandler:
                 result.validation_run_id,
                 lease_grant_supplier=lambda: context.grant,
             )
-            return {
+            checkpoint: dict[str, object] = {
                 "validation_run_id": str(result.validation_run_id),
                 "commit_sha": result.commit_sha,
                 "tree_sha": result.tree_sha,
@@ -1296,6 +1321,15 @@ class ValidationEvidenceJobHandler:
                 "reason_code": decision.reason_code,
                 "decision_evidence_id": str(decision.decision_evidence_id),
             }
+            if decision.outcome is ValidationOutcome.FAILED:
+                checkpoint.update(
+                    _repair_schedule_checkpoint(
+                        self._repair_scheduler,
+                        result.validation_run_id,
+                        decision,
+                    )
+                )
+            return checkpoint
         except ValidationEvidenceError as error:
             if error.code == "TASK_VALIDATION_PAUSED":
                 raise PausedBackgroundJobError(error.code) from None
@@ -1304,6 +1338,41 @@ class ValidationEvidenceJobHandler:
             if error.code == "TASK_VALIDATION_PAUSED":
                 raise PausedBackgroundJobError(error.code) from None
             raise TerminalBackgroundJobError(error.code) from None
+        except RepairLoopError as error:
+            raise TerminalBackgroundJobError(error.code) from None
+
+
+def _repair_schedule_checkpoint(
+    scheduler: ValidationRepairScheduler,
+    validation_run_id: UUID,
+    decision: ValidationDecisionResult,
+) -> dict[str, object]:
+    try:
+        repair = scheduler.schedule(validation_run_id, decision=decision)
+    except RepairLoopError as error:
+        return {
+            "repair_status": "UNSCHEDULED",
+            "repair_reason_code": error.code,
+        }
+    except ApprovalConflictError:
+        return {
+            "repair_status": "ESCALATED",
+            "repair_reason_code": "REPAIR_APPROVAL_CONFLICT",
+        }
+    except BackgroundJobConflictError:
+        return {
+            "repair_status": "UNSCHEDULED",
+            "repair_reason_code": "REPAIR_JOB_CONFLICT",
+        }
+    return {
+        "repair_status": repair.status.value,
+        "repair_job_id": None if repair.job_id is None else str(repair.job_id),
+        "repair_approval_request_id": (
+            None
+            if repair.approval_request_id is None
+            else str(repair.approval_request_id)
+        ),
+    }
 
 
 def _require_current_validation_attempt(
