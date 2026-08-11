@@ -73,6 +73,8 @@ envelope address continues to identify the destroyed source without retaining
 or reconstructing its content.
 
 These rules let Task 7.2 build a disposable retrieval index from verified
-sources while preserving the ledger as the only authority. Index entries must
-retain the evidence UUID, source hash, access class, and deletion state from
-this service and must never weaken its per-record authorization.
+sources while preserving the ledger as the only authority. Index entries retain
+the evidence UUID, source hash, access class, and deletion state from this
+service and never weaken its per-record authorization. The implemented index
+and rebuild contract are documented in
+[`RETRIEVAL_INDEX.md`](RETRIEVAL_INDEX.md).

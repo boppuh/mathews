@@ -67,6 +67,10 @@ from mathews_control_plane.repositories import (
     RepositoryService,
     create_repository_router,
 )
+from mathews_control_plane.retrieval_index import (
+    RetrievalIndexService,
+    create_retrieval_index_router,
+)
 from mathews_control_plane.settings import Settings, settings
 from mathews_control_plane.tasks import (
     TaskBodyLimitMiddleware,
@@ -101,6 +105,7 @@ def create_app(
     authentication_service: AuthenticationService | None = None,
     evidence_service: EvidenceService | None = None,
     evidence_projection_service: EvidenceProjectionService | None = None,
+    retrieval_index_service: RetrievalIndexService | None = None,
     task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
     repository_service: RepositoryService | None = None,
@@ -141,6 +146,12 @@ def create_app(
         evidence_projection_service = EvidenceProjectionService(
             session_factory,
             artifact_store,
+        )
+    if retrieval_index_service is None:
+        retrieval_index_service = RetrievalIndexService(
+            session_factory,
+            artifact_store,
+            evidence_projection_service,
         )
     if task_service is None:
         task_service = TaskService(
@@ -276,6 +287,7 @@ def create_app(
     application.state.authentication_service = authentication_service
     application.state.evidence_service = evidence_service
     application.state.evidence_projection_service = evidence_projection_service
+    application.state.retrieval_index_service = retrieval_index_service
     application.state.task_service = task_service
     application.state.approval_service = approval_service
     application.state.repository_service = repository_service
@@ -287,6 +299,7 @@ def create_app(
     application.include_router(
         create_evidence_projection_router(evidence_projection_service)
     )
+    application.include_router(create_retrieval_index_router(retrieval_index_service))
     application.include_router(create_evidence_router(evidence_service))
     application.include_router(create_task_router(task_service))
     application.include_router(create_approval_router(approval_service))

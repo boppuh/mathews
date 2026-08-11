@@ -74,6 +74,18 @@ _ENVELOPE_KEYS = {
     "task_id",
     "validation_run_id",
 }
+_DERIVATIVE_ENVELOPE_KEYS = {
+    "captured_at",
+    "content",
+    "content_hash",
+    "derivative_id",
+    "derivative_type",
+    "evidence_id",
+    "media_type",
+    "redaction_policy_version",
+    "schema_version",
+    "source_envelope_hash",
+}
 _SENSITIVE_KEY_FRAGMENTS = frozenset(
     {
         "accesstoken",
@@ -212,6 +224,18 @@ class LoadedEvidence:
     """A verified live canonical envelope and its redacted content."""
 
     record: EvidenceRecord
+    envelope: dict[str, JsonValue]
+    content: JsonValue
+    content_bytes: bytes
+    media_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedEvidenceDerivative:
+    """Verified live derivative content bound to its canonical source."""
+
+    derivative: EvidenceDerivative
+    source_record: EvidenceRecord
     envelope: dict[str, JsonValue]
     content: JsonValue
     content_bytes: bytes
@@ -787,6 +811,72 @@ def load_evidence(
     )
 
 
+def load_evidence_derivative(
+    session: Session,
+    artifact_store: ArtifactStore,
+    derivative: EvidenceDerivative,
+) -> LoadedEvidenceDerivative:
+    """Verify a live derivative and its binding to a live canonical source."""
+
+    if derivative.content_address is None or derivative.deleted_at is not None:
+        raise EvidenceNotFoundError("evidence derivative is unavailable")
+    source = _live_record(session, derivative.evidence_id, for_update=False)
+    try:
+        payload = artifact_store.get_bytes(derivative.content_address)
+    except (ArtifactStoreError, ValueError):
+        raise EvidenceNotFoundError("evidence derivative is unavailable") from None
+    envelope = _decode_json_object(payload)
+    if (
+        set(envelope) != _DERIVATIVE_ENVELOPE_KEYS
+        or envelope.get("schema_version") != 1
+        or envelope.get("redaction_policy_version")
+        != EVIDENCE_REDACTION_POLICY_VERSION
+        or _canonical_json_bytes(envelope) != payload
+        or derivative.content_hash != derivative.content_address
+        or derivative.content_hash != _digest(payload)
+        or envelope.get("derivative_id") != str(derivative.id)
+        or envelope.get("evidence_id") != str(derivative.evidence_id)
+        or envelope.get("derivative_type") != derivative.derivative_type
+        or envelope.get("captured_at") != _timestamp(derivative.captured_at)
+        or envelope.get("source_envelope_hash") != source.content_hash
+    ):
+        raise EvidenceValidationError("evidence derivative metadata is invalid")
+    media_type = envelope.get("media_type")
+    content = envelope.get("content")
+    content_hash = envelope.get("content_hash")
+    if not isinstance(media_type, str) or not isinstance(content_hash, str):
+        raise EvidenceValidationError("evidence derivative content metadata is invalid")
+    content_bytes = _canonical_content_bytes(media_type, content)
+    if content_hash != _digest(content_bytes):
+        raise EvidenceValidationError("evidence derivative content hash is invalid")
+    return LoadedEvidenceDerivative(
+        derivative=derivative,
+        source_record=source,
+        envelope=envelope,
+        content=content,
+        content_bytes=content_bytes,
+        media_type=media_type,
+    )
+
+
+def destroy_evidence_derivative(
+    artifact_store: ArtifactStore,
+    derivative: EvidenceDerivative,
+    *,
+    deleted_at: datetime,
+) -> bool:
+    """Destroy rebuildable derivative bytes and retain a minimal deletion marker."""
+
+    if derivative.deleted_at is not None:
+        return False
+    address = derivative.content_address
+    if address is not None:
+        artifact_store.delete_bytes(address)
+    derivative.content_address = None
+    derivative.deleted_at = _as_utc(deleted_at)
+    return True
+
+
 def _append_event(
     session: Session,
     *,
@@ -1207,11 +1297,11 @@ def _finalize_deletion(
         )
     )
     for derivative in derivatives:
-        address = derivative.content_address
-        if address is not None:
-            artifact_store.delete_bytes(address)
-        derivative.content_address = None
-        derivative.deleted_at = now
+        destroy_evidence_derivative(
+            artifact_store,
+            derivative,
+            deleted_at=now,
+        )
 
     if record.evidence_type == "task-request" and record.task_id is not None:
         task = session.scalar(
