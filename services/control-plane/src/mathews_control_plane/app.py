@@ -37,6 +37,10 @@ from mathews_control_plane.evidence import (
     EvidenceService,
     create_evidence_router,
 )
+from mathews_control_plane.evidence_projections import (
+    EvidenceProjectionService,
+    create_evidence_projection_router,
+)
 from mathews_control_plane.github_app import (
     GitHubWebhookVerifier,
     build_github_app_configuration,
@@ -96,6 +100,7 @@ def create_app(
     session_factory: SessionFactory | None = None,
     authentication_service: AuthenticationService | None = None,
     evidence_service: EvidenceService | None = None,
+    evidence_projection_service: EvidenceProjectionService | None = None,
     task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
     repository_service: RepositoryService | None = None,
@@ -129,6 +134,11 @@ def create_app(
     artifact_store = ArtifactStore.from_settings(current_settings)
     if evidence_service is None:
         evidence_service = EvidenceService(
+            session_factory,
+            artifact_store,
+        )
+    if evidence_projection_service is None:
+        evidence_projection_service = EvidenceProjectionService(
             session_factory,
             artifact_store,
         )
@@ -265,6 +275,7 @@ def create_app(
         application.state.database_engine = database_engine
     application.state.authentication_service = authentication_service
     application.state.evidence_service = evidence_service
+    application.state.evidence_projection_service = evidence_projection_service
     application.state.task_service = task_service
     application.state.approval_service = approval_service
     application.state.repository_service = repository_service
@@ -273,6 +284,9 @@ def create_app(
     application.state.github_webhook_service = github_webhook_service
     application.state.startup_recovery_service = startup_recovery_service
     application.include_router(create_authentication_router(authentication_service))
+    application.include_router(
+        create_evidence_projection_router(evidence_projection_service)
+    )
     application.include_router(create_evidence_router(evidence_service))
     application.include_router(create_task_router(task_service))
     application.include_router(create_approval_router(approval_service))

@@ -101,3 +101,8 @@ evidence ledger. A collected `ValidationRun` remains `PENDING` only until the
 lease-fenced worker invokes the decision service. The resulting immutable
 exact-SHA decision and fail-closed outcome rules are documented in
 [`VALIDATION_DECISIONING.md`](VALIDATION_DECISIONING.md).
+
+Task 7.1 classifies these canonical validation sources as verified test-artifact
+projections and connects them to their correction, deletion, and parent
+lineage. The access-preserving read model is documented in
+[`EVIDENCE_PROJECTIONS.md`](EVIDENCE_PROJECTIONS.md).
