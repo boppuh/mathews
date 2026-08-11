@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -20,23 +20,26 @@ from sqlalchemy.orm import Session
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
-    EvidenceDeletionRequest,
     EvidenceDerivative,
     EvidenceDerivativeCitation,
     EvidenceRecord,
     RuleCandidate,
+    RuleCandidateCitation,
     RuleCandidateStatus,
     Task,
 )
 from mathews_control_plane.evidence import (
     EvidenceAccessClass,
     EvidenceError,
+    invalidated_evidence_ids,
     load_evidence,
     load_evidence_derivative,
     normalize_evidence_timestamp,
     redact_evidence_content,
     register_evidence_derivative,
 )
+from mathews_control_plane.principals import LOCAL_OWNER_ID
+from mathews_control_plane.review_rule_contract import executable_review_rule
 
 CANDIDATE_LEARNING_SCHEMA_VERSION = 1
 DERIVED_SUMMARY_TYPE = "candidate-learning-summary-v1"
@@ -113,6 +116,16 @@ class ReviewRuleDefinition(BaseModel):
         ):
             raise ValueError("evidence requirements are invalid")
         return normalized
+
+    @model_validator(mode="after")
+    def _executable(self) -> ReviewRuleDefinition:
+        executable_review_rule(
+            scope=self.scope,
+            matcher=self.matcher,
+            risk_class=self.risk_class.value,
+            evidence_requirements=self.evidence_requirements,
+        )
+        return self
 
 
 class RuleCandidateDraft(BaseModel):
@@ -284,12 +297,13 @@ class CandidateLearningService:
         actor_id: str,
     ) -> RuleCandidateResult:
         actor = _identifier(actor_id, "learning actor")
+        normalized_draft = _redacted_candidate_draft(draft)
         now = normalize_evidence_timestamp(self._clock())
         try:
             with self._factory.begin() as session:
                 task = _task(session, task_id)
-                summary = session.get(EvidenceDerivative, draft.summary_id)
-                citations, _hashes = _validated_summary(
+                summary = session.get(EvidenceDerivative, normalized_draft.summary_id)
+                citations, source_hashes, _summary_content = _validated_summary(
                     session,
                     self._store,
                     task,
@@ -297,43 +311,63 @@ class CandidateLearningService:
                 )
                 existing = session.get(RuleCandidate, candidate_id)
                 if existing is not None:
-                    _require_same_candidate(existing, task, draft, citations)
+                    _require_same_candidate(existing, task, normalized_draft, citations)
                     return RuleCandidateResult(
                         task.id,
                         existing.id,
-                        draft.summary_id,
+                        normalized_draft.summary_id,
                         citations,
                         RuleCandidateStatus(existing.status),
                         replayed=True,
                     )
                 evaluation = {
                     "passed": True,
-                    "review_rule": draft.review_rule.model_dump(mode="json"),
+                    "review_rule": normalized_draft.review_rule.model_dump(mode="json"),
                 }
                 candidate = RuleCandidate(
                     id=candidate_id,
                     task_id=task.id,
-                    proposed_rule=draft.proposed_rule,
+                    proposed_rule=normalized_draft.proposed_rule,
                     cited_evidence_ids=[str(value) for value in citations],
-                    recurrence_assessment=draft.recurrence_assessment,
-                    severity_assessment=draft.severity_assessment,
-                    false_positive_risks=list(draft.false_positive_risks),
+                    recurrence_assessment=normalized_draft.recurrence_assessment,
+                    severity_assessment=normalized_draft.severity_assessment,
+                    false_positive_risks=list(normalized_draft.false_positive_risks),
                     evaluation_result=evaluation,
                     status=RuleCandidateStatus.EVALUATED,
                     owner_id=task.owner_id,
                     actor_id=actor,
                     root_correlation_id=task.root_correlation_id,
-                    causation_id=draft.summary_id,
-                    parent_correlation_id=draft.summary_id,
+                    causation_id=normalized_draft.summary_id,
+                    parent_correlation_id=normalized_draft.summary_id,
                     created_at=now,
                     updated_at=now,
                 )
                 session.add(candidate)
                 session.flush()
+                session.add_all(
+                    RuleCandidateCitation(
+                        candidate_id=candidate.id,
+                        evidence_id=evidence_id,
+                        source_hash=source_hash,
+                        owner_id=task.owner_id,
+                        actor_id=actor,
+                        root_correlation_id=task.root_correlation_id,
+                        causation_id=candidate.id,
+                        parent_correlation_id=evidence_id,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    for evidence_id, source_hash in zip(
+                        citations,
+                        source_hashes,
+                        strict=True,
+                    )
+                )
+                session.flush()
                 return RuleCandidateResult(
                     task.id,
                     candidate.id,
-                    draft.summary_id,
+                    normalized_draft.summary_id,
                     citations,
                     RuleCandidateStatus.EVALUATED,
                 )
@@ -343,7 +377,7 @@ class CandidateLearningService:
 
 def _task(session: Session, task_id: UUID) -> Task:
     task = session.get(Task, task_id)
-    if task is None or task.owner_id != "local-user":
+    if task is None or task.owner_id != LOCAL_OWNER_ID:
         raise CandidateLearningError("LEARNING_TASK_UNAVAILABLE")
     return task
 
@@ -362,20 +396,7 @@ def _citation_records(
         )
     )
     by_id = {record.id: record for record in records}
-    corrected = set(
-        session.scalars(
-            select(EvidenceRecord.correction_of_id).where(
-                EvidenceRecord.correction_of_id.in_(evidence_ids)
-            )
-        )
-    )
-    deletion_requested = set(
-        session.scalars(
-            select(EvidenceDeletionRequest.evidence_id).where(
-                EvidenceDeletionRequest.evidence_id.in_(evidence_ids)
-            )
-        )
-    )
+    invalidated_ids = invalidated_evidence_ids(session, evidence_ids)
     ordered: list[EvidenceRecord] = []
     for evidence_id in evidence_ids:
         record = by_id.get(evidence_id)
@@ -390,8 +411,7 @@ def _citation_records(
                 EvidenceAccessClass.TASK_OWNER.value,
                 EvidenceAccessClass.OWNER.value,
             }
-            or record.id in corrected
-            or record.id in deletion_requested
+            or record.id in invalidated_ids
         ):
             raise CandidateLearningError("LEARNING_CITATION_UNAVAILABLE")
         try:
@@ -436,7 +456,7 @@ def _validated_summary(
     store: ArtifactStore,
     task: Task,
     summary: EvidenceDerivative | None,
-) -> tuple[tuple[UUID, ...], tuple[str, ...]]:
+) -> tuple[tuple[UUID, ...], tuple[str, ...], dict[str, object]]:
     if summary is None or summary.derivative_type != DERIVED_SUMMARY_TYPE:
         raise CandidateLearningError("LEARNING_SUMMARY_UNAVAILABLE")
     try:
@@ -496,7 +516,7 @@ def _validated_summary(
         or content.get("summary_fingerprint") != _fingerprint(identity)
     ):
         raise CandidateLearningError("LEARNING_SUMMARY_STALE")
-    return tuple(ids), current_hashes
+    return tuple(ids), current_hashes, cast(dict[str, object], content)
 
 
 def _replayed_summary(
@@ -506,8 +526,7 @@ def _replayed_summary(
     summary: EvidenceDerivative,
     draft: CitedSummaryDraft,
 ) -> CitedSummaryResult:
-    citations, hashes = _validated_summary(session, store, task, summary)
-    loaded = load_evidence_derivative(session, store, summary).content
+    citations, hashes, loaded = _validated_summary(session, store, task, summary)
     expected = _summary_payload(task.id, draft, hashes)
     if citations != draft.cited_evidence_ids or loaded != expected:
         raise CandidateLearningError("LEARNING_SUMMARY_CONFLICT")
@@ -518,6 +537,15 @@ def _replayed_summary(
         hashes,
         replayed=True,
     )
+
+
+def _redacted_candidate_draft(draft: RuleCandidateDraft) -> RuleCandidateDraft:
+    raw = draft.model_dump(mode="json")
+    redacted = redact_evidence_content(raw, media_type="application/json").value
+    try:
+        return RuleCandidateDraft.model_validate(redacted)
+    except (TypeError, ValueError):
+        raise CandidateLearningError("RULE_CANDIDATE_REDACTION_INVALID") from None
 
 
 def _require_same_candidate(

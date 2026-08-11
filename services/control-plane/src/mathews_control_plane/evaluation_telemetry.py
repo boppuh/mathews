@@ -27,6 +27,7 @@ from mathews_control_plane.domain_models import (
     RetrievalIndexGeneration,
 )
 from mathews_control_plane.evidence import normalize_evidence_timestamp
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.retrieval_index import RetrievalSearchResult
 
 Clock = Callable[[], datetime]
@@ -129,7 +130,7 @@ class EvaluationTelemetryService:
                 contract_fingerprint=fingerprint,
                 active=activate,
                 activated_at=now if activate else None,
-                owner_id="local-user",
+                owner_id=LOCAL_OWNER_ID,
                 actor_id=actor,
                 root_correlation_id=(latest.root_correlation_id if latest else uuid4()),
                 causation_id=None if latest is None else latest.id,

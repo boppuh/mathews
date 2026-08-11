@@ -36,8 +36,12 @@ from mathews_control_plane.domain_models import (
     EvidenceRecord,
     EvidenceTombstone,
     RetrievalIndexChunk,
+    RuleCandidate,
+    RuleCandidateCitation,
+    RuleCandidateStatus,
     Task,
 )
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -50,7 +54,6 @@ MAX_EVIDENCE_NODES = 100_000
 MAX_EVIDENCE_REQUEST_BYTES = MAX_EVIDENCE_BYTES + 64 * 1024
 
 _LOCAL_USER_ID = 1
-_LOCAL_OWNER_ID = "local-user"
 _DIGEST_PREFIX = "sha256:"
 _METADATA_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
 _ENVELOPE_KEYS = {
@@ -142,7 +145,7 @@ _OPAQUE_TOKEN = re.compile(
 _JWT = re.compile(
     r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
 )
-_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
+_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])")
 _PHONE = re.compile(r"(?<!\w)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\w)")
 
 
@@ -913,7 +916,7 @@ def _principal(authentication: AuthenticatedSession, *, now: datetime) -> str:
         or _as_utc(authentication.absolute_expires_at) <= now
     ):
         raise EvidenceNotFoundError("evidence is unavailable")
-    return _LOCAL_OWNER_ID
+    return LOCAL_OWNER_ID
 
 
 def _authorize(
@@ -1010,6 +1013,30 @@ def _live_record(
     ):
         raise EvidenceNotFoundError("evidence is unavailable")
     return record
+
+
+def invalidated_evidence_ids(
+    session: Session,
+    evidence_ids: Sequence[UUID],
+) -> set[UUID]:
+    """Return cited records superseded by correction or fenced for deletion."""
+
+    corrected = {
+        value
+        for value in session.scalars(
+            select(EvidenceRecord.correction_of_id).where(
+                EvidenceRecord.correction_of_id.in_(evidence_ids)
+            )
+        )
+        if value is not None
+    }
+    return corrected | set(
+        session.scalars(
+            select(EvidenceDeletionRequest.evidence_id).where(
+                EvidenceDeletionRequest.evidence_id.in_(evidence_ids)
+            )
+        )
+    )
 
 
 def _source_kind(loaded: LoadedEvidence) -> EvidenceSourceKind:
@@ -1327,6 +1354,23 @@ def _finalize_deletion(
             derivative,
             deleted_at=now,
         )
+    removable_candidates = tuple(
+        session.scalars(
+            select(RuleCandidate)
+            .join(
+                RuleCandidateCitation,
+                RuleCandidateCitation.candidate_id == RuleCandidate.id,
+            )
+            .where(
+                RuleCandidateCitation.evidence_id == record.id,
+                RuleCandidate.status != RuleCandidateStatus.APPROVED,
+            )
+            .with_for_update()
+        )
+    )
+    for candidate in removable_candidates:
+        session.delete(candidate)
+    session.flush()
     retrieval_chunks = tuple(
         session.scalars(
             select(RetrievalIndexChunk)
@@ -1386,6 +1430,7 @@ def _finalize_deletion(
         occurred_at=now,
         details={
             "deletion_request_id": str(request.id),
+            "removed_candidate_count": len(removable_candidates),
             "removed_derivative_count": len(derivatives),
             "tombstone_id": str(tombstone.id),
         },

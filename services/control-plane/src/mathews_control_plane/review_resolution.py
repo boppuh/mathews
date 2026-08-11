@@ -73,6 +73,7 @@ from mathews_control_plane.prompt_compiler import PromptCompilerService, PromptR
 from mathews_control_plane.repository_configuration import (
     validated_repository_configuration,
 )
+from mathews_control_plane.review_rule_contract import executable_review_rule
 from mathews_control_plane.task_state_machine import (
     TaskTransitionGateEvaluator,
     TaskTransitionGuards,
@@ -89,21 +90,6 @@ MAX_REVIEW_REPAIRS = 5
 _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
-_AVAILABLE_REVIEW_EVIDENCE_TYPES = frozenset(
-    {
-        "github-webhook",
-        "review-resolution-assessment",
-        "hermes-tool-proposal",
-        "hermes-tool-authorization",
-        "hermes-tool-result",
-        "workspace-diff",
-        "review-repair-candidate",
-        "validation-decision",
-        "draft-pull-request-proof",
-    }
-)
-
-
 class ReviewResolutionError(RuntimeError):
     """Stable review-resolution refusal without review or artifact contents."""
 
@@ -1110,50 +1096,25 @@ def _rule_matches(rule: ReviewRule, classification: ReviewClassification) -> boo
         or rule.permitted_action != classification.action
     ):
         return False
-    matcher = rule.matcher
-    scope = rule.scope
-    if set(matcher) != {"categories", "required_labels"} or set(scope) != {
-        "path_prefixes",
-        "max_files",
-    }:
-        return False
-    categories = matcher.get("categories")
-    labels = matcher.get("required_labels")
-    prefixes = scope.get("path_prefixes")
-    maximum = scope.get("max_files")
-    requirements = rule.evidence_requirements
-    if (
-        not isinstance(categories, list)
-        or not categories
-        or any(not isinstance(value, str) for value in categories)
-        or len(categories) != len(set(cast(list[str], categories)))
-        or classification.category not in categories
-        or not isinstance(labels, list)
-        or any(not isinstance(value, str) for value in labels)
-        or len(labels) != len(set(cast(list[str], labels)))
-        or not set(cast(list[str], labels)).issubset(classification.labels)
-        or not isinstance(prefixes, list)
-        or not prefixes
-        or any(not isinstance(value, str) for value in prefixes)
-        or len(prefixes) != len(set(cast(list[str], prefixes)))
-        or isinstance(maximum, bool)
-        or not isinstance(maximum, int)
-        or not 1 <= maximum <= 32
-        or len(classification.proposed_paths) > maximum
-        or not isinstance(requirements, list)
-        or not requirements
-        or any(not isinstance(value, str) for value in requirements)
-        or len(requirements) != len(set(cast(list[str], requirements)))
-        or not set(cast(list[str], requirements)).issubset(
-            _AVAILABLE_REVIEW_EVIDENCE_TYPES
+    try:
+        contract = executable_review_rule(
+            scope=rule.scope,
+            matcher=rule.matcher,
+            risk_class=rule.risk_class.upper(),
+            evidence_requirements=rule.evidence_requirements,
         )
+    except ValueError:
+        return False
+    if (
+        classification.category not in contract.categories
+        or not set(contract.required_labels).issubset(classification.labels)
+        or len(classification.proposed_paths) > contract.max_files
     ):
         return False
-    try:
-        allowed = tuple(_path(value) for value in prefixes)
-    except (TypeError, ValueError):
-        return False
-    return all(_path_in_scope(path, allowed) for path in classification.proposed_paths)
+    return all(
+        _path_in_scope(path, contract.path_prefixes)
+        for path in classification.proposed_paths
+    )
 
 
 def _assessment_payload(

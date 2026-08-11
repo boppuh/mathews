@@ -82,6 +82,7 @@ EXPECTED_HEAD_TABLES = {
     "retrieval_index_generations",
     "reconciliation_targets",
     "review_rules",
+    "rule_candidate_citations",
     "rule_candidates",
     "task_events",
     "task_event_evidence_references",
@@ -115,7 +116,10 @@ EVALUATION_TELEMETRY_TABLES = {
     "agent_run_evaluations",
     "evaluation_contract_versions",
 }
-CANDIDATE_LEARNING_TABLES = {"evidence_derivative_citations"}
+CANDIDATE_LEARNING_TABLES = {
+    "evidence_derivative_citations",
+    "rule_candidate_citations",
+}
 
 
 def _migration_config(database_url: str) -> Config:

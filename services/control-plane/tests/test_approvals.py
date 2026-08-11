@@ -44,6 +44,7 @@ from mathews_control_plane.domain_models import (
     Brief,
     BriefApprovalDecision,
     BriefDecisionDisposition,
+    EvidenceDeletionRequest,
     EvidenceRecord,
     PolicyVersion,
     PolicyVersionPromptTemplate,
@@ -1092,6 +1093,52 @@ def test_rule_promotion_rejects_a_superseded_candidate_citation(
             task_id=source.task_id,
             validation_run_id=source.validation_run_id,
             correction_of_id=source.id,
+        )
+
+    with pytest.raises(ApprovalPreconditionError):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+        )
+
+    with approval_harness.factory() as session:
+        assert session.scalar(select(func.count(ReviewRule.id))) == 0
+
+
+def test_rule_promotion_rejects_a_deletion_requested_candidate_citation(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+    with approval_harness.factory.begin() as session:
+        source = session.get(EvidenceRecord, evidence_id)
+        assert source is not None
+        session.add(
+            EvidenceDeletionRequest(
+                evidence_id=source.id,
+                reason_code="SOURCE_REVOKED",
+                requested_at=_NOW,
+                owner_id=source.owner_id,
+                actor_id=source.owner_id,
+                root_correlation_id=source.root_correlation_id,
+                causation_id=source.id,
+                parent_correlation_id=source.parent_correlation_id,
+            )
         )
 
     with pytest.raises(ApprovalPreconditionError):

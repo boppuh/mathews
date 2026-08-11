@@ -1164,6 +1164,33 @@ class RuleCandidate(RecordContext, Base):
     )
 
 
+class RuleCandidateCitation(RecordContext, Base):
+    """Exact source lineage for removable non-authoritative candidates."""
+
+    __tablename__ = "rule_candidate_citations"
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id",
+            "evidence_id",
+            name="uq_rule_candidate_citation_source",
+        ),
+        CheckConstraint("length(source_hash) = 71", name="source_hash_length"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    candidate_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("rule_candidates.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+
+
 class ReviewRule(RecordContext, Base):
     """Human-approved, immutable executable review rule version."""
 

@@ -38,6 +38,7 @@ from mathews_control_plane.domain_models import (
     PromptTemplateVersion,
     ReviewRule,
     RuleCandidate,
+    RuleCandidateCitation,
     RuleCandidateStatus,
     Task,
     TaskState,
@@ -250,12 +251,20 @@ def test_rule_candidate_cannot_create_authority_or_approval(
     with learning_harness.factory() as session:
         candidate = session.get(RuleCandidate, candidate_id)
         assert candidate is not None
+        lineage = tuple(
+            session.scalars(
+                select(RuleCandidateCitation).where(
+                    RuleCandidateCitation.candidate_id == candidate_id
+                )
+            )
+        )
         assert candidate.parent_correlation_id == summary_id
         assert candidate.cited_evidence_ids == [
             str(value) for value in learning_harness.source_ids
         ]
         assert candidate.evaluation_result is not None
         assert candidate.evaluation_result["passed"] is True
+        assert {item.evidence_id for item in lineage} == set(learning_harness.source_ids)
         for model in (
             ApprovalRequest,
             ReviewRule,
@@ -401,10 +410,18 @@ def test_deleting_any_cited_source_destroys_the_summary(
     learning_harness: LearningHarness,
 ) -> None:
     summary_id = uuid4()
-    _service(learning_harness).create_summary(
+    service = _service(learning_harness)
+    service.create_summary(
         learning_harness.task_id,
         summary_id=summary_id,
         draft=_summary(learning_harness),
+        actor_id="candidate-learning",
+    )
+    candidate_id = uuid4()
+    service.create_rule_candidate(
+        learning_harness.task_id,
+        candidate_id=candidate_id,
+        draft=_candidate(summary_id),
         actor_id="candidate-learning",
     )
     with learning_harness.factory.begin() as session:
@@ -435,6 +452,98 @@ def test_deleting_any_cited_source_destroys_the_summary(
         assert derivative.content_address is None
         assert derivative.deleted_at is not None
         assert derivative.deleted_at.replace(tzinfo=UTC) == _NOW
+        assert session.get(RuleCandidate, candidate_id) is None
+
+
+def test_deletion_request_fences_candidate_creation(
+    learning_harness: LearningHarness,
+) -> None:
+    service = _service(learning_harness)
+    summary_id = uuid4()
+    service.create_summary(
+        learning_harness.task_id,
+        summary_id=summary_id,
+        draft=_summary(learning_harness),
+        actor_id="candidate-learning",
+    )
+    with learning_harness.factory.begin() as session:
+        source = session.get(EvidenceRecord, learning_harness.source_ids[1])
+        assert source is not None
+        session.add(
+            EvidenceDeletionRequest(
+                evidence_id=source.id,
+                reason_code="SOURCE_REVOKED",
+                requested_at=_NOW,
+                owner_id=source.owner_id,
+                actor_id="candidate-learning",
+                root_correlation_id=source.root_correlation_id,
+                causation_id=source.id,
+                parent_correlation_id=source.parent_correlation_id,
+            )
+        )
+
+    with pytest.raises(CandidateLearningError, match="LEARNING_CITATION_UNAVAILABLE"):
+        service.create_rule_candidate(
+            learning_harness.task_id,
+            candidate_id=uuid4(),
+            draft=_candidate(summary_id),
+            actor_id="candidate-learning",
+        )
+
+
+def test_candidate_content_is_redacted_before_persistence_and_replay(
+    learning_harness: LearningHarness,
+) -> None:
+    service = _service(learning_harness)
+    summary_id = uuid4()
+    candidate_id = uuid4()
+    service.create_summary(
+        learning_harness.task_id,
+        summary_id=summary_id,
+        draft=_summary(learning_harness),
+        actor_id="candidate-learning",
+    )
+    draft = _candidate(summary_id).model_copy(
+        update={
+            "proposed_rule": "Notify owner@example.com after a formatter repair.",
+            "false_positive_risks": ("Do not reveal owner@example.com.",),
+        }
+    )
+    service.create_rule_candidate(
+        learning_harness.task_id,
+        candidate_id=candidate_id,
+        draft=draft,
+        actor_id="candidate-learning",
+    )
+    replayed = service.create_rule_candidate(
+        learning_harness.task_id,
+        candidate_id=candidate_id,
+        draft=draft,
+        actor_id="candidate-learning",
+    )
+
+    assert replayed.replayed
+    with learning_harness.factory() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+        assert candidate is not None
+        assert candidate.proposed_rule == (
+            "Notify [REDACTED:EMAIL] after a formatter repair."
+        )
+        assert candidate.false_positive_risks == ["Do not reveal [REDACTED:EMAIL]."]
+
+
+def test_candidate_definition_must_match_the_runtime_rule_contract(
+    learning_harness: LearningHarness,
+) -> None:
+    with pytest.raises(ValueError, match="review rule is not executable"):
+        ReviewRuleDefinition(
+            lineage_key="inert-rule",
+            scope={"repository": "boppuh/mathews"},
+            matcher={"category": "formatting"},
+            permitted_action="repair.format",
+            risk_class=CandidateRisk.HIGH,
+            evidence_requirements=("unknown-evidence",),
+        )
 
 
 def test_candidate_replay_preserves_a_terminal_review_status(

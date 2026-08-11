@@ -49,6 +49,7 @@ from mathews_control_plane.github_app import (
     GitHubWebhookVerificationError,
     GitHubWebhookVerifier,
 )
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.readiness_contract import ReadinessError
 from mathews_control_plane.task_state_machine import TaskTransitionError
 
@@ -60,7 +61,7 @@ GITHUB_PR_HEAD_CHANGED_EVENT = "GITHUB_PR_HEAD_CHANGED"
 MAX_GITHUB_WEBHOOK_BYTES = 1024 * 1024
 MAX_GITHUB_WEBHOOK_CHUNKS = 1024
 
-_OWNER = "local-user"
+_OWNER = LOCAL_OWNER_ID
 _ACTOR = "github-webhook"
 _DELIVERY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
 _BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}\Z")

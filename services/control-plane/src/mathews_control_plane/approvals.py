@@ -38,7 +38,6 @@ from mathews_control_plane.domain_models import (
     BriefApprovalDecision,
     BriefDecisionDisposition,
     DependencyOutageAttempt,
-    EvidenceDeletionRequest,
     EvidenceRecord,
     PolicyVersion,
     PolicyVersionPromptTemplate,
@@ -51,7 +50,11 @@ from mathews_control_plane.domain_models import (
     TaskEventEvidenceReference,
     TaskState,
 )
-from mathews_control_plane.evidence import EvidenceAccessClass
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    invalidated_evidence_ids,
+)
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.task_state_machine import (
     TaskTransitionError,
     TaskTransitionGateEvaluator,
@@ -123,7 +126,6 @@ _PRECONDITIONED_DECISIONS = _APPROVING_DECISIONS | {
 }
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_USER_ID = 1
-_LOCAL_OWNER_ID = "local-user"
 AuthenticatedApprovalSession = Annotated[
     AuthenticatedSession,
     Depends(require_authenticated_session),
@@ -875,6 +877,8 @@ def _candidate_evidence_ids(
     session: Session,
     task: Task,
     candidate: RuleCandidate,
+    *,
+    for_update: bool = False,
 ) -> tuple[UUID, ...]:
     try:
         values = tuple(UUID(cast(str, value)) for value in candidate.cited_evidence_ids)
@@ -886,14 +890,15 @@ def _candidate_evidence_ids(
         or len(set(values)) != len(values)
     ):
         raise ApprovalConflictError("stored rule candidate evidence is invalid")
-    records = session.scalars(
-        select(EvidenceRecord).where(
-            EvidenceRecord.id.in_(values),
-            EvidenceRecord.task_id == task.id,
-            EvidenceRecord.owner_id == task.owner_id,
-            EvidenceRecord.deleted_at.is_(None),
-        )
-    ).all()
+    records_query = select(EvidenceRecord).where(
+        EvidenceRecord.id.in_(values),
+        EvidenceRecord.task_id == task.id,
+        EvidenceRecord.owner_id == task.owner_id,
+        EvidenceRecord.deleted_at.is_(None),
+    )
+    if for_update:
+        records_query = records_query.with_for_update()
+    records = session.scalars(records_query).all()
     if any(
         record.access_classification
         not in {
@@ -903,20 +908,8 @@ def _candidate_evidence_ids(
         for record in records
     ):
         raise ApprovalConflictError("rule candidate evidence is unavailable")
-    invalidated_ids = set(
-        session.scalars(
-            select(EvidenceRecord.correction_of_id).where(
-                EvidenceRecord.correction_of_id.in_(values)
-            )
-        )
-    ) | set(
-        session.scalars(
-            select(EvidenceDeletionRequest.evidence_id).where(
-                EvidenceDeletionRequest.evidence_id.in_(values)
-            )
-        )
-    )
-    if len(records) != len(values) or any(value in invalidated_ids for value in values):
+    invalidated_ids = invalidated_evidence_ids(session, values)
+    if len(records) != len(values) or bool(invalidated_ids):
         raise ApprovalConflictError("rule candidate evidence is unavailable")
     return values
 
@@ -1001,7 +994,7 @@ def _brief_fingerprint(brief: Brief) -> str:
 def _approval_principal(authentication: AuthenticatedSession) -> str:
     if authentication.user_id != _LOCAL_USER_ID:
         raise ApprovalNotFoundError("approval inbox is unavailable")
-    return _LOCAL_OWNER_ID
+    return LOCAL_OWNER_ID
 
 
 def _durable_preconditions_are_current(
@@ -2072,7 +2065,12 @@ class ApprovalService:
         approved_at: datetime,
     ) -> None:
         definition = _evaluated_review_rule(candidate)
-        cited_evidence_ids = _candidate_evidence_ids(session, task, candidate)
+        cited_evidence_ids = _candidate_evidence_ids(
+            session,
+            task,
+            candidate,
+            for_update=True,
+        )
         if not set(cited_evidence_ids).issubset(_stored_evidence_ids(request)):
             raise ApprovalConflictError("rule candidate evidence is not bound to the approval")
         _lock_policy_promotion(session, self._active_policy_lineage)

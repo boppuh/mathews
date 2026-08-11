@@ -550,6 +550,7 @@ def test_deletion_fences_reads_destroys_derivatives_and_appends_tombstone(
     assert destroyed is not None
     assert destroyed.details == {
         "deletion_request_id": str(request.id),
+        "removed_candidate_count": 0,
         "removed_derivative_count": 1,
         "tombstone_id": str(persisted_tombstone.id),
     }
