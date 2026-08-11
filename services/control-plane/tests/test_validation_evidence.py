@@ -254,6 +254,7 @@ def _seed(factory: SessionFactory) -> tuple[UUID, UUID, UUID]:
         )
         session.add(policy)
         session.flush()
+        decision.policy_version_id = policy.id
         prompt = PromptTemplateVersion(
             lineage_key="mvp-implementer",
             role="implementer",
@@ -678,12 +679,23 @@ def test_failed_decision_schedules_one_evidence_backed_repair_job(
 
     scheduled = service.schedule(collected.validation_run_id)
     replayed = service.schedule(collected.validation_run_id)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.state = TaskState.REPAIRING
+    recovered_replay = service.schedule(collected.validation_run_id)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        task.state = TaskState.VALIDATING
 
     assert scheduled.status is RepairScheduleStatus.SCHEDULED
     assert scheduled.job_id is not None
     assert scheduled.replayed is False
     assert replayed.job_id == scheduled.job_id
     assert replayed.replayed is True
+    assert recovered_replay.job_id == scheduled.job_id
+    assert recovered_replay.replayed is True
     with factory() as session:
         task = session.get(Task, task_id)
         job = session.get(BackgroundJob, scheduled.job_id)
@@ -1015,14 +1027,24 @@ def test_repair_job_commits_new_candidate_and_requests_the_complete_contract(
         collected.validation_run_id
     )
     assert scheduled.job_id is not None
-    jobs = BackgroundJobService(factory, store, clock=lambda: _NOW)
-    grant = jobs.claim_next(
+    current_time = [_NOW]
+    jobs = BackgroundJobService(factory, store, clock=lambda: current_time[0])
+    prior_grant = jobs.claim_next(
         worker_id="repair-worker",
         lease_duration=timedelta(seconds=30),
         job_types=(VALIDATION_REPAIR_JOB_TYPE,),
     )
+    assert prior_grant is not None
+    prior_fencing_token = prior_grant.fencing_token
+    current_time[0] += timedelta(seconds=31)
+    grant = jobs.claim_next(
+        worker_id="repair-worker-recovered",
+        lease_duration=timedelta(seconds=30),
+        job_types=(VALIDATION_REPAIR_JOB_TYPE,),
+    )
     assert grant is not None
-    fencing_token = grant.fencing_token
+    assert grant.recovered is True
+    assert grant.fencing_token > prior_fencing_token
 
     class ValidatedConfiguration:
         repository_key = "boppuh/mathews"
@@ -1061,9 +1083,9 @@ def test_repair_job_commits_new_candidate_and_requests_the_complete_contract(
                 host_version="0.1.0",
                 status=HostResponseStatus.OK,
                 code="OK",
-                replayed=False,
+                replayed=True,
                 completed_at_ms=1_800_000_000_000,
-                execution_fencing_token=fencing_token,
+                execution_fencing_token=prior_fencing_token,
                 result={
                     "committed": True,
                     "clean": True,

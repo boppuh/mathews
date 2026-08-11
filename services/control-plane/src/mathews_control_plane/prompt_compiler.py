@@ -179,6 +179,7 @@ class PromptCompilerService:
         evidence_ids: Sequence[UUID] = (),
         template_id: UUID | None = None,
         evaluation_label: str | None = None,
+        policy_version_id: UUID | None = None,
     ) -> CompiledPrompt:
         evidence_ids = tuple(evidence_ids)
         if len(evidence_ids) != len(set(evidence_ids)):
@@ -187,12 +188,26 @@ class PromptCompilerService:
             task = session.get(Task, task_id)
             if task is None:
                 raise PromptNotFoundError("task is unavailable")
-            policy = _active_policy(
-                session,
-                owner_id=task.owner_id,
-                lineage_key=self._policy_lineage,
-                now=_as_utc(self._clock()),
-            )
+            now = _as_utc(self._clock())
+            policy: PolicyVersion | None
+            if policy_version_id is None:
+                policy = _active_policy(
+                    session,
+                    owner_id=task.owner_id,
+                    lineage_key=self._policy_lineage,
+                    now=now,
+                )
+            else:
+                policy = session.get(PolicyVersion, policy_version_id)
+                if (
+                    policy is None
+                    or policy.owner_id != task.owner_id
+                    or policy.lineage_key != self._policy_lineage
+                    or policy.approved_by is None
+                    or policy.approved_at is None
+                    or _as_utc(policy.approved_at) > now
+                ):
+                    raise PromptNotFoundError("policy version is unavailable")
             default = _default_prompt(session, policy.id, role)
             selected = default if template_id is None else session.get(
                 PromptTemplateVersion, template_id

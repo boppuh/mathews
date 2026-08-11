@@ -45,6 +45,7 @@ from mathews_control_plane.domain_models import (
     ApprovalRequestType,
     ApprovalStatus,
     BackgroundJob,
+    BriefApprovalDecision,
     DependencyService,
     EvidenceRecord,
     PolicyVersion,
@@ -161,6 +162,7 @@ class _RepairContext:
     validation_contract_version: int
     repository_configuration_id: UUID
     repository_configuration_version: int
+    prompt_policy_version_id: UUID
     decision_evidence_id: UUID
     manifest_evidence_id: UUID
     failure_fingerprint: str
@@ -216,13 +218,16 @@ class ValidationRepairService:
         *,
         decision: ValidationDecisionResult | None = None,
     ) -> RepairScheduleResult:
+        if decision is not None and decision.validation_run_id != validation_run_id:
+            raise RepairLoopError("VALIDATION_DECISION_RUN_MISMATCH")
+        replayed = _replayed_repair_schedule(self._factory, validation_run_id)
+        if replayed is not None:
+            return replayed
         if decision is None:
             try:
                 decision = self._decisions.decide(validation_run_id)
             except ValidationDecisionError as error:
                 raise RepairLoopError(error.code) from None
-        elif decision.validation_run_id != validation_run_id:
-            raise RepairLoopError("VALIDATION_DECISION_RUN_MISMATCH")
         if decision.outcome is not ValidationOutcome.FAILED or not decision.is_current:
             raise RepairLoopError("VALIDATION_FAILURE_NOT_REPAIRABLE")
         now = _as_utc(self._clock())
@@ -277,6 +282,7 @@ class ValidationRepairService:
                 context.decision_evidence_id,
                 context.manifest_evidence_id,
             ),
+            policy_version_id=context.prompt_policy_version_id,
         )
         job_input = RepairJobInput(
             validation_run_id=context.validation_run_id,
@@ -589,7 +595,10 @@ class RepairJobHandler:
         tree_sha = result.get("tree_sha")
         if (
             response.status is not HostResponseStatus.OK
-            or response.execution_fencing_token != context.grant.fencing_token
+            or (
+                response.execution_fencing_token != context.grant.fencing_token
+                and not response.replayed
+            )
             or result.get("committed") is not True
             or result.get("clean") is not True
             or not isinstance(changed_paths, list)
@@ -927,6 +936,11 @@ def _repair_context(
         .order_by(PolicyVersion.version.desc())
         .limit(1)
     )
+    brief_decision = (
+        None
+        if task is None or task.brief_approval_decision_id is None
+        else session.get(BriefApprovalDecision, task.brief_approval_decision_id)
+    )
     decision = session.scalar(
         select(TaskEvent)
         .where(
@@ -954,6 +968,9 @@ def _repair_context(
         or contract is None
         or configuration is None
         or policy is None
+        or brief_decision is None
+        or brief_decision.task_id != task.id
+        or brief_decision.policy_version_id is None
         or decision_evidence_id is None
         or manifest is None
         or TaskState(task.state) is not TaskState.VALIDATING
@@ -986,6 +1003,7 @@ def _repair_context(
         validation_contract_version=contract.version,
         repository_configuration_id=configuration.id,
         repository_configuration_version=configuration.version,
+        prompt_policy_version_id=brief_decision.policy_version_id,
         decision_evidence_id=decision_evidence_id,
         manifest_evidence_id=manifest.id,
         failure_fingerprint=_failure_fingerprint(run),
@@ -1202,6 +1220,36 @@ def _repair_jobs(session: Session, task_id: UUID) -> tuple[BackgroundJob, ...]:
             .order_by(BackgroundJob.created_at, BackgroundJob.id)
         )
     )
+
+
+def _replayed_repair_schedule(
+    factory: SessionFactory,
+    validation_run_id: UUID,
+) -> RepairScheduleResult | None:
+    with factory() as session:
+        jobs = session.scalars(
+            select(BackgroundJob)
+            .where(BackgroundJob.job_type == VALIDATION_REPAIR_JOB_TYPE)
+            .order_by(BackgroundJob.created_at, BackgroundJob.id)
+        )
+        for job in jobs:
+            if job.input_payload.get("validation_run_id") != str(validation_run_id):
+                continue
+            try:
+                job_input = RepairJobInput.model_validate(job.input_payload)
+            except ValueError:
+                raise RepairLoopError("REPAIR_JOB_CONFLICT") from None
+            if job_input.validation_run_id != validation_run_id:
+                raise RepairLoopError("REPAIR_JOB_CONFLICT")
+            return RepairScheduleResult(
+                validation_run_id=validation_run_id,
+                task_id=job_input.task_id,
+                status=RepairScheduleStatus.SCHEDULED,
+                failure_fingerprint=job_input.failure_fingerprint,
+                job_id=job.id,
+                replayed=True,
+            )
+    return None
 
 
 def _require_evidence_payload(
