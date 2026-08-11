@@ -222,6 +222,11 @@ class GitHubInstallationCredential:
 
         return f"Bearer {self._token.reveal()}"
 
+    def github_revocation_token(self) -> str:
+        """Reveal the token only at the allowlisted revocation boundary."""
+
+        return self._token.reveal()
+
     def safe_summary(self) -> dict[str, object]:
         return {
             "credential": "[REDACTED]",
@@ -523,7 +528,7 @@ class GitHubAppCredentialBroker:
             or credential.repository_key != self._configuration.repository_key
         ):
             raise GitHubPermissionError("github credential repository mismatch")
-        self._revoke_installation_token(credential._token.reveal())
+        self._revoke_installation_token(credential.github_revocation_token())
 
     def _app_jwt(self) -> str:
         now = _aware_utc(self._clock())

@@ -57,9 +57,10 @@ new candidate.
 
 The GitHub publisher first queries by exact owner, task branch, base branch, and
 open state. A retry reuses the single matching draft and refuses ambiguous
-matches, preventing duplicate pull requests. Host push operations use the task
-transition ID in their idempotency keys. Every minted GitHub installation token
-is revoked after the bounded GitHub operation, including error paths.
+matches, preventing duplicate pull requests. Every host operation in the
+sequence—including the before/after inspections and the push—derives its
+idempotency key from the task transition ID. Every minted GitHub installation
+token is revoked after the bounded GitHub operation, including error paths.
 
 ## Required production wiring
 

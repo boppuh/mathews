@@ -29,6 +29,7 @@ from mathews_control_plane.domain_models import (
     ValidationRun,
 )
 from mathews_control_plane.draft_pull_requests import (
+    DRAFT_PULL_REQUEST_PROOF_KEYS,
     DraftPullRequestError,
     GitHubDraftPullRequestPublisher,
     _DraftProofGates,
@@ -38,6 +39,7 @@ from mathews_control_plane.evidence import (
     EvidenceRetentionClass,
     EvidenceSourceKind,
     capture_evidence,
+    load_evidence,
 )
 from mathews_control_plane.github_app import (
     GitHubAppCredentialBroker,
@@ -222,6 +224,32 @@ def test_publisher_reconciles_an_ambiguous_create_without_duplication() -> None:
     assert len(broker.revoked) == 1
 
 
+def test_publisher_preserves_create_failure_when_reconciliation_also_fails() -> None:
+    broker = _Broker()
+    publisher = GitHubDraftPullRequestPublisher(
+        cast(GitHubAppCredentialBroker, broker),
+        "boppuh/mathews",
+        transport=_Transport(
+            _response(200, []),
+            _response(201, {}),
+            _response(500, {"message": "still unavailable"}),
+        ),
+    )
+
+    with pytest.raises(
+        DraftPullRequestError, match="GITHUB_PULL_REQUEST_RESPONSE_INVALID"
+    ):
+        publisher.ensure_draft(
+            branch_name="codex/task-1",
+            base_branch="main",
+            title="Verified candidate",
+            body="body",
+            expected_head_sha=_SHA,
+        )
+
+    assert len(broker.revoked) == 1
+
+
 @pytest.mark.parametrize(
     ("value", "code"),
     [
@@ -308,7 +336,31 @@ def test_immutable_gate_closes_when_persisted_validation_is_no_longer_passing(
     assert guards.draft_pr is None
 
 
-def _persist_gate_proof(harness: _GateHarness) -> tuple[UUID, UUID, UUID]:
+def test_immutable_gate_closes_instead_of_raising_for_malformed_proof(
+    gate_harness: _GateHarness,
+) -> None:
+    task_id, proof_id, policy_id = _persist_gate_proof(
+        gate_harness,
+        proof_overrides={"local_before_push": "not-an-object"},
+    )
+
+    with gate_harness.factory() as session:
+        guards = _DraftProofGates(gate_harness.store, proof_id).evaluate(
+            session,
+            session.get_one(Task, task_id),
+            TaskTransitionKind.OPEN_VERIFIED_DRAFT_PR,
+            policy=session.get_one(PolicyVersion, policy_id),
+            now=_NOW,
+        )
+
+    assert guards.draft_pr is None
+
+
+def _persist_gate_proof(
+    harness: _GateHarness,
+    *,
+    proof_overrides: Mapping[str, object] | None = None,
+) -> tuple[UUID, UUID, UUID]:
     with harness.factory.begin() as session:
         task = create_task_record(
             session,
@@ -434,31 +486,36 @@ def _persist_gate_proof(harness: _GateHarness) -> tuple[UUID, UUID, UUID]:
             "remote_head_sha": None,
         }
         pushed = {**observation, "remote_head_sha": _SHA}
+        proof_payload: dict[str, object] = {
+            "schema_version": 1,
+            "task_id": str(task.id),
+            "brief_id": str(brief.id),
+            "validation_contract_id": str(contract.id),
+            "validation_contract_version": contract.version,
+            "repository_configuration_id": str(configuration.id),
+            "repository_configuration_version": configuration.version,
+            "validation_run_id": str(run.id),
+            "validation_decision_evidence_id": str(decision.record.id),
+            "commit_sha": _SHA,
+            "tree_sha": _TREE,
+            "local_before_push": observation,
+            "push_result": pushed,
+            "local_after_push": observation,
+            "pull_request": {
+                "number": 42,
+                "url": "https://github.com/boppuh/mathews/pull/42",
+                "branch_name": observation["branch_name"],
+                "head_sha": _SHA,
+                "is_draft": True,
+            },
+            "pull_request_content_sha256": "f" * 64,
+        }
+        proof_payload.update(proof_overrides or {})
+        assert set(proof_payload) == DRAFT_PULL_REQUEST_PROOF_KEYS
         proof = capture_evidence(
             session,
             harness.store,
-            payload={
-                "schema_version": 1,
-                "brief_id": str(brief.id),
-                "validation_contract_id": str(contract.id),
-                "validation_contract_version": contract.version,
-                "repository_configuration_id": str(configuration.id),
-                "repository_configuration_version": configuration.version,
-                "validation_run_id": str(run.id),
-                "validation_decision_evidence_id": str(decision.record.id),
-                "commit_sha": _SHA,
-                "tree_sha": _TREE,
-                "local_before_push": observation,
-                "push_result": pushed,
-                "local_after_push": observation,
-                "pull_request": {
-                    "number": 42,
-                    "url": "https://github.com/boppuh/mathews/pull/42",
-                    "branch_name": observation["branch_name"],
-                    "head_sha": _SHA,
-                    "is_draft": True,
-                },
-            },
+            payload=proof_payload,
             media_type="application/json",
             source_kind=EvidenceSourceKind.TOOL_OPERATION,
             evidence_type="draft-pull-request-proof",
@@ -471,4 +528,7 @@ def _persist_gate_proof(harness: _GateHarness) -> tuple[UUID, UUID, UUID]:
             task_id=task.id,
             validation_run_id=run.id,
         )
+        loaded = load_evidence(session, harness.store, proof.record)
+        assert isinstance(loaded.content, dict)
+        assert set(loaded.content) == DRAFT_PULL_REQUEST_PROOF_KEYS
         return task.id, proof.record.id, policy.id

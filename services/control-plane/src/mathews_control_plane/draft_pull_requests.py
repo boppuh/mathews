@@ -78,6 +78,26 @@ _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _BRANCH = re.compile(r"(?!.*(?:\.\.|//|@\{|\\))[A-Za-z0-9][A-Za-z0-9._/-]{0,254}\Z")
 _REPOSITORY = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38})/[a-z0-9](?:[a-z0-9._-]{0,99})\Z")
 _PROOF_SCHEMA_VERSION = 1
+DRAFT_PULL_REQUEST_PROOF_KEYS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "brief_id",
+        "validation_contract_id",
+        "validation_contract_version",
+        "repository_configuration_id",
+        "repository_configuration_version",
+        "validation_run_id",
+        "validation_decision_evidence_id",
+        "commit_sha",
+        "tree_sha",
+        "local_before_push",
+        "push_result",
+        "local_after_push",
+        "pull_request",
+        "pull_request_content_sha256",
+    }
+)
 
 
 class DraftPullRequestError(RuntimeError):
@@ -326,12 +346,15 @@ class GitHubDraftPullRequestPublisher:
                     # The POST may have committed even when its response was lost.
                     # Reconcile by exact identity before allowing a retry to create
                     # a duplicate pull request.
-                    observed = self._find_open_branch_draft(
-                        owner=owner,
-                        branch=branch,
-                        base=base,
-                        authorization=authorization,
-                    )
+                    try:
+                        observed = self._find_open_branch_draft(
+                            owner=owner,
+                            branch=branch,
+                            base=base,
+                            authorization=authorization,
+                        )
+                    except DraftPullRequestError as lookup_error:
+                        raise error from lookup_error
                     if observed is None:
                         raise error
             _require_pr_head(observed, branch=branch, head_sha=expected)
@@ -686,34 +709,36 @@ class _DraftProofGates(TaskTransitionGateEvaluator):
             return TaskTransitionGuards()
         loaded = load_evidence(session, self._store, record)
         payload = loaded.content
-        if not isinstance(payload, dict):
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != DRAFT_PULL_REQUEST_PROOF_KEYS
+        ):
             return TaskTransitionGuards()
         try:
             commit = _sha(payload["commit_sha"])
-            run_id = UUID(cast(str, payload["validation_run_id"]))
-            contract_id = UUID(cast(str, payload["validation_contract_id"]))
-            config_id = UUID(cast(str, payload["repository_configuration_id"]))
-            before = cast(dict[str, object], payload["local_before_push"])
-            pushed = cast(dict[str, object], payload["push_result"])
-            after = cast(dict[str, object], payload["local_after_push"])
-            pull_request = cast(dict[str, object], payload["pull_request"])
+            proof_task_id = _uuid_member(payload, "task_id")
+            brief_id = _uuid_member(payload, "brief_id")
+            run_id = _uuid_member(payload, "validation_run_id")
+            contract_id = _uuid_member(payload, "validation_contract_id")
+            config_id = _uuid_member(payload, "repository_configuration_id")
+            decision_id = _uuid_member(payload, "validation_decision_evidence_id")
+            before = _object_member(payload, "local_before_push")
+            pushed = _object_member(payload, "push_result")
+            after = _object_member(payload, "local_after_push")
+            pull_request = _object_member(payload, "pull_request")
         except (KeyError, TypeError, ValueError, DraftPullRequestError):
             return TaskTransitionGuards()
         run = session.get(ValidationRun, run_id)
         contract = session.get(ValidationContract, contract_id)
         configuration = session.get(RepositoryConfiguration, config_id)
-        decision_id_value = payload.get("validation_decision_evidence_id")
-        try:
-            decision_id = UUID(cast(str, decision_id_value))
-        except (TypeError, ValueError):
-            return TaskTransitionGuards()
         decision = session.get(EvidenceRecord, decision_id)
         if decision is not None:
             load_evidence(session, self._store, decision)
         valid = (
             payload.get("schema_version") == _PROOF_SCHEMA_VERSION
+            and proof_task_id == task.id
             and task.accepted_brief_id is not None
-            and payload.get("brief_id") == str(task.accepted_brief_id)
+            and brief_id == task.accepted_brief_id
             and task.validation_contract_id == contract_id
             and task.repository_configuration_id == config_id
             and contract is not None
@@ -734,6 +759,11 @@ class _DraftProofGates(TaskTransitionGateEvaluator):
             and decision.validation_run_id == run.id
             and decision.evidence_type == "validation-decision"
             and payload.get("validation_decision_evidence_id") == str(decision.id)
+            and isinstance(payload.get("pull_request_content_sha256"), str)
+            and re.fullmatch(
+                r"[0-9a-f]{64}", cast(str, payload["pull_request_content_sha256"])
+            )
+            is not None
             and before.get("head_sha") == commit
             and before.get("tree_sha") == run.tree_sha
             and before.get("clean") is True
@@ -872,6 +902,20 @@ def _human_or_cancel_fence(session: Session, task_id: UUID) -> bool:
         )
         or session.scalar(select(exists().where(TaskCancellation.task_id == task_id)))
     )
+
+
+def _uuid_member(payload: Mapping[str, object], key: str) -> UUID:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        raise ValueError("proof UUID member is invalid")
+    return UUID(value)
+
+
+def _object_member(payload: Mapping[str, object], key: str) -> dict[str, object]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise ValueError("proof object member is invalid")
+    return cast(dict[str, object], value)
 
 
 def _require_no_human_or_cancel_fence(session: Session, task_id: UUID) -> None:
