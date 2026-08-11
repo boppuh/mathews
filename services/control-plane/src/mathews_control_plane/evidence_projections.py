@@ -37,10 +37,11 @@ from mathews_control_plane.evidence import (
     EvidenceNotFoundError,
     EvidenceSourceKind,
     EvidenceValidationError,
-    _append_event,
-    _authorize,
-    _principal,
+    append_evidence_audit_event,
+    authorize_evidence_access,
     load_evidence,
+    normalize_evidence_timestamp,
+    resolve_evidence_principal,
 )
 
 Clock = Callable[[], datetime]
@@ -81,6 +82,28 @@ class EvidenceDerivativeStatus(StrEnum):
 class ProvenanceEdgeKind(StrEnum):
     PARENT = "PARENT"
     CORRECTS = "CORRECTS"
+
+
+_EVIDENCE_TYPE_CLASSES: Mapping[str, EvidenceProjectionClass] = {
+    "task-request": EvidenceProjectionClass.REQUEST,
+    "task-steering-message": EvidenceProjectionClass.REQUEST,
+    "repository-preflight-request": EvidenceProjectionClass.REQUEST,
+    "validation-rerun-request": EvidenceProjectionClass.REQUEST,
+    "repository-preflight": EvidenceProjectionClass.REPOSITORY_STATE,
+    "workspace-diff": EvidenceProjectionClass.REPOSITORY_STATE,
+    "validation-repair-candidate": EvidenceProjectionClass.REPOSITORY_STATE,
+    "hermes-tool-proposal": EvidenceProjectionClass.TOOL_OPERATION,
+    "hermes-tool-authorization": EvidenceProjectionClass.TOOL_OPERATION,
+    "hermes-tool-result": EvidenceProjectionClass.TOOL_OPERATION,
+    "validation-unit-test-output": EvidenceProjectionClass.TEST_ARTIFACT,
+    "validation-integration-test-output": EvidenceProjectionClass.TEST_ARTIFACT,
+    "validation-simulator-artifact": EvidenceProjectionClass.TEST_ARTIFACT,
+    "validation-application-log": EvidenceProjectionClass.TEST_ARTIFACT,
+    "validation-crash-signal": EvidenceProjectionClass.TEST_ARTIFACT,
+    "validation-error-signal": EvidenceProjectionClass.TEST_ARTIFACT,
+    "validation-network-signal": EvidenceProjectionClass.TEST_ARTIFACT,
+    "validation-performance-signal": EvidenceProjectionClass.TEST_ARTIFACT,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,7 +281,7 @@ class EvidenceProjectionService:
         limit = _bounded_limit(limit)
         now = self._clock()
         with self._factory.begin() as session:
-            principal = _principal(authentication, now=now)
+            principal = resolve_evidence_principal(authentication, now=now)
             task = session.get(Task, task_id)
             if task is None or task.owner_id != principal:
                 raise EvidenceNotFoundError("task evidence is unavailable")
@@ -269,12 +292,13 @@ class EvidenceProjectionService:
                 browser_authentication=authentication,
                 now=now,
             )
+            fetched_full_page = len(records) > limit
             authorized = tuple(
                 record
                 for record in records
                 if self._browser_authorized(session, record, authentication, now=now)
             )
-            truncated = len(authorized) > limit
+            truncated = fetched_full_page or len(authorized) > limit
             selected = authorized[:limit]
             projections = self._project(session, selected)
             self._audit(
@@ -329,7 +353,9 @@ class EvidenceProjectionService:
             root = session.get(EvidenceRecord, evidence_id)
             if root is None:
                 raise EvidenceNotFoundError("evidence is unavailable")
-            principal = _authorize(session, root, authentication, now=now)
+            principal = authorize_evidence_access(
+                session, root, authentication, now=now
+            )
 
             def allowed(record: EvidenceRecord) -> bool:
                 return self._browser_authorized(
@@ -389,7 +415,7 @@ class EvidenceProjectionService:
         now: datetime,
     ) -> bool:
         try:
-            _authorize(session, record, authentication, now=now)
+            authorize_evidence_access(session, record, authentication, now=now)
         except EvidenceNotFoundError:
             return False
         return True
@@ -417,7 +443,10 @@ class EvidenceProjectionService:
             recent_password = bool(
                 now is not None
                 and browser_authentication.recent_password_verified
-                and browser_authentication.reauthenticated_until > now
+                and normalize_evidence_timestamp(
+                    browser_authentication.reauthenticated_until
+                )
+                > normalize_evidence_timestamp(now)
             )
             direct_access = [EvidenceAccessClass.OWNER.value]
             if recent_password:
@@ -615,37 +644,53 @@ class EvidenceProjectionService:
         examined: set[UUID] = set()
         truncated = False
         while queue:
-            record = queue.popleft()
-            if record.id in examined:
-                continue
-            examined.add(record.id)
-            if not allowed(record):
-                continue
-            if len(nodes) >= limit:
+            frontier: list[EvidenceRecord] = []
+            for _ in range(len(queue)):
+                record = queue.popleft()
+                if record.id in examined:
+                    continue
+                examined.add(record.id)
+                if allowed(record):
+                    frontier.append(record)
+            available = limit - len(nodes)
+            if len(frontier) > available:
+                frontier = frontier[:available]
                 truncated = True
-                break
-            nodes[record.id] = record
-            relation_ids = {record.id}
-            if record.correction_of_id is not None:
-                relation_ids.add(record.correction_of_id)
-            if record.parent_correlation_id is not None:
-                relation_ids.add(record.parent_correlation_id)
+            for record in frontier:
+                nodes[record.id] = record
+            if truncated or not frontier:
+                if truncated:
+                    break
+                continue
+            frontier_ids = {record.id for record in frontier}
+            relation_ids = set(frontier_ids)
+            relation_ids.update(
+                record.correction_of_id
+                for record in frontier
+                if record.correction_of_id is not None
+            )
+            relation_ids.update(
+                record.parent_correlation_id
+                for record in frontier
+                if record.parent_correlation_id is not None
+            )
             related = tuple(
                 session.scalars(
                     select(EvidenceRecord).where(
                         EvidenceRecord.owner_id == root.owner_id,
                         or_(
                             EvidenceRecord.id.in_(relation_ids),
-                            EvidenceRecord.correction_of_id == record.id,
-                            EvidenceRecord.parent_correlation_id == record.id,
+                            EvidenceRecord.correction_of_id.in_(frontier_ids),
+                            EvidenceRecord.parent_correlation_id.in_(frontier_ids),
                         ),
                     )
                 )
             )
-            for candidate in related:
-                if candidate.id != record.id:
-                    queue.append(candidate)
-                _add_relation_edges(edges, record, candidate)
+            for record in frontier:
+                for candidate in related:
+                    if candidate.id != record.id:
+                        queue.append(candidate)
+                    _add_relation_edges(edges, record, candidate)
         visible = set(nodes)
         visible_edges = tuple(
             sorted(
@@ -678,7 +723,7 @@ class EvidenceProjectionService:
         now: datetime,
     ) -> None:
         for record in records:
-            _append_event(
+            append_evidence_audit_event(
                 session,
                 record=record,
                 event_type=EvidenceAuditEventType.METADATA_READ,
@@ -727,43 +772,18 @@ def _classify(
             "pull_request_review_thread",
         } or "GITHUB_REVIEW_UPDATED" in event_types:
         return EvidenceProjectionClass.REVIEW
-    if source_kind is EvidenceSourceKind.REQUEST or any(
-        token in evidence_type for token in ("request", "steering")
-    ):
+    if source_kind is EvidenceSourceKind.REQUEST:
         return EvidenceProjectionClass.REQUEST
-    if source_kind is EvidenceSourceKind.REPOSITORY_SNAPSHOT or any(
-        token in evidence_type
-        for token in ("repository", "workspace-diff", "preflight", "candidate")
-    ):
+    if source_kind is EvidenceSourceKind.REPOSITORY_SNAPSHOT:
         return EvidenceProjectionClass.REPOSITORY_STATE
-    if source_kind is EvidenceSourceKind.TOOL_OPERATION or evidence_type.startswith(
-        "hermes-tool-"
-    ):
+    if source_kind is EvidenceSourceKind.TOOL_OPERATION:
         return EvidenceProjectionClass.TOOL_OPERATION
-    if _is_test_artifact(evidence_type):
-        return EvidenceProjectionClass.TEST_ARTIFACT
     if (
         source_kind is EvidenceSourceKind.EXTERNAL_EVENT
         or evidence_type == "github-webhook"
     ):
         return EvidenceProjectionClass.EXTERNAL_EVENT
-    return EvidenceProjectionClass.RESULT
-
-
-def _is_test_artifact(evidence_type: str) -> bool:
-    artifact_tokens = (
-        "unit-test",
-        "integration-test",
-        "simulator-artifact",
-        "application-log",
-        "crash-signal",
-        "error-signal",
-        "network-signal",
-        "performance-signal",
-        "test-artifact",
-        "test-output",
-    )
-    return any(token in evidence_type for token in artifact_tokens)
+    return _EVIDENCE_TYPE_CLASSES.get(evidence_type, EvidenceProjectionClass.RESULT)
 
 
 def _bounded_limit(limit: int) -> int:

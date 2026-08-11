@@ -852,6 +852,57 @@ def _authorize(
     return principal
 
 
+def normalize_evidence_timestamp(value: datetime) -> datetime:
+    """Normalize a persisted evidence timestamp to an aware UTC value."""
+
+    return _as_utc(value)
+
+
+def resolve_evidence_principal(
+    authentication: AuthenticatedSession,
+    *,
+    now: datetime,
+) -> str:
+    """Resolve the local evidence principal without revealing auth failures."""
+
+    return _principal(authentication, now=now)
+
+
+def authorize_evidence_access(
+    session: Session,
+    record: EvidenceRecord,
+    authentication: AuthenticatedSession,
+    *,
+    now: datetime,
+) -> str:
+    """Enforce one canonical evidence record's original access class."""
+
+    return _authorize(session, record, authentication, now=now)
+
+
+def append_evidence_audit_event(
+    session: Session,
+    *,
+    record: EvidenceRecord,
+    event_type: EvidenceAuditEventType,
+    actor_id: str,
+    occurred_at: datetime,
+    details: Mapping[str, object],
+    session_id: UUID | None = None,
+) -> EvidenceAuditEvent:
+    """Append a non-content event through the canonical evidence audit path."""
+
+    return _append_event(
+        session,
+        record=record,
+        event_type=event_type,
+        actor_id=actor_id,
+        occurred_at=occurred_at,
+        details=details,
+        session_id=session_id,
+    )
+
+
 def _live_record(
     session: Session,
     evidence_id: UUID,

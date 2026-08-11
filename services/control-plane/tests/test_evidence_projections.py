@@ -56,7 +56,7 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 _ORIGIN = "http://localhost:3000"
-_PASSWORD = "correct horse battery staple"
+_PASSWORD = "correct horse battery staple"  # noqa: S105 - test-only credential
 
 
 @dataclass(slots=True)
@@ -328,6 +328,7 @@ def test_browser_views_preserve_each_original_access_class(
     )
     result = service.task_projections(task_id, ordinary)
     assert {item.evidence_id for item in result.projections} == {owner.id}
+    assert result.truncated is False
     with pytest.raises(EvidenceNotFoundError):
         service.provenance(recent.id, ordinary)
     with pytest.raises(EvidenceNotFoundError):
@@ -340,6 +341,13 @@ def test_browser_views_preserve_each_original_access_class(
         owner.id,
         recent.id,
     }
+    limited = service.task_projections(
+        task_id,
+        _authentication(projection_harness.now),
+        limit=1,
+    )
+    assert len(limited.projections) == 1
+    assert limited.truncated is True
 
 
 def test_corrections_deletions_and_derivatives_propagate_to_provenance(
@@ -479,7 +487,7 @@ def test_provenance_navigation_omits_inaccessible_related_nodes(
     )
 
 
-def test_projection_routes_require_authentication_and_precede_uuid_route(
+def test_projection_routes_require_authentication_and_disable_caching(
     tmp_path: Path,
 ) -> None:
     database_url = f"sqlite:///{tmp_path / 'projection-api.sqlite3'}"
@@ -494,7 +502,7 @@ def test_projection_routes_require_authentication_and_precede_uuid_route(
         task = _task()
         session.add(task)
         session.flush()
-        _capture(
+        captured = _capture(
             ProjectionHarness(engine, factory, store, now),
             session,
             task_id=task.id,
@@ -503,6 +511,7 @@ def test_projection_routes_require_authentication_and_precede_uuid_route(
             content={"request": "api"},
         )
         task_id = task.id
+        evidence_id = captured.id
     app = create_app(
         Settings(database_url=SecretStr(database_url), artifact_root=store.root),
         session_factory=factory,
@@ -512,7 +521,9 @@ def test_projection_routes_require_authentication_and_precede_uuid_route(
     client = TestClient(app, base_url="https://localhost")
     try:
         path = f"/api/evidence/tasks/{task_id}/projections"
+        provenance_path = f"/api/evidence/{evidence_id}/provenance"
         assert client.get(path).status_code == 401
+        assert client.get(provenance_path).status_code == 401
         bootstrap_token = generate_bootstrap_token(factory)
         assert client.get("/api/auth/status").status_code == 200
         csrf_token = client.cookies.get(CSRF_COOKIE_NAME)
@@ -527,6 +538,10 @@ def test_projection_routes_require_authentication_and_precede_uuid_route(
         assert response.status_code == 200, response.text
         assert response.headers["cache-control"] == "no-store"
         assert response.json()["projections"][0]["projection_class"] == "REQUEST"
+        provenance = client.get(provenance_path)
+        assert provenance.status_code == 200, provenance.text
+        assert provenance.headers["cache-control"] == "no-store"
+        assert provenance.json()["root_evidence_id"] == str(evidence_id)
     finally:
         client.close()
         engine.dispose()
