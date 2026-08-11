@@ -67,6 +67,10 @@ from mathews_control_plane.repositories import (
     RepositoryService,
     create_repository_router,
 )
+from mathews_control_plane.retrieval_index import (
+    RetrievalIndexService,
+    create_retrieval_index_router,
+)
 from mathews_control_plane.settings import Settings, settings
 from mathews_control_plane.tasks import (
     TaskBodyLimitMiddleware,
@@ -84,6 +88,8 @@ from mathews_control_plane.validation_evidence import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_RETRIEVAL_INDEX_ACTOR = "retrieval-index-worker"
+_RETRIEVAL_INDEX_REFRESH_SECONDS = 5
 
 
 class HealthResponse(BaseModel):
@@ -101,6 +107,7 @@ def create_app(
     authentication_service: AuthenticationService | None = None,
     evidence_service: EvidenceService | None = None,
     evidence_projection_service: EvidenceProjectionService | None = None,
+    retrieval_index_service: RetrievalIndexService | None = None,
     task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
     repository_service: RepositoryService | None = None,
@@ -141,6 +148,16 @@ def create_app(
         evidence_projection_service = EvidenceProjectionService(
             session_factory,
             artifact_store,
+        )
+    if retrieval_index_service is None:
+        if evidence_projection_service.artifact_root != artifact_store.root:
+            raise ValueError(
+                "the retrieval index and evidence projections must share an artifact root"
+            )
+        retrieval_index_service = RetrievalIndexService(
+            session_factory,
+            artifact_store,
+            evidence_projection_service,
         )
     if task_service is None:
         task_service = TaskService(
@@ -204,6 +221,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
         webhook_drain_task: asyncio.Task[None] | None = None
+        retrieval_refresh_task: asyncio.Task[None] | None = None
         if github_webhook_service is not None:
             webhook_batch_size = 100
             for _pass in range(10):
@@ -256,8 +274,32 @@ def create_app(
         ):
             pass
         try:
+            await run_in_threadpool(
+                retrieval_index_service.refresh_stale_task_indexes_internal,
+                actor_id=_RETRIEVAL_INDEX_ACTOR,
+            )
+        except Exception:
+            _LOGGER.exception("initial retrieval-index refresh failed")
+
+        async def refresh_retrieval_indexes() -> None:
+            while True:
+                await asyncio.sleep(_RETRIEVAL_INDEX_REFRESH_SECONDS)
+                try:
+                    await run_in_threadpool(
+                        retrieval_index_service.refresh_stale_task_indexes_internal,
+                        actor_id=_RETRIEVAL_INDEX_ACTOR,
+                    )
+                except Exception:
+                    _LOGGER.exception("retrieval-index refresh failed")
+
+        retrieval_refresh_task = asyncio.create_task(refresh_retrieval_indexes())
+        try:
             yield
         finally:
+            if retrieval_refresh_task is not None:
+                retrieval_refresh_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await retrieval_refresh_task
             if webhook_drain_task is not None:
                 webhook_drain_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -276,6 +318,7 @@ def create_app(
     application.state.authentication_service = authentication_service
     application.state.evidence_service = evidence_service
     application.state.evidence_projection_service = evidence_projection_service
+    application.state.retrieval_index_service = retrieval_index_service
     application.state.task_service = task_service
     application.state.approval_service = approval_service
     application.state.repository_service = repository_service
@@ -287,6 +330,7 @@ def create_app(
     application.include_router(
         create_evidence_projection_router(evidence_projection_service)
     )
+    application.include_router(create_retrieval_index_router(retrieval_index_service))
     application.include_router(create_evidence_router(evidence_service))
     application.include_router(create_task_router(task_service))
     application.include_router(create_approval_router(approval_service))

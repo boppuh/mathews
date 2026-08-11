@@ -75,6 +75,8 @@ EXPECTED_HEAD_TABLES = {
     "policy_versions",
     "prompt_template_versions",
     "repository_configurations",
+    "retrieval_index_chunks",
+    "retrieval_index_generations",
     "reconciliation_targets",
     "review_rules",
     "rule_candidates",
@@ -101,6 +103,10 @@ HERMES_TABLES = {
     "hermes_tool_decisions",
     "hermes_tool_proposals",
     "hermes_tool_results",
+}
+RETRIEVAL_INDEX_TABLES = {
+    "retrieval_index_chunks",
+    "retrieval_index_generations",
 }
 
 
@@ -998,7 +1004,10 @@ def test_job_loop_migration_enforces_fenced_provenance_and_guarded_downgrade(
     ):
         command.downgrade(config, "0005")
     assert _table_names(database_url) == (
-        EXPECTED_HEAD_TABLES - RELIABILITY_TABLES - HERMES_TABLES
+        EXPECTED_HEAD_TABLES
+        - RELIABILITY_TABLES
+        - HERMES_TABLES
+        - RETRIEVAL_INDEX_TABLES
     )
 
 
@@ -1156,7 +1165,9 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         match="cancellation or outage provenance",
     ):
         command.downgrade(config, "0007")
-    assert _table_names(database_url) == EXPECTED_HEAD_TABLES - HERMES_TABLES
+    assert _table_names(database_url) == (
+        EXPECTED_HEAD_TABLES - HERMES_TABLES - RETRIEVAL_INDEX_TABLES
+    )
 
 
 def test_outage_escalation_and_resume_operate_through_migrated_guards(

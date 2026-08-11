@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
@@ -272,6 +273,12 @@ class EvidenceProjectionService:
         self._factory = factory
         self._artifact_store = artifact_store
         self._clock = clock
+
+    @property
+    def artifact_root(self) -> Path:
+        """Return the canonical artifact root used to verify projections."""
+
+        return self._artifact_store.root
 
     def task_projections(
         self,
