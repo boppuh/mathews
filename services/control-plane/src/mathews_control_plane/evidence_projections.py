@@ -93,6 +93,8 @@ _EVIDENCE_TYPE_CLASSES: Mapping[str, EvidenceProjectionClass] = {
     "repository-preflight": EvidenceProjectionClass.REPOSITORY_STATE,
     "workspace-diff": EvidenceProjectionClass.REPOSITORY_STATE,
     "validation-repair-candidate": EvidenceProjectionClass.REPOSITORY_STATE,
+    "review-repair-candidate": EvidenceProjectionClass.REPOSITORY_STATE,
+    "review-resolution-assessment": EvidenceProjectionClass.REVIEW,
     "hermes-tool-proposal": EvidenceProjectionClass.TOOL_OPERATION,
     "hermes-tool-authorization": EvidenceProjectionClass.TOOL_OPERATION,
     "hermes-tool-result": EvidenceProjectionClass.TOOL_OPERATION,

@@ -219,6 +219,22 @@ def test_internal_task_view_classifies_all_verified_sources_without_copying(
             source_kind=EvidenceSourceKind.RESULT,
             content={"passed": True},
         )
+        review_assessment = _capture(
+            projection_harness,
+            session,
+            task_id=task.id,
+            evidence_type="review-resolution-assessment",
+            source_kind=EvidenceSourceKind.RESULT,
+            content={"authorized": True},
+        )
+        review_candidate = _capture(
+            projection_harness,
+            session,
+            task_id=task.id,
+            evidence_type="review-repair-candidate",
+            source_kind=EvidenceSourceKind.RESULT,
+            content={"commit_sha": "a" * 40},
+        )
         ci = _capture(
             projection_harness,
             session,
@@ -282,16 +298,24 @@ def test_internal_task_view_classifies_all_verified_sources_without_copying(
     repository = next(
         item
         for item in result.projections
-        if item.projection_class is EvidenceProjectionClass.REPOSITORY_STATE
+        if item.evidence_type == "workspace-diff"
     )
     assert repository.parent_correlation_id == request.id
     ci_view = next(item for item in result.projections if item.evidence_id == ci.id)
     assert len(ci_view.task_event_references) == 1
+    assessment_view = next(
+        item for item in result.projections if item.evidence_id == review_assessment.id
+    )
+    candidate_view = next(
+        item for item in result.projections if item.evidence_id == review_candidate.id
+    )
+    assert assessment_view.projection_class is EvidenceProjectionClass.REVIEW
+    assert candidate_view.projection_class is EvidenceProjectionClass.REPOSITORY_STATE
     assert next(
         item for item in result.projections if item.evidence_id == schema_free.id
     ).projection_class is EvidenceProjectionClass.RESULT
     with projection_harness.factory() as session:
-        assert session.scalar(select(func.count()).select_from(EvidenceRecord)) == 7
+        assert session.scalar(select(func.count()).select_from(EvidenceRecord)) == 9
         assert session.scalar(select(func.count()).select_from(EvidenceDerivative)) == 0
 
 
