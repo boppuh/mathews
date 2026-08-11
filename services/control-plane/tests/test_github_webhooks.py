@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -18,6 +19,7 @@ from mathews_configuration import (
 from mathews_control_plane.app import create_app
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import AuthenticatedSession
+from mathews_control_plane.background_jobs import LeasedJobContext
 from mathews_control_plane.database import (
     SessionFactory,
     create_database_engine,
@@ -38,6 +40,7 @@ from mathews_control_plane.github_app import GitHubWebhookVerifier
 from mathews_control_plane.github_webhooks import (
     GITHUB_CHECK_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
+    GitHubWebhookJobHandler,
     GitHubWebhookService,
 )
 from mathews_control_plane.settings import Settings
@@ -314,6 +317,38 @@ def test_verified_delivery_is_persisted_correlated_and_wakes_task(
     assert cockpit.github.ci_status == "PASSED"
     assert cockpit.github.checks_total == 1
     assert cockpit.github.checks_passed == 1
+
+
+def test_durable_webhook_wakeup_reconciles_exact_task_readiness() -> None:
+    task_id = uuid4()
+    event_id = uuid4()
+
+    class Reconciler:
+        def __init__(self) -> None:
+            self.calls: list[tuple[UUID, UUID]] = []
+
+        def reconcile(self, task_id: UUID, *, trigger_event_id: UUID) -> object:
+            self.calls.append((task_id, trigger_event_id))
+            return SimpleNamespace(status=SimpleNamespace(value="READY"))
+
+    reconciler = Reconciler()
+    context = SimpleNamespace(
+        grant=SimpleNamespace(
+            task_id=task_id,
+            input_payload={
+                "delivery_id": "delivery-1",
+                "task_event_id": str(event_id),
+                "head_sha": _HEAD_SHA,
+            },
+        )
+    )
+
+    result = GitHubWebhookJobHandler(reconciler)(
+        cast(LeasedJobContext, context)
+    )
+
+    assert reconciler.calls == [(task_id, event_id)]
+    assert result["readiness_status"] == "READY"
 
 
 def test_duplicate_delivery_replays_without_duplicate_event_or_job(

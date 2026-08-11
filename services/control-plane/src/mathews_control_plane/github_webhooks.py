@@ -9,7 +9,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -100,8 +100,20 @@ class GitHubWebhookIngestionResponse(BaseModel):
     job_id: UUID | None = None
 
 
+class GitHubWorkflowReconciler(Protocol):
+    def reconcile(
+        self,
+        task_id: UUID,
+        *,
+        trigger_event_id: UUID,
+    ) -> object: ...
+
+
 class GitHubWebhookJobHandler:
     """Consume one durable GitHub wake-up after its task event is committed."""
+
+    def __init__(self, readiness: GitHubWorkflowReconciler | None = None) -> None:
+        self._readiness = readiness
 
     def __call__(self, context: LeasedJobContext) -> Mapping[str, object]:
         payload = context.grant.input_payload
@@ -114,11 +126,20 @@ class GitHubWebhookJobHandler:
             head_sha,
         )):
             raise ValueError("github webhook wake-up payload is invalid")
+        readiness_status = "NOT_CONFIGURED"
+        if self._readiness is not None:
+            result = self._readiness.reconcile(
+                context.grant.task_id,
+                trigger_event_id=UUID(cast(str, task_event_id)),
+            )
+            result_status = getattr(result, "status", None)
+            readiness_status = str(getattr(result_status, "value", result_status))
         return {
             "delivery_id": cast(str, delivery_id),
             "task_event_id": cast(str, task_event_id),
             "head_sha": cast(str, head_sha),
             "workflow_woken": True,
+            "readiness_status": readiness_status,
         }
 
 

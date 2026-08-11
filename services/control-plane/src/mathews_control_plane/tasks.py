@@ -58,6 +58,11 @@ from mathews_control_plane.github_webhooks import (
     GITHUB_PULL_REQUEST_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
 )
+from mathews_control_plane.readiness import (
+    HandoffResult,
+    ReadinessError,
+    ReadinessService,
+)
 from mathews_control_plane.reliability import (
     CancellationService,
     ReliabilityConflictError,
@@ -201,6 +206,28 @@ class TaskCancellationResponse(BaseModel):
     revoked_lease_count: int = Field(ge=0)
     revoked_tool_grant_count: int = Field(ge=0)
     cleanup_complete: bool
+    replayed: bool
+
+
+class TaskHandoffRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    handoff_id: UUID
+    expected_head_sha: GitObjectId
+    acknowledgement: Literal[
+        "I acknowledge that automation is complete and that merge, deployment, "
+        "delivery, and release remain human responsibilities."
+    ]
+
+
+class TaskHandoffResponse(BaseModel):
+    handoff_id: UUID
+    task_id: UUID
+    task_state: Literal[TaskState.HANDED_OFF]
+    head_sha: str
+    acknowledgement_evidence_id: UUID
+    event_id: UUID
+    meaning: str
     replayed: bool
 
 
@@ -386,6 +413,11 @@ class TaskService:
             artifact_store,
             clock=self._clock,
         )
+        self._readiness = ReadinessService(
+            session_factory,
+            artifact_store,
+            clock=self._clock,
+        )
 
     def create(
         self,
@@ -553,6 +585,43 @@ class TaskService:
             revoked_tool_grant_count=result.revoked_tool_grant_count,
             cleanup_complete=result.cleanup_complete,
             replayed=result.replayed,
+        )
+
+    def acknowledge_handoff(
+        self,
+        task_id: UUID,
+        body: TaskHandoffRequest,
+        authentication: AuthenticatedSession,
+    ) -> TaskHandoffResponse:
+        owner_id = _principal(authentication)
+        now = _as_utc(self._clock())
+        if not (
+            authentication.recent_password_verified
+            and _as_utc(authentication.reauthenticated_until) > now
+        ):
+            raise PermissionError("recent password authentication required")
+        with self._factory() as session:
+            task = session.scalar(
+                select(Task).where(Task.id == task_id, Task.owner_id == owner_id)
+            )
+        if task is None:
+            raise TaskNotFoundError("task is unavailable")
+        result: HandoffResult = self._readiness.acknowledge_handoff(
+            task_id,
+            handoff_id=body.handoff_id,
+            expected_head_sha=body.expected_head_sha,
+            acknowledgement=body.acknowledgement,
+            actor_id=owner_id,
+        )
+        return TaskHandoffResponse(
+            handoff_id=result.handoff_id,
+            task_id=result.task_id,
+            task_state=TaskState.HANDED_OFF,
+            head_sha=result.head_sha,
+            acknowledgement_evidence_id=result.acknowledgement_evidence_id,
+            event_id=result.transition.event_id,
+            meaning=result.meaning,
+            replayed=result.transition.replayed,
         )
 
     def detail(
@@ -1231,6 +1300,15 @@ def _event_response(
             summary = "Task cancelled; active automation was fenced."
         elif event.transition_kind == TaskTransitionKind.SCOPE_STEER.value:
             summary = "Scope changed; a new brief and validation contract are required."
+        elif event.transition_kind == TaskTransitionKind.MARK_MERGE_READY.value:
+            summary = "The exact pull-request head is ready for human action."
+        elif event.transition_kind == TaskTransitionKind.INVALIDATE_READINESS.value:
+            summary = "Exact-head readiness was invalidated by current evidence."
+        elif event.transition_kind == TaskTransitionKind.ACKNOWLEDGE_HANDOFF.value:
+            summary = (
+                "Human acknowledged automation handoff; this does not mean merged, "
+                "deployed, delivered, or released."
+            )
         else:
             summary = (
                 f"State changed from {_state_label(from_state)} "
@@ -1740,7 +1818,7 @@ class TaskBodyLimitMiddleware:
             len(parts) == 5
             and parts[:3] == ["", "api", "tasks"]
             and bool(parts[3])
-            and parts[4] in {"steering", "cancellations"}
+            and parts[4] in {"steering", "cancellations", "handoff"}
         )
 
     @staticmethod
@@ -1856,6 +1934,35 @@ def create_task_router(service: TaskService) -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="task cancellation conflicts with durable state",
+            ) from None
+
+    @router.post(
+        "/{task_id}/handoff",
+        response_model=TaskHandoffResponse,
+    )
+    def acknowledge_task_handoff(
+        task_id: UUID,
+        body: TaskHandoffRequest,
+        authentication: AuthenticatedTaskSession,
+        response: Response,
+    ) -> TaskHandoffResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return service.acknowledge_handoff(task_id, body, authentication)
+        except PermissionError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="recent password authentication required",
+            ) from None
+        except (TaskAccessError, TaskNotFoundError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="task unavailable",
+            ) from None
+        except (ReadinessError, TaskTransitionError):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="task handoff conflicts with exact readiness state",
             ) from None
 
     @router.get("/{task_id}/events")

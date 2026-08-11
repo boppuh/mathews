@@ -34,13 +34,14 @@ complete here unless its backlog definition of done is satisfied on `main`.
   repair,
   `6.1` least-privilege GitHub App authentication, `6.2` exact-head verified
   draft pull-request publication, `6.3` signed,
-  idempotent CI and review webhook ingestion, and `6.4` policy-gated,
-  exact-head review resolution,
+  idempotent CI and review webhook ingestion, `6.4` policy-gated,
+  exact-head review resolution, and `6.5` exact-head readiness and explicit
+  human handoff,
   `7.1` verified-source projections and provenance views, `7.2` rebuildable
   retrieval index, and `7.3` version-bound retrieval and prompt telemetry.
-- Remaining: 3 of 40 MVP tasks.
+- Remaining: 2 of 40 MVP tasks.
 - Active next wave: Wave 7 pull request, review, and controlled learning.
-- Next completion target: `6.5`.
+- Next completion target: `7.4`.
 
 ## Operating model
 

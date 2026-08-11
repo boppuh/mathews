@@ -282,7 +282,11 @@ export function TaskCockpit({ taskId }: { taskId: string }) {
         <p>{stateContext.detail}</p>
       </section>
 
-      <TaskControls task={task} onRefresh={() => loadCockpit(undefined, true)} />
+      <TaskControls
+        task={task}
+        verifiedHeadSha={github.head_sha}
+        onRefresh={() => loadCockpit(undefined, true)}
+      />
 
       <section id="github" className="github-status-panel" aria-labelledby="github-heading">
         <div className="cockpit-section-heading">

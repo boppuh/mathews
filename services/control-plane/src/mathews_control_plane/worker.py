@@ -32,6 +32,7 @@ from mathews_control_plane.hermes_adapter import (
     UnavailableHermesRuntime,
 )
 from mathews_control_plane.host_gateway import configured_local_host_gateway
+from mathews_control_plane.readiness import ReadinessService
 from mathews_control_plane.reliability import (
     OwnedProcessTerminator,
     OwnedWorkspaceCleaner,
@@ -90,7 +91,9 @@ def build_worker(
         )
         handler_registry: dict[str, BackgroundJobHandler] = {
             "hermes-run": hermes_handler,
-            "github-webhook": GitHubWebhookJobHandler(),
+            "github-webhook": GitHubWebhookJobHandler(
+                ReadinessService(factory, store)
+            ),
         }
         if gateway is not None:
             validation_handler = ValidationEvidenceJobHandler(

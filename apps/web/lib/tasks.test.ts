@@ -6,6 +6,7 @@ import {
   parseTaskCancellationResponse,
   parseTaskCockpit,
   parseTaskEvent,
+  parseTaskHandoffResponse,
   parseTaskList,
   parseTaskSteeringResponse,
   parseTaskSummary,
@@ -79,10 +80,22 @@ describe("task control response parsing", () => {
     cleanup_complete: true,
     replayed: false,
   };
+  const handoff = {
+    handoff_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    task_id: task.id,
+    task_state: "HANDED_OFF",
+    head_sha: "a".repeat(40),
+    acknowledgement_evidence_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    event_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    meaning:
+      "Automation responsibility has ended; this does not mean merged, deployed, delivered, or released.",
+    replayed: false,
+  };
 
   it("accepts bounded steering and cancellation results", () => {
     expect(parseTaskSteeringResponse(steering)).toEqual(steering);
     expect(parseTaskCancellationResponse(cancellation)).toEqual(cancellation);
+    expect(parseTaskHandoffResponse(handoff)).toEqual(handoff);
   });
 
   it.each([
@@ -100,6 +113,15 @@ describe("task control response parsing", () => {
     { ...cancellation, revoked_tool_grant_count: -1 },
   ])("rejects invalid cancellation results", (value) => {
     expect(() => parseTaskCancellationResponse(value)).toThrow("control plane returned");
+  });
+
+  it.each([
+    { ...handoff, task_state: "READY_FOR_HUMAN_MERGE" },
+    { ...handoff, head_sha: "main" },
+    { ...handoff, meaning: "merged" },
+    { ...handoff, acknowledgement_evidence_id: "not-a-uuid" },
+  ])("rejects invalid handoff results", (value) => {
+    expect(() => parseTaskHandoffResponse(value)).toThrow("control plane returned");
   });
 });
 

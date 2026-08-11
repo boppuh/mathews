@@ -14,6 +14,7 @@ import {
   TASK_EVIDENCE_STATUSES,
   TASK_GITHUB_CI_STATUSES,
   TASK_GITHUB_REVIEW_STATUSES,
+  TASK_HANDOFF_MEANING,
   TASK_STATE_CONTEXT_KINDS,
   TASK_STATES,
   TASK_STEERING_IMPACTS,
@@ -32,6 +33,7 @@ import {
   type TaskGitHubCiStatus,
   type TaskGitHubReviewStatus,
   type TaskGitHubStatus,
+  type TaskHandoffResponse,
   type TaskListResponse,
   type TaskState,
   type TaskStateContext,
@@ -235,6 +237,32 @@ export function parseTaskCancellationResponse(value: unknown): TaskCancellationR
       "The control plane returned an invalid cancellation fence.",
     ),
     cleanup_complete: value.cleanup_complete,
+    replayed: value.replayed,
+  };
+}
+
+export function parseTaskHandoffResponse(value: unknown): TaskHandoffResponse {
+  if (
+    !isRecord(value) ||
+    value.task_state !== "HANDED_OFF" ||
+    typeof value.head_sha !== "string" ||
+    !GIT_OBJECT_ID_PATTERN.test(value.head_sha) ||
+    value.meaning !== TASK_HANDOFF_MEANING ||
+    typeof value.replayed !== "boolean"
+  ) {
+    throw new Error("The control plane returned an invalid handoff result.");
+  }
+  return {
+    handoff_id: parseUuid(value.handoff_id, "The control plane returned invalid handoff identity."),
+    task_id: parseUuid(value.task_id, "The control plane returned invalid handoff identity."),
+    task_state: value.task_state,
+    head_sha: value.head_sha,
+    acknowledgement_evidence_id: parseUuid(
+      value.acknowledgement_evidence_id,
+      "The control plane returned invalid handoff evidence.",
+    ),
+    event_id: parseUuid(value.event_id, "The control plane returned invalid handoff event."),
+    meaning: value.meaning,
     replayed: value.replayed,
   };
 }

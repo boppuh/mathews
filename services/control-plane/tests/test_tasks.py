@@ -54,7 +54,14 @@ from mathews_control_plane.evidence import (
     capture_evidence,
     load_evidence,
 )
+from mathews_control_plane.readiness import (
+    HANDOFF_ACKNOWLEDGEMENT,
+    HANDOFF_MEANING,
+    HandoffResult,
+    ReadinessService,
+)
 from mathews_control_plane.settings import Settings
+from mathews_control_plane.task_state_machine import TaskTransitionResult
 from mathews_control_plane.tasks import (
     MAX_TASK_EVENT_SEQUENCE,
     MAX_TASK_REQUEST_BYTES,
@@ -1212,7 +1219,89 @@ def test_cancellation_requires_recent_password_and_is_durable(
     )
 
 
-@pytest.mark.parametrize("operation", ["steering", "cancellations"])
+class _FakeReadinessService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def acknowledge_handoff(self, task_id: UUID, **kwargs: object) -> HandoffResult:
+        self.calls.append({"task_id": task_id, **kwargs})
+        return HandoffResult(
+            cast(UUID, kwargs["handoff_id"]),
+            task_id,
+            cast(str, kwargs["expected_head_sha"]),
+            uuid4(),
+            TaskTransitionResult(
+                task_id,
+                uuid4(),
+                uuid4(),
+                7,
+                TaskState.READY_FOR_HUMAN_MERGE,
+                TaskState.HANDED_OFF,
+            ),
+        )
+
+
+def test_handoff_requires_recent_password_and_exact_acknowledgement(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    task_id = UUID(str(_create(task_harness, csrf_token)["id"]))
+    fake = _FakeReadinessService()
+    task_harness.task_service._readiness = cast(ReadinessService, fake)
+    with task_harness.factory.begin() as session:
+        session.get_one(Task, task_id).state = TaskState.READY_FOR_HUMAN_MERGE
+    task_harness.clock.advance(timedelta(minutes=6))
+    handoff_id = uuid4()
+    payload = {
+        "handoff_id": str(handoff_id),
+        "expected_head_sha": "a" * 40,
+        "acknowledgement": HANDOFF_ACKNOWLEDGEMENT,
+    }
+
+    stale = task_harness.client.post(
+        f"/api/tasks/{task_id}/handoff",
+        json=payload,
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+    assert stale.status_code == 403
+    reauthenticated = task_harness.client.post(
+        "/api/auth/reauthenticate",
+        json={"password": _PASSWORD},
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+    assert reauthenticated.status_code == 200
+    refreshed_csrf = task_harness.client.cookies.get(CSRF_COOKIE_NAME)
+    assert refreshed_csrf is not None
+
+    response = task_harness.client.post(
+        f"/api/tasks/{task_id}/handoff",
+        json=payload,
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: refreshed_csrf},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "handoff_id": str(handoff_id),
+        "task_id": str(task_id),
+        "task_state": "HANDED_OFF",
+        "head_sha": "a" * 40,
+        "acknowledgement_evidence_id": response.json()[
+            "acknowledgement_evidence_id"
+        ],
+        "event_id": response.json()["event_id"],
+        "meaning": HANDOFF_MEANING,
+        "replayed": False,
+    }
+    assert len(fake.calls) == 1
+    rejected = task_harness.client.post(
+        f"/api/tasks/{task_id}/handoff",
+        json={**payload, "acknowledgement": "merge it"},
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: refreshed_csrf},
+    )
+    assert rejected.status_code == 422
+
+
+@pytest.mark.parametrize("operation", ["steering", "cancellations", "handoff"])
 def test_task_control_rejects_oversized_body_before_parsing(
     task_harness: TaskHarness,
     operation: str,
