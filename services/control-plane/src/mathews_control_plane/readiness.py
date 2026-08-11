@@ -20,6 +20,7 @@ from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
     BackgroundJob,
     BackgroundJobStatus,
+    EvidenceDeletionRequest,
     EvidenceRecord,
     PolicyVersion,
     Task,
@@ -601,6 +602,13 @@ def _draft_pr_facts(
             break
     if proof is None:
         return None, None
+    invalidated = session.scalar(
+        select(exists().where(EvidenceRecord.correction_of_id == proof.id))
+    ) or session.scalar(
+        select(exists().where(EvidenceDeletionRequest.evidence_id == proof.id))
+    )
+    if invalidated:
+        return proof.id, None
     try:
         guards = _DraftProofGates(store, proof.id).evaluate(
             session,
@@ -647,6 +655,26 @@ def _github_facts(events: Sequence[TaskEvent]) -> _GitHubFacts:
     ):
         return _empty_github_facts()
     required_checks = tuple(cast(list[str], checks_value))
+    carryover = binding.payload.get("review_state_carryover")
+    carried_reviews: dict[str, str] = {}
+    carried_threads: dict[str, str] = {}
+    if carryover is not None:
+        if not isinstance(carryover, dict) or set(carryover) != {
+            "changes_requested_review_ids",
+            "open_review_thread_ids",
+        }:
+            return _empty_github_facts()
+        raw_reviews = carryover.get("changes_requested_review_ids")
+        raw_threads = carryover.get("open_review_thread_ids")
+        if (
+            not isinstance(raw_reviews, list)
+            or not isinstance(raw_threads, list)
+            or any(not isinstance(value, str) or not value for value in raw_reviews)
+            or any(not isinstance(value, str) or not value for value in raw_threads)
+        ):
+            return _empty_github_facts()
+        carried_reviews = {value: "CHANGES_REQUESTED" for value in raw_reviews}
+        carried_threads = {value: "OPEN" for value in raw_threads}
     head_change = next(
         (
             event
@@ -705,18 +733,21 @@ def _github_facts(events: Sequence[TaskEvent]) -> _GitHubFacts:
     required_ci_green = len(check_states) == len(required_checks) and all(
         state in {"PASSED", "NEUTRAL"} for _name, state in check_states
     )
-    review_states = tuple(
-        str(event.payload.get("state"))
-        for (resource_type, _resource_id), event in latest.items()
-        if resource_type == "review"
+    review_states = dict(carried_reviews)
+    thread_states = dict(carried_threads)
+    for (resource_type, resource_id), event in latest.items():
+        state = event.payload.get("state")
+        if not isinstance(resource_id, str) or not isinstance(state, str):
+            continue
+        if resource_type == "review":
+            if state != "COMMENTED" or resource_id not in review_states:
+                review_states[resource_id] = state
+        elif resource_type == "review_thread":
+            thread_states[resource_id] = state
+    blocking_reviews = sum(
+        state == "CHANGES_REQUESTED" for state in review_states.values()
     )
-    thread_states = tuple(
-        str(event.payload.get("state"))
-        for (resource_type, _resource_id), event in latest.items()
-        if resource_type == "review_thread"
-    )
-    blocking_reviews = sum(state == "CHANGES_REQUESTED" for state in review_states)
-    open_threads = sum(state == "OPEN" for state in thread_states)
+    open_threads = sum(state == "OPEN" for state in thread_states.values())
     current_pr = next(
         (
             event

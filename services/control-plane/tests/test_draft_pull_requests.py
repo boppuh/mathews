@@ -11,6 +11,7 @@ from uuid import UUID
 import pytest
 from mathews_configuration import GitHubCredentialPurpose
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.background_jobs import BackgroundJobService
 from mathews_control_plane.database import (
     Base,
     SessionFactory,
@@ -32,7 +33,9 @@ from mathews_control_plane.draft_pull_requests import (
     DRAFT_PULL_REQUEST_PROOF_KEYS,
     DraftPullRequestError,
     GitHubDraftPullRequestPublisher,
+    VerifiedDraftPullRequestService,
     _DraftProofGates,
+    _required_check_names,
 )
 from mathews_control_plane.evidence import (
     EvidenceAccessClass,
@@ -174,6 +177,60 @@ def test_publisher_creates_one_draft_and_revokes_credential() -> None:
         "title": "Verified candidate",
     }
     assert transport.requests[1].headers["Authorization"] == ("Bearer installation-token")
+
+
+def test_post_activation_readiness_failure_schedules_idempotent_retry() -> None:
+    task_id = UUID("11111111-1111-1111-1111-111111111111")
+    event_id = UUID("22222222-2222-2222-2222-222222222222")
+
+    class _UnavailableReadiness:
+        def reconcile(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("temporary readiness outage")
+
+    class _Jobs:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def schedule(self, **kwargs: object) -> None:
+            self.calls.append(dict(kwargs))
+
+    service = object.__new__(VerifiedDraftPullRequestService)
+    service._readiness = _UnavailableReadiness()
+    jobs = _Jobs()
+    service._jobs = cast(BackgroundJobService, jobs)
+
+    service._reconcile_after_activation(
+        task_id,
+        transition_event_id=event_id,
+        head_sha=_SHA,
+    )
+
+    assert jobs.calls == [
+        {
+            "task_id": task_id,
+            "job_type": "github-webhook",
+            "idempotency_key": f"post-draft-readiness:{event_id}",
+            "input_payload": {
+                "schema_version": 1,
+                "delivery_id": f"post-draft:{event_id}",
+                "task_event_id": str(event_id),
+                "head_sha": _SHA,
+                "resource_type": "post_draft_activation",
+                "resource_state": "ACTIVE",
+            },
+        }
+    ]
+
+
+def test_github_checks_are_explicit_names_not_local_operation_ids() -> None:
+    assert _required_check_names(("Verify", "Security / scan")) == (
+        "Verify",
+        "Security / scan",
+    )
+    with pytest.raises(DraftPullRequestError, match="GITHUB_REQUIRED_CHECKS_INVALID"):
+        _required_check_names(())
+    with pytest.raises(DraftPullRequestError, match="GITHUB_REQUIRED_CHECKS_INVALID"):
+        _required_check_names(("Verify", "Verify"))
 
 
 def test_publisher_reuses_the_single_exact_branch_draft() -> None:

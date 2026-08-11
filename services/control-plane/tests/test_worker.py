@@ -1,6 +1,7 @@
 import logging
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 from mathews_configuration import SecretReference
@@ -104,6 +105,36 @@ def test_default_worker_registers_the_fail_closed_hermes_handler(
     try:
         assert set(worker._handlers) == {"github-webhook", "hermes-run"}
         assert "no registered handlers" not in caplog.text
+    finally:
+        engine.dispose()
+
+
+def test_automatic_review_classifier_requires_and_registers_its_handler(
+    tmp_path: Path,
+) -> None:
+    from mathews_control_plane.background_jobs import BackgroundJobHandler
+    from mathews_control_plane.review_resolution import ReviewClassifier
+    from mathews_control_plane.settings import Settings
+    from mathews_control_plane.worker import build_worker
+
+    runtime_settings = Settings(
+        environment="test",
+        database_url=SecretStr(f"sqlite:///{tmp_path / 'worker.sqlite3'}"),
+        artifact_root=tmp_path / "artifacts",
+    )
+    classifier = cast(ReviewClassifier, object())
+    handler = cast(BackgroundJobHandler, lambda _context: None)
+
+    with pytest.raises(ValueError, match="review-resolution handler"):
+        build_worker(runtime_settings, review_classifier=classifier)
+
+    worker, engine = build_worker(
+        runtime_settings,
+        review_classifier=classifier,
+        review_resolution_handler=handler,
+    )
+    try:
+        assert worker._handlers["review-resolution"] is handler
     finally:
         engine.dispose()
 

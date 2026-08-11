@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse
 from mathews_control_plane import __version__
 from mathews_control_plane.approvals import (
     ApprovalBodyLimitMiddleware,
+    ApprovalContinuation,
     ApprovalService,
     create_approval_router,
 )
@@ -112,6 +113,7 @@ def create_app(
     evaluation_telemetry_service: EvaluationTelemetryService | None = None,
     task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
+    approval_continuation: ApprovalContinuation | None = None,
     repository_service: RepositoryService | None = None,
     validation_evidence_scheduler: ValidationEvidenceJobScheduler | None = None,
     validation_decision_service: ValidationDecisionService | None = None,
@@ -338,7 +340,9 @@ def create_app(
     application.include_router(create_retrieval_index_router(retrieval_index_service))
     application.include_router(create_evidence_router(evidence_service))
     application.include_router(create_task_router(task_service))
-    application.include_router(create_approval_router(approval_service))
+    application.include_router(
+        create_approval_router(approval_service, approval_continuation)
+    )
     application.include_router(create_repository_router(repository_service))
     application.include_router(
         create_validation_evidence_router(validation_evidence_scheduler)

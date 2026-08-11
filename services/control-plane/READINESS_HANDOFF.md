@@ -34,14 +34,21 @@ ready only when all of these facts agree:
 6. the pull request remains draft; and
 7. no approval or cancellation fence invalidates the verified draft proof.
 
+The pull-request binding names the GitHub check runs emitted by CI. Local
+validation operation IDs are a separate namespace and are never inferred as
+GitHub check names, so draft publication requires an explicit, non-empty list
+of required GitHub checks. Verified deliveries that arrive before the first
+binding are retained and replayed when that exact installation, repository,
+pull request, and head are bound.
+
 The service stores the fact set and blocker codes as immutable
 `pull-request-readiness-assessment` evidence. The transition evaluator derives
 the facts again inside the locked transaction and requires an exact match with
 that evidence before entering `READY_FOR_HUMAN_MERGE`.
 
-Only live, unsuperseded assessments created by the control plane can settle an
-open informational review comment. User corrections remain visible evidence,
-but cannot grant or revoke readiness authority. When no bounded production
+Only live, unsuperseded assessments and draft proofs created by the control
+plane can satisfy readiness. User corrections remain visible evidence, but
+cannot grant or revoke readiness authority. When no bounded production
 classifier is configured, review text fails closed to a human approval instead
 of being treated as informational or safe to repair.
 

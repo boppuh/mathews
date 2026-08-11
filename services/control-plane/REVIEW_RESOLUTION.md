@@ -60,4 +60,9 @@ state, or changed bindings prevent the repair from starting.
 durable job. `ReviewResolutionJobHandler` accepts the existing Hermes handler,
 an authenticated host gateway, a `FullReviewValidator`, and the verified draft
 PR publisher. Production composition must register the handler under
-`review-resolution`; tests can inject deterministic adapters at each boundary.
+`review-resolution`; `build_worker` accepts that handler explicitly, registers
+it under the same job type, and refuses to enable a configured automatic
+classifier without it. The API approval composition accepts the same
+`ReviewResolutionService` as its approval continuation so an approved one-off
+repair deterministically reschedules its original review event. Tests can
+inject deterministic adapters at each boundary.

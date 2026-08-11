@@ -162,6 +162,8 @@ def _check_payload(
     status: str = "completed",
     conclusion: str | None = "success",
     check_id: int = 901,
+    pull_request_number: int = 42,
+    branch_name: str = "codex/task-6-3",
 ) -> dict[str, object]:
     return {
         "action": "completed" if status == "completed" else "rerequested",
@@ -174,10 +176,67 @@ def _check_payload(
             "conclusion": conclusion,
             "head_sha": head_sha,
             "updated_at": updated_at,
-            "check_suite": {"id": 801, "head_branch": "codex/task-6-3"},
-            "pull_requests": [{"number": 42}],
+            "check_suite": {"id": 801, "head_branch": branch_name},
+            "pull_requests": [{"number": pull_request_number}],
         },
     }
+
+
+def test_binding_replays_an_exact_webhook_that_arrived_before_correlation(
+    webhook_harness: WebhookHarness,
+) -> None:
+    task_id = uuid4()
+    branch = "codex/pre-binding"
+    with webhook_harness.factory.begin() as session:
+        session.add(
+            Task(
+                id=task_id,
+                repository="boppuh/mathews",
+                base_revision="0" * 40,
+                requester="local-user",
+                raw_request="evidence://pre-binding",
+                summary="Bind after webhook",
+                state=TaskState.PR_ACTIVE,
+                retry_count=0,
+                owner_id="local-user",
+                actor_id="local-user",
+                root_correlation_id=task_id,
+                causation_id=task_id,
+            )
+        )
+
+    response = _post(
+        webhook_harness,
+        _check_payload(pull_request_number=43, branch_name=branch),
+        delivery="before-binding",
+    )
+    assert response.json()["disposition"] == "QUARANTINED"
+
+    webhook_harness.service.bind_pull_request(
+        task_id,
+        installation_id=202,
+        repository_id=303,
+        pull_request_number=43,
+        task_branch=branch,
+        head_sha=_HEAD_SHA,
+        required_checks=("test",),
+    )
+
+    with webhook_harness.factory() as session:
+        delivery = session.scalar(
+            select(WebhookDelivery).where(
+                WebhookDelivery.provider_delivery_id == "before-binding"
+            )
+        )
+        assert delivery is not None
+        assert delivery.quarantine_reason is None
+        assert delivery.processing_result is not None
+        assert delivery.processing_result["disposition"] == "ACCEPTED"
+        assert session.scalar(
+            select(func.count(BackgroundJob.id)).where(
+                BackgroundJob.task_id == task_id,
+            )
+        ) == 1
 
 
 def _review_payload(

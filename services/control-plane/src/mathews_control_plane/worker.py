@@ -45,6 +45,7 @@ from mathews_control_plane.repair_loop import (
     RepairJobHandler,
 )
 from mathews_control_plane.review_resolution import (
+    REVIEW_RESOLUTION_JOB_TYPE,
     ConservativeReviewClassifier,
     ReviewClassifier,
     ReviewResolutionService,
@@ -72,9 +73,18 @@ def build_worker(
     hermes_runtime: HermesRuntime | None = None,
     host_gateway: HostGateway | None = None,
     review_classifier: ReviewClassifier | None = None,
+    review_resolution_handler: BackgroundJobHandler | None = None,
 ) -> tuple[DurableJobWorker, Engine]:
     """Build one database-backed worker and return its disposable engine."""
 
+    if (
+        handlers is None
+        and review_classifier is not None
+        and review_resolution_handler is None
+    ):
+        raise ValueError(
+            "an automatic review classifier requires a review-resolution handler"
+        )
     engine = create_database_engine(runtime_settings.database_url)
     factory = create_session_factory(engine)
     store = ArtifactStore(runtime_settings.artifact_root)
@@ -108,6 +118,8 @@ def build_worker(
                 review_resolution,
             ),
         }
+        if review_resolution_handler is not None:
+            handler_registry[REVIEW_RESOLUTION_JOB_TYPE] = review_resolution_handler
         if gateway is not None:
             validation_handler = ValidationEvidenceJobHandler(
                 factory,

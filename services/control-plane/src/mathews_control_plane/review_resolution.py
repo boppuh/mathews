@@ -475,6 +475,40 @@ class ReviewResolutionService:
             replayed=scheduled.replayed,
         )
 
+    def resume_approved(self, request_id: UUID) -> ReviewScheduleResult | None:
+        with self._factory() as session:
+            request = session.get(ApprovalRequest, request_id)
+            blocked = None if request is None else request.blocked_operation
+            if request is None or request.status is not ApprovalStatus.APPROVED:
+                raise ReviewResolutionError("REVIEW_APPROVAL_UNAVAILABLE")
+            if (
+                request.request_type != ApprovalRequestType.REVIEW_CONFLICT.value
+                or not isinstance(blocked, dict)
+                or blocked.get("operation_name") != "review.repair"
+            ):
+                return None
+            raw_assessment_id = blocked.get("checkpoint_evidence_id")
+            if not isinstance(raw_assessment_id, str):
+                raise ReviewResolutionError("REVIEW_APPROVAL_UNAVAILABLE")
+            try:
+                assessment_id = UUID(raw_assessment_id)
+            except ValueError:
+                raise ReviewResolutionError("REVIEW_APPROVAL_UNAVAILABLE") from None
+            assessment = session.get(EvidenceRecord, assessment_id)
+            if assessment is None or assessment.task_id != request.task_id:
+                raise ReviewResolutionError("REVIEW_APPROVAL_UNAVAILABLE")
+            payload = load_evidence(session, self._store, assessment).content
+            raw_event_id = (
+                payload.get("task_event_id") if isinstance(payload, dict) else None
+            )
+            if not isinstance(raw_event_id, str):
+                raise ReviewResolutionError("REVIEW_APPROVAL_UNAVAILABLE")
+            try:
+                task_event_id = UUID(raw_event_id)
+            except ValueError:
+                raise ReviewResolutionError("REVIEW_APPROVAL_UNAVAILABLE") from None
+        return self.schedule(task_event_id)
+
     def _request_approval(
         self,
         context: _ReviewContext,

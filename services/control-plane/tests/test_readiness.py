@@ -597,6 +597,99 @@ def test_commented_review_does_not_clear_an_outstanding_change_request() -> None
     assert not facts.no_blocking_review
 
 
+def test_new_head_binding_preserves_review_blockers_until_explicitly_cleared() -> None:
+    changed = "c" * 40
+    binding_payload = {
+        **_github_event_payload(head_sha=changed),
+        "required_checks": ["verify"],
+        "review_state_carryover": {
+            "changes_requested_review_ids": ["reviewer-1"],
+            "open_review_thread_ids": ["thread-1"],
+        },
+    }
+    blocked = _github_facts((_event(1, GITHUB_PR_BOUND_EVENT, binding_payload),))
+    cleared = _github_facts(
+        (
+            _event(1, GITHUB_PR_BOUND_EVENT, binding_payload),
+            _event(
+                2,
+                GITHUB_REVIEW_UPDATED_EVENT,
+                _github_event_payload(
+                    head_sha=changed,
+                    resource_type="review",
+                    resource_id="reviewer-1",
+                    state="APPROVED",
+                ),
+            ),
+            _event(
+                3,
+                GITHUB_REVIEW_UPDATED_EVENT,
+                _github_event_payload(
+                    head_sha=changed,
+                    resource_type="review_thread",
+                    resource_id="thread-1",
+                    state="RESOLVED",
+                ),
+            ),
+        )
+    )
+
+    assert blocked.blocking_reviews == 1
+    assert blocked.open_threads == 1
+    assert not blocked.no_blocking_review
+    assert cleared.no_blocking_review
+
+
+def test_superseded_draft_proof_cannot_satisfy_readiness(
+    readiness_harness: ReadinessHarness,
+) -> None:
+    with readiness_harness.factory.begin() as session:
+        task = session.get(Task, readiness_harness.task_id)
+        assert task is not None
+        reference = session.scalar(
+            select(TaskEventEvidenceReference)
+            .join(TaskEvent, TaskEvent.id == TaskEventEvidenceReference.task_event_id)
+            .where(
+                TaskEvent.task_id == task.id,
+                TaskEvent.transition_kind
+                == TaskTransitionKind.OPEN_VERIFIED_DRAFT_PR.value,
+                TaskEventEvidenceReference.position == 1,
+            )
+        )
+        assert reference is not None
+        proof = session.get(EvidenceRecord, reference.evidence_id)
+        assert proof is not None
+        capture_evidence(
+            session,
+            readiness_harness.store,
+            payload={"correction": "draft proof withdrawn"},
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.TOOL_OPERATION,
+            evidence_type="draft-pull-request-proof",
+            origin="local-user:correction",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.AUDIT,
+            owner_id=task.owner_id,
+            actor_id=task.owner_id,
+            root_correlation_id=task.root_correlation_id,
+            task_id=task.id,
+            validation_run_id=proof.validation_run_id,
+            correction_of_id=proof.id,
+        )
+
+    result = ReadinessService(
+        readiness_harness.factory,
+        readiness_harness.store,
+        clock=lambda: _NOW,
+    ).reconcile(
+        readiness_harness.task_id,
+        trigger_event_id=readiness_harness.trigger_id,
+    )
+
+    assert result.status is ReadinessReconcileStatus.BLOCKED
+    assert result.transition is None
+
+
 @pytest.mark.parametrize(
     ("source_disposition", "correction_disposition"),
     [

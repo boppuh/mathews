@@ -326,6 +326,7 @@ class GitHubWebhookService:
             "head_sha": sha,
             "required_checks": list(checks),
         }
+        replay_ids: tuple[UUID, ...]
         with self._factory.begin() as session:
             task = session.scalar(
                 select(Task).where(Task.id == task_id).with_for_update()
@@ -337,18 +338,49 @@ class GitHubWebhookService:
                 or TaskState(task.state) in _TERMINAL_STATES
             ):
                 raise GitHubWebhookPayloadError("task cannot be bound")
+            carryover = _review_state_carryover(session, task.id)
+            if carryover is not None:
+                payload["review_state_carryover"] = carryover
             current = _latest_binding(session, task.id)
             if current is not None and current.payload == payload:
-                return current.id
-            event = _append_task_event(
-                session,
-                task,
-                event_type=GITHUB_PR_BOUND_EVENT,
-                payload=payload,
-                occurred_at=_utc(self._clock()),
-                causation_id=task.id,
+                binding_id = current.id
+            else:
+                binding_id = _append_task_event(
+                    session,
+                    task,
+                    event_type=GITHUB_PR_BOUND_EVENT,
+                    payload=payload,
+                    occurred_at=_utc(self._clock()),
+                    causation_id=task.id,
+                ).id
+            deferred = tuple(
+                session.scalars(
+                    select(WebhookDelivery)
+                    .where(
+                        WebhookDelivery.provider == "github",
+                        WebhookDelivery.installation_id == str(installation_id),
+                        WebhookDelivery.repository_id == str(repository_id),
+                        WebhookDelivery.pull_request_number == pull_request_number,
+                        WebhookDelivery.head_sha == sha,
+                        WebhookDelivery.quarantine_reason == "correlation_unknown",
+                    )
+                    .order_by(WebhookDelivery.received_at, WebhookDelivery.id)
+                    .with_for_update()
+                )
             )
-            return event.id
+            for delivery in deferred:
+                prior = cast(dict[str, object], delivery.processing_result or {})
+                delivery.processing_result = {
+                    **prior,
+                    "stage": "RECEIVED",
+                    "replayed_after_binding": True,
+                }
+                delivery.quarantine_reason = None
+                delivery.processed_at = None
+            replay_ids = tuple(delivery.id for delivery in deferred)
+        for delivery_id in replay_ids:
+            self._process(delivery_id)
+        return binding_id
 
     def ingest(
         self,
@@ -1028,6 +1060,47 @@ def _latest_binding(session: Session, task_id: UUID) -> TaskEvent | None:
         .order_by(TaskEvent.sequence.desc(), TaskEvent.id.desc())
         .limit(1)
     )
+
+
+def _review_state_carryover(
+    session: Session,
+    task_id: UUID,
+) -> dict[str, object] | None:
+    reviews: dict[str, str] = {}
+    threads: dict[str, str] = {}
+    events = session.scalars(
+        select(TaskEvent)
+        .where(
+            TaskEvent.task_id == task_id,
+            TaskEvent.event_type == GITHUB_REVIEW_UPDATED_EVENT,
+        )
+        .order_by(TaskEvent.sequence, TaskEvent.id)
+    )
+    for event in events:
+        resource_type = event.payload.get("resource_type")
+        resource_id = event.payload.get("resource_id")
+        state = event.payload.get("state")
+        if not isinstance(resource_id, str) or not isinstance(state, str):
+            continue
+        if resource_type == "review":
+            if state != "COMMENTED" or resource_id not in reviews:
+                reviews[resource_id] = state
+        elif resource_type == "review_thread":
+            threads[resource_id] = state
+    blocking_reviews = sorted(
+        resource_id
+        for resource_id, state in reviews.items()
+        if state == "CHANGES_REQUESTED"
+    )
+    open_threads = sorted(
+        resource_id for resource_id, state in threads.items() if state == "OPEN"
+    )
+    if not blocking_reviews and not open_threads:
+        return None
+    return {
+        "changes_requested_review_ids": blocking_reviews,
+        "open_review_thread_ids": open_threads,
+    }
 
 
 def _effective_task_head(session: Session, task_id: UUID) -> str | None:
