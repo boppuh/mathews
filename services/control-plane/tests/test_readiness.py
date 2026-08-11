@@ -16,10 +16,17 @@ from mathews_control_plane.database import (
     create_session_factory,
 )
 from mathews_control_plane.domain_models import (
+    Brief,
+    EvidenceRecord,
     PolicyVersion,
+    RepositoryConfiguration,
     Task,
     TaskEvent,
+    TaskEventEvidenceReference,
     TaskState,
+    ValidationContract,
+    ValidationOutcome,
+    ValidationRun,
 )
 from mathews_control_plane.evidence import (
     EvidenceAccessClass,
@@ -31,10 +38,13 @@ from mathews_control_plane.github_webhooks import (
     GITHUB_CHECK_UPDATED_EVENT,
     GITHUB_PR_BOUND_EVENT,
     GITHUB_PR_HEAD_CHANGED_EVENT,
+    GITHUB_PULL_REQUEST_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
 )
 from mathews_control_plane.readiness import (
     HANDOFF_ACKNOWLEDGEMENT,
+    HANDOFF_MEANING,
+    ReadinessError,
     ReadinessReconcileStatus,
     ReadinessService,
     _fingerprint,
@@ -51,7 +61,6 @@ from mathews_control_plane.review_resolution import (
 )
 from mathews_control_plane.task_state_machine import (
     DraftPrGateFacts,
-    TaskTransitionError,
     TaskTransitionKind,
 )
 from sqlalchemy import Engine, select
@@ -107,40 +116,224 @@ def readiness_harness(tmp_path: Path) -> Iterator[ReadinessHarness]:
         )
         session.add_all((task, policy))
         session.flush()
+        configuration = RepositoryConfiguration(
+            repository_key=task.repository,
+            version=1,
+            predecessor_id=None,
+            repository_settings={},
+            git_settings={},
+            xcode_settings={},
+            operations=[],
+            e2e_assertions=[],
+            artifact_settings={},
+            prohibited_paths=[],
+            secret_references=[],
+            owner_id=task.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=task.root_correlation_id,
+        )
+        brief = Brief(
+            task_id=task.id,
+            version=1,
+            predecessor_id=None,
+            scope={},
+            exclusions=[],
+            acceptance_criteria=[],
+            risks=[],
+            affected_flow={},
+            test_plan=[],
+            owner_id=task.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=task.root_correlation_id,
+        )
+        session.add_all((configuration, brief))
+        session.flush()
+        contract = ValidationContract(
+            task_id=task.id,
+            version=1,
+            predecessor_id=None,
+            brief_id=brief.id,
+            repository_configuration_id=configuration.id,
+            required_operations=[],
+            simulator_setup={},
+            clean_state_setup={},
+            e2e_flow={},
+            typed_assertions=[],
+            evidence_requirements=[],
+            timeouts={},
+            outcome_rules={},
+            owner_id=task.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=task.root_correlation_id,
+        )
+        session.add(contract)
+        session.flush()
+        task.accepted_brief_id = brief.id
+        task.repository_configuration_id = configuration.id
+        task.validation_contract_id = contract.id
+        run = ValidationRun(
+            task_id=task.id,
+            validation_contract_id=contract.id,
+            repository_configuration_id=configuration.id,
+            commit_sha=_HEAD,
+            tree_sha=_TREE,
+            configured_test_plan=[],
+            operation_results=[],
+            assertion_results=[],
+            simulator_target=None,
+            outcome=ValidationOutcome.PASSED,
+            duration_ms=1,
+            acceptance_criterion_results=[],
+            owner_id=task.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=task.root_correlation_id,
+        )
+        session.add(run)
+        session.flush()
+        decision = capture_evidence(
+            session,
+            store,
+            payload={"outcome": "PASSED"},
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.RESULT,
+            evidence_type="validation-decision",
+            origin="control-plane:validation-decision",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.TASK_LIFETIME,
+            owner_id=task.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=task.root_correlation_id,
+            task_id=task.id,
+            validation_run_id=run.id,
+        )
+        observation = {
+            "branch_name": "codex/task",
+            "head_sha": _HEAD,
+            "tree_sha": _TREE,
+            "clean": True,
+            "remote_head_sha": None,
+        }
+        proof = capture_evidence(
+            session,
+            store,
+            payload={
+                "schema_version": 1,
+                "task_id": str(task.id),
+                "brief_id": str(brief.id),
+                "validation_contract_id": str(contract.id),
+                "validation_contract_version": contract.version,
+                "repository_configuration_id": str(configuration.id),
+                "repository_configuration_version": configuration.version,
+                "validation_run_id": str(run.id),
+                "validation_decision_evidence_id": str(decision.record.id),
+                "commit_sha": _HEAD,
+                "tree_sha": _TREE,
+                "local_before_push": observation,
+                "push_result": {**observation, "remote_head_sha": _HEAD},
+                "local_after_push": observation,
+                "pull_request": {
+                    "number": 42,
+                    "url": "https://github.com/boppuh/mathews/pull/42",
+                    "branch_name": "codex/task",
+                    "head_sha": _HEAD,
+                    "is_draft": True,
+                },
+                "pull_request_content_sha256": "f" * 64,
+            },
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.TOOL_OPERATION,
+            evidence_type="draft-pull-request-proof",
+            origin="control-plane:draft-pull-request",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.AUDIT,
+            owner_id=task.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=task.root_correlation_id,
+            task_id=task.id,
+            validation_run_id=run.id,
+        )
+        opened = TaskEvent(
+            task_id=task_id,
+            sequence=1,
+            event_type="TASK_STATE_TRANSITION",
+            payload={"schema_version": 1, "kind": "OPEN_VERIFIED_DRAFT_PR"},
+            occurred_at=_NOW,
+            transition_id=uuid4(),
+            transition_fingerprint="f" * 64,
+            transition_kind=TaskTransitionKind.OPEN_VERIFIED_DRAFT_PR.value,
+            transition_from_state=TaskState.VALIDATING,
+            transition_to_state=TaskState.PR_ACTIVE,
+            transition_reason_code="VERIFIED_DRAFT_PR_OPENED",
+            policy_lineage_key=policy.lineage_key,
+            policy_version_id=policy.id,
+            gate_head_sha=_HEAD,
+            owner_id=task.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=task.root_correlation_id,
+            causation_id=task.id,
+        )
+        session.add(opened)
+        session.flush()
         session.add(
-            TaskEvent(
-                task_id=task_id,
-                sequence=1,
-                event_type="TASK_STATE_TRANSITION",
-                payload={"schema_version": 1, "kind": "OPEN_VERIFIED_DRAFT_PR"},
-                occurred_at=_NOW,
-                transition_id=uuid4(),
-                transition_fingerprint="f" * 64,
-                transition_kind=TaskTransitionKind.OPEN_VERIFIED_DRAFT_PR.value,
-                transition_from_state=TaskState.VALIDATING,
-                transition_to_state=TaskState.PR_ACTIVE,
-                transition_reason_code="VERIFIED_DRAFT_PR_OPENED",
-                policy_lineage_key=policy.lineage_key,
-                policy_version_id=policy.id,
-                gate_head_sha=_HEAD,
+            TaskEventEvidenceReference(
+                task_id=task.id,
+                task_event_id=opened.id,
+                evidence_id=proof.record.id,
+                position=1,
                 owner_id=task.owner_id,
                 actor_id="control-plane",
                 root_correlation_id=task.root_correlation_id,
-                causation_id=task.id,
+                causation_id=opened.id,
             )
         )
-        session.add(
-            TaskEvent(
-                id=trigger_id,
-                task_id=task_id,
-                sequence=2,
-                event_type=GITHUB_CHECK_UPDATED_EVENT,
-                payload={"schema_version": 1, "head_sha": _HEAD},
-                occurred_at=_NOW,
-                owner_id=task.owner_id,
-                actor_id="github-webhook",
-                root_correlation_id=task.root_correlation_id,
-                causation_id=task.id,
+        session.add_all(
+            (
+                TaskEvent(
+                    task_id=task.id,
+                    sequence=2,
+                    event_type=GITHUB_PR_BOUND_EVENT,
+                    payload={
+                        **_github_event_payload(),
+                        "required_checks": ["verify"],
+                    },
+                    occurred_at=_NOW,
+                    owner_id=task.owner_id,
+                    actor_id="github-webhook",
+                    root_correlation_id=task.root_correlation_id,
+                    causation_id=task.id,
+                ),
+                TaskEvent(
+                    task_id=task.id,
+                    sequence=3,
+                    event_type=GITHUB_CHECK_UPDATED_EVENT,
+                    payload=_github_event_payload(
+                        resource_type="check_run",
+                        resource_id="suite:verify",
+                        resource_label="verify",
+                        state="PASSED",
+                    ),
+                    occurred_at=_NOW,
+                    owner_id=task.owner_id,
+                    actor_id="github-webhook",
+                    root_correlation_id=task.root_correlation_id,
+                    causation_id=task.id,
+                ),
+                TaskEvent(
+                    id=trigger_id,
+                    task_id=task.id,
+                    sequence=4,
+                    event_type=GITHUB_PULL_REQUEST_UPDATED_EVENT,
+                    payload=_github_event_payload(
+                        resource_type="pull_request",
+                        resource_id="42",
+                        state="DRAFT",
+                    ),
+                    occurred_at=_NOW,
+                    owner_id=task.owner_id,
+                    actor_id="github-webhook",
+                    root_correlation_id=task.root_correlation_id,
+                    causation_id=task.id,
+                ),
             )
         )
     try:
@@ -174,6 +367,7 @@ def _github(*, ci: bool = True, reviews: bool = True) -> _GitHubFacts:
         ("verify",),
         ci,
         reviews,
+        True,
         True,
         (),
         (("verify", "PASSED" if ci else "FAILED"),),
@@ -265,6 +459,35 @@ def test_github_facts_require_every_exact_head_check_and_no_blocking_review() ->
     assert ready.no_blocking_review
     assert not blocked.no_blocking_review
     assert blocked.blocking_reviews == 1
+
+
+def test_pull_request_draft_state_requires_current_positive_evidence() -> None:
+    binding = _event(
+        1,
+        GITHUB_PR_BOUND_EVENT,
+        {**_github_event_payload(), "required_checks": ["verify"]},
+    )
+
+    unknown = _github_facts((binding,))
+    draft = _github_facts(
+        (
+            binding,
+            _event(
+                2,
+                GITHUB_PULL_REQUEST_UPDATED_EVENT,
+                _github_event_payload(
+                    resource_type="pull_request",
+                    resource_id="42",
+                    state="DRAFT",
+                ),
+            ),
+        )
+    )
+
+    assert not unknown.pull_request_state_known
+    assert not unknown.current_pull_request_is_draft
+    assert draft.pull_request_state_known
+    assert draft.current_pull_request_is_draft
 
 
 def test_head_change_discards_prior_check_success() -> None:
@@ -410,6 +633,24 @@ def test_corrected_review_assessments_never_satisfy_readiness(
     )
     with readiness_harness.factory.begin() as session:
         task = session.get_one(Task, readiness_harness.task_id)
+        session.add(
+            TaskEvent(
+                id=review_event_id,
+                task_id=task.id,
+                sequence=5,
+                event_type=GITHUB_REVIEW_UPDATED_EVENT,
+                payload=_github_event_payload(
+                    resource_type="review_comment",
+                    resource_id="comment-1",
+                    state="OPEN",
+                ),
+                occurred_at=_NOW,
+                owner_id=task.owner_id,
+                actor_id="github-webhook",
+                root_correlation_id=task.root_correlation_id,
+                causation_id=task.id,
+            )
+        )
         source = capture_evidence(
             session,
             readiness_harness.store,
@@ -480,6 +721,27 @@ def test_corrected_review_assessments_never_satisfy_readiness(
         )
 
 
+def test_reconcile_uses_real_durable_proof_and_exact_head_rows(
+    readiness_harness: ReadinessHarness,
+) -> None:
+    result = ReadinessService(
+        readiness_harness.factory,
+        readiness_harness.store,
+        clock=lambda: _NOW,
+    ).reconcile(
+        readiness_harness.task_id,
+        trigger_event_id=readiness_harness.trigger_id,
+    )
+
+    assert result.status is ReadinessReconcileStatus.READY
+    assert result.blocker_codes == ()
+    with readiness_harness.factory() as session:
+        assert (
+            session.get_one(Task, readiness_harness.task_id).state
+            is TaskState.READY_FOR_HUMAN_MERGE
+        )
+
+
 def test_reconcile_marks_ready_then_invalidates_on_current_failure(
     readiness_harness: ReadinessHarness,
     monkeypatch: pytest.MonkeyPatch,
@@ -509,7 +771,7 @@ def test_reconcile_marks_ready_then_invalidates_on_current_failure(
             TaskEvent(
                 id=invalidating_trigger,
                 task_id=task.id,
-                sequence=4,
+                sequence=6,
                 event_type=GITHUB_CHECK_UPDATED_EVENT,
                 payload={"schema_version": 1, "head_sha": _HEAD},
                 occurred_at=_NOW,
@@ -550,14 +812,16 @@ def test_handoff_is_explicit_idempotent_and_never_means_merged(
     )
     handoff_id = uuid4()
 
-    with pytest.raises(TaskTransitionError):
+    with pytest.raises(ReadinessError, match="HANDOFF_HEAD_STALE"):
         service.acknowledge_handoff(
             readiness_harness.task_id,
-            handoff_id=uuid4(),
+            handoff_id=handoff_id,
             expected_head_sha="c" * 40,
             acknowledgement=HANDOFF_ACKNOWLEDGEMENT,
             actor_id="local-user",
         )
+    with readiness_harness.factory() as session:
+        assert session.get(EvidenceRecord, handoff_id) is None
 
     first = service.acknowledge_handoff(
         readiness_harness.task_id,
@@ -587,6 +851,4 @@ def test_handoff_is_explicit_idempotent_and_never_means_merged(
         )
     assert task.state is TaskState.HANDED_OFF
     assert event is not None
-    assert event.payload["meaning"] == (
-        "automation responsibility handed off; not merged, deployed, or released"
-    )
+    assert event.payload["meaning"] == HANDOFF_MEANING

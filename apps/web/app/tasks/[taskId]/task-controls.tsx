@@ -56,6 +56,7 @@ export function TaskControls({
   const [handoffError, setHandoffError] = useState("");
   const [handoffReauthenticationRequired, setHandoffReauthenticationRequired] = useState(false);
   const [handoffPassword, setHandoffPassword] = useState("");
+  const [handoffCompletedTaskId, setHandoffCompletedTaskId] = useState<string | null>(null);
   const steeringCommand = useRef<CommandIdentity | null>(null);
   const cancellationCommand = useRef<CommandIdentity | null>(null);
   const handoffCommand = useRef<string | null>(null);
@@ -171,6 +172,7 @@ export function TaskControls({
         expected_head_sha: verifiedHeadSha,
         acknowledgement: TASK_HANDOFF_ACKNOWLEDGEMENT,
       });
+      setHandoffCompletedTaskId(task.id);
       handoffCommand.current = null;
       setHandoffConfirming(false);
       setHandoffReauthenticationRequired(false);
@@ -369,7 +371,7 @@ export function TaskControls({
               any merge, deployment, delivery, or release decision.
             </p>
           </div>
-          {task.state === "HANDED_OFF" ? (
+          {task.state === "HANDED_OFF" || handoffCompletedTaskId === task.id ? (
             <p className="task-control-notice">Automation handoff is complete.</p>
           ) : task.state !== "READY_FOR_HUMAN_MERGE" || !verifiedHeadSha ? (
             <p className="task-control-muted">

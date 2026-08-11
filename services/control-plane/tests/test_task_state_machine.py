@@ -40,6 +40,7 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
 )
+from mathews_control_plane.readiness_contract import HANDOFF_MEANING
 from mathews_control_plane.task_state_machine import (
     MAX_TRANSITION_EVIDENCE_REFERENCES,
     ClosedTaskTransitionGateEvaluator,
@@ -1172,9 +1173,7 @@ def test_full_verified_draft_readiness_and_handoff_path_records_exact_head(
     assert events[-3].gate_head_sha == _SHA
     assert events[-2].gate_head_sha == _SHA
     assert events[-1].gate_head_sha == _SHA
-    assert events[-1].payload["meaning"] == (
-        "automation responsibility handed off; not merged, deployed, or released"
-    )
+    assert events[-1].payload["meaning"] == HANDOFF_MEANING
     assert events[2].payload["validation_candidate"] == {
         "commit_sha": "a" * 40,
         "tree_sha": "b" * 40,

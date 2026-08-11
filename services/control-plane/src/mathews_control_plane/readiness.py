@@ -43,6 +43,11 @@ from mathews_control_plane.github_webhooks import (
     GITHUB_PULL_REQUEST_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
 )
+from mathews_control_plane.readiness_contract import (
+    HANDOFF_ACKNOWLEDGEMENT,
+    HANDOFF_MEANING,
+    ReadinessError,
+)
 from mathews_control_plane.review_resolution import (
     REVIEW_RESOLUTION_JOB_TYPE,
     REVIEW_RESOLUTION_SCHEMA_VERSION,
@@ -59,28 +64,14 @@ from mathews_control_plane.task_state_machine import (
     TaskTransitionService,
 )
 
+__all__ = ["HANDOFF_ACKNOWLEDGEMENT", "HANDOFF_MEANING", "ReadinessError"]
+
 READINESS_ASSESSMENT_SCHEMA_VERSION = 1
 HANDOFF_ACKNOWLEDGEMENT_SCHEMA_VERSION = 1
-HANDOFF_MEANING = (
-    "Automation responsibility has ended; this does not mean merged, deployed, "
-    "delivered, or released."
-)
-HANDOFF_ACKNOWLEDGEMENT = (
-    "I acknowledge that automation is complete and that merge, deployment, "
-    "delivery, and release remain human responsibilities."
-)
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _ACTIVE_JOB_STATES = frozenset(
     {BackgroundJobStatus.QUEUED, BackgroundJobStatus.RUNNING}
 )
-
-
-class ReadinessError(RuntimeError):
-    """Stable readiness refusal without evidence or review contents."""
-
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
 
 
 class ReadinessReconcileStatus(StrEnum):
@@ -119,6 +110,7 @@ class _GitHubFacts:
     required_checks: tuple[str, ...]
     required_ci_green: bool
     no_blocking_review: bool
+    pull_request_state_known: bool
     current_pull_request_is_draft: bool
     open_review_event_ids: tuple[UUID, ...]
     check_states: tuple[tuple[str, str], ...]
@@ -390,6 +382,25 @@ class ReadinessService:
                 or TaskState(task.state) is not TaskState.READY_FOR_HUMAN_MERGE
             ):
                 raise ReadinessError("HANDOFF_TASK_NOT_READY")
+            assessment = _assess(
+                session,
+                self._store,
+                task,
+                policy=_active_policy(
+                    session,
+                    task,
+                    lineage_key=self._policy_lineage,
+                    now=_utc(self._clock()),
+                ),
+            )
+            if (
+                assessment.github.head_sha != head_sha
+                or assessment.draft_pr is None
+                or assessment.draft_pr.current_head_sha != head_sha
+            ):
+                raise ReadinessError("HANDOFF_HEAD_STALE")
+            if not assessment.ready:
+                raise ReadinessError("HANDOFF_TASK_NOT_READY")
             captured = capture_evidence(
                 session,
                 self._store,
@@ -494,11 +505,27 @@ def _assess(
     policy: PolicyVersion,
 ) -> _ReadinessAssessment:
     proof_id, draft = _draft_pr_facts(session, store, task, policy=policy)
-    events = tuple(
-        session.scalars(
-            select(TaskEvent)
-            .where(TaskEvent.task_id == task.id)
-            .order_by(TaskEvent.sequence, TaskEvent.id)
+    binding_sequence = session.scalar(
+        select(TaskEvent.sequence)
+        .where(
+            TaskEvent.task_id == task.id,
+            TaskEvent.event_type == GITHUB_PR_BOUND_EVENT,
+        )
+        .order_by(TaskEvent.sequence.desc(), TaskEvent.id.desc())
+        .limit(1)
+    )
+    events = (
+        ()
+        if binding_sequence is None
+        else tuple(
+            session.scalars(
+                select(TaskEvent)
+                .where(
+                    TaskEvent.task_id == task.id,
+                    TaskEvent.sequence >= binding_sequence,
+                )
+                .order_by(TaskEvent.sequence, TaskEvent.id)
+            )
         )
     )
     github = _github_facts(events)
@@ -520,7 +547,9 @@ def _assess(
         and draft.current_head_sha != github.head_sha
     ):
         blockers.append("PULL_REQUEST_HEAD_CHANGED")
-    if not github.current_pull_request_is_draft:
+    if not github.pull_request_state_known:
+        blockers.append("PULL_REQUEST_STATE_UNKNOWN")
+    elif not github.current_pull_request_is_draft:
         blockers.append("PULL_REQUEST_NOT_DRAFT")
     if not github.required_ci_green:
         blockers.append("REQUIRED_CI_NOT_GREEN")
@@ -697,7 +726,7 @@ def _github_facts(events: Sequence[TaskEvent]) -> _GitHubFacts:
         None,
     )
     current_pull_request_is_draft = (
-        current_pr is None or current_pr.payload.get("state") == "DRAFT"
+        current_pr is not None and current_pr.payload.get("state") == "DRAFT"
     )
     open_review_events = tuple(
         event.id
@@ -712,6 +741,7 @@ def _github_facts(events: Sequence[TaskEvent]) -> _GitHubFacts:
         required_checks,
         required_ci_green,
         blocking_reviews == 0 and open_threads == 0,
+        current_pr is not None,
         current_pull_request_is_draft,
         open_review_events,
         check_states,
@@ -744,12 +774,18 @@ def _repairs_authorized(
     correction = aliased(EvidenceRecord)
     records = tuple(
         session.scalars(
-            select(EvidenceRecord).where(
+            select(EvidenceRecord)
+            .join(TaskEvent, TaskEvent.id == EvidenceRecord.causation_id)
+            .where(
                 EvidenceRecord.task_id == task.id,
                 EvidenceRecord.evidence_type == "review-resolution-assessment",
                 EvidenceRecord.origin == "control-plane:review-resolution",
                 EvidenceRecord.correction_of_id.is_(None),
                 EvidenceRecord.deleted_at.is_(None),
+                TaskEvent.task_id == task.id,
+                TaskEvent.event_type == GITHUB_REVIEW_UPDATED_EVENT,
+                TaskEvent.payload["resource_type"].as_string() == "review_comment",
+                TaskEvent.payload["head_sha"].as_string() == current_head,
                 ~exists().where(correction.correction_of_id == EvidenceRecord.id),
             )
         )
@@ -837,6 +873,7 @@ def _assessment_payload(
         "blocking_reviews": github.blocking_reviews,
         "open_review_threads": github.open_threads,
         "no_blocking_review": github.no_blocking_review,
+        "pull_request_state_known": github.pull_request_state_known,
         "current_pull_request_is_draft": github.current_pull_request_is_draft,
         "repairs_authorized": assessment.repairs_authorized,
         "blocker_codes": list(assessment.blocker_codes),
@@ -873,6 +910,7 @@ def _empty_github_facts() -> _GitHubFacts:
         None,
         None,
         (),
+        False,
         False,
         False,
         False,

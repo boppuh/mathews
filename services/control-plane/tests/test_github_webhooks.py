@@ -43,6 +43,7 @@ from mathews_control_plane.github_webhooks import (
     GitHubWebhookJobHandler,
     GitHubWebhookService,
 )
+from mathews_control_plane.readiness_contract import ReadinessError
 from mathews_control_plane.settings import Settings
 from mathews_control_plane.tasks import TaskService
 from pydantic import SecretStr
@@ -360,6 +361,48 @@ def test_durable_webhook_wakeup_reconciles_exact_task_readiness() -> None:
     assert calls == [("review", event_id), ("readiness", event_id)]
     assert result["review_resolution_status"] == "IGNORED"
     assert result["readiness_status"] == "READY"
+
+
+def test_durable_webhook_wakeup_reports_unconfigured_readiness() -> None:
+    context = SimpleNamespace(
+        grant=SimpleNamespace(
+            task_id=uuid4(),
+            input_payload={
+                "delivery_id": "delivery-2",
+                "task_event_id": str(uuid4()),
+                "head_sha": _HEAD_SHA,
+            },
+        )
+    )
+
+    result = GitHubWebhookJobHandler()(cast(LeasedJobContext, context))
+
+    assert result["readiness_status"] == "NOT_CONFIGURED"
+    assert result["workflow_woken"] is True
+
+
+def test_durable_webhook_wakeup_reports_bounded_readiness_refusal() -> None:
+    class RefusingReadiness:
+        def reconcile(self, _task_id: UUID, *, trigger_event_id: UUID) -> object:
+            assert isinstance(trigger_event_id, UUID)
+            raise ReadinessError("READINESS_POLICY_UNAVAILABLE")
+
+    context = SimpleNamespace(
+        grant=SimpleNamespace(
+            task_id=uuid4(),
+            input_payload={
+                "delivery_id": "delivery-3",
+                "task_event_id": str(uuid4()),
+                "head_sha": _HEAD_SHA,
+            },
+        )
+    )
+
+    result = GitHubWebhookJobHandler(RefusingReadiness())(
+        cast(LeasedJobContext, context)
+    )
+
+    assert result["readiness_status"] == "REFUSED:READINESS_POLICY_UNAVAILABLE"
 
 
 def test_duplicate_delivery_replays_without_duplicate_event_or_job(

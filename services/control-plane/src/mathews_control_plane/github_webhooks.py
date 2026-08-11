@@ -49,6 +49,8 @@ from mathews_control_plane.github_app import (
     GitHubWebhookVerificationError,
     GitHubWebhookVerifier,
 )
+from mathews_control_plane.readiness_contract import ReadinessError
+from mathews_control_plane.task_state_machine import TaskTransitionError
 
 GITHUB_PR_BOUND_EVENT = "GITHUB_PR_BOUND"
 GITHUB_CHECK_UPDATED_EVENT = "GITHUB_CHECK_UPDATED"
@@ -135,7 +137,10 @@ class GitHubWebhookJobHandler:
             head_sha,
         )):
             raise ValueError("github webhook wake-up payload is invalid")
-        event_id = UUID(cast(str, task_event_id))
+        try:
+            event_id = UUID(cast(str, task_event_id))
+        except ValueError:
+            raise ValueError("github webhook wake-up payload is invalid") from None
         review_status = "NOT_APPLICABLE"
         if (
             payload.get("resource_type") == "review_comment"
@@ -167,12 +172,23 @@ class GitHubWebhookJobHandler:
             )
         readiness_status = "NOT_CONFIGURED"
         if self._readiness is not None:
-            result = self._readiness.reconcile(
-                context.grant.task_id,
-                trigger_event_id=event_id,
-            )
-            result_status = getattr(result, "status", None)
-            readiness_status = str(getattr(result_status, "value", result_status))
+            try:
+                result = self._readiness.reconcile(
+                    context.grant.task_id,
+                    trigger_event_id=event_id,
+                )
+            except ReadinessError as error:
+                readiness_status = f"REFUSED:{error.code}"
+            except TaskTransitionError:
+                readiness_status = "REFUSED:TASK_TRANSITION"
+            else:
+                result_status = getattr(result, "status", None)
+                readiness_status = (
+                    str(result_status.value)
+                    if result_status is not None
+                    and isinstance(getattr(result_status, "value", None), str)
+                    else "UNKNOWN"
+                )
         return {
             "delivery_id": cast(str, delivery_id),
             "task_event_id": cast(str, task_event_id),
