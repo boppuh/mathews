@@ -33,10 +33,11 @@ complete here unless its backlog definition of done is satisfied on `main`.
   collection, `5.3` exact-SHA validation decisioning, `5.4` bounded validation
   repair,
   `6.1` least-privilege GitHub App authentication, and `6.3` signed,
-  idempotent CI and review webhook ingestion.
-- Remaining: 8 of 40 MVP tasks.
+  idempotent CI and review webhook ingestion,
+  plus `7.1` verified-source projections and provenance views.
+- Remaining: 7 of 40 MVP tasks.
 - Active next wave: Wave 6 validation, repair, and evidence intelligence.
-- Next completion target: `7.1`.
+- Next completion target: `7.2`.
 
 ## Operating model
 
