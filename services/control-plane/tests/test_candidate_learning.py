@@ -130,7 +130,10 @@ def _service(harness: LearningHarness) -> CandidateLearningService:
 
 def _summary(harness: LearningHarness) -> CitedSummaryDraft:
     return CitedSummaryDraft(
-        summary="Two cited records show a recurring formatter-only repair.",
+        summary=(
+            "Two cited records from owner@example.com show a recurring "
+            "formatter-only repair."
+        ),
         cited_evidence_ids=harness.source_ids,
     )
 
@@ -190,6 +193,9 @@ def test_cited_summary_is_redacted_non_authoritative_and_replayable(
         ).content
     assert isinstance(content, dict)
     assert content["authority"] == NON_AUTHORITATIVE
+    assert content["summary"] == (
+        "Two cited records from [REDACTED:EMAIL] show a recurring formatter-only repair."
+    )
     citations = cast(list[dict[str, object]], content["citations"])
     assert [item["evidence_id"] for item in citations] == [
         str(value) for value in learning_harness.source_ids

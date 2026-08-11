@@ -32,6 +32,7 @@ from mathews_control_plane.evidence import (
     load_evidence,
     load_evidence_derivative,
     normalize_evidence_timestamp,
+    redact_evidence_content,
     register_evidence_derivative,
 )
 
@@ -356,7 +357,7 @@ def _summary_payload(
     draft: CitedSummaryDraft,
     source_hashes: Sequence[str],
 ) -> dict[str, object]:
-    identity = {
+    raw_identity = {
         "schema_version": CANDIDATE_LEARNING_SCHEMA_VERSION,
         "authority": NON_AUTHORITATIVE,
         "task_id": str(task_id),
@@ -370,6 +371,13 @@ def _summary_payload(
             )
         ],
     }
+    redacted = redact_evidence_content(
+        raw_identity,
+        media_type="application/json",
+    ).value
+    if not isinstance(redacted, dict):
+        raise CandidateLearningError("LEARNING_PAYLOAD_INVALID")
+    identity = cast(dict[str, object], redacted)
     return {**identity, "summary_fingerprint": _fingerprint(identity)}
 
 
@@ -437,11 +445,8 @@ def _replayed_summary(
 ) -> CitedSummaryResult:
     citations, hashes = _validated_summary(session, store, task, summary)
     loaded = load_evidence_derivative(session, store, summary).content
-    if (
-        citations != draft.cited_evidence_ids
-        or not isinstance(loaded, dict)
-        or loaded.get("summary") != draft.summary
-    ):
+    expected = _summary_payload(task.id, draft, hashes)
+    if citations != draft.cited_evidence_ids or loaded != expected:
         raise CandidateLearningError("LEARNING_SUMMARY_CONFLICT")
     return CitedSummaryResult(
         task.id,
