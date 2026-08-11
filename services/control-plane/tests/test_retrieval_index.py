@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -43,7 +44,10 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
     create_correction,
+    destroy_evidence_derivative,
     load_evidence,
+    load_evidence_derivative,
+    register_evidence_derivative,
 )
 from mathews_control_plane.evidence_projections import EvidenceProjectionService
 from mathews_control_plane.retrieval_index import (
@@ -52,6 +56,7 @@ from mathews_control_plane.retrieval_index import (
     RETRIEVAL_VERIFIER_VERSION,
     RetrievalIndexService,
     RetrievalIndexValidationError,
+    _term_frequencies,
 )
 from mathews_control_plane.settings import Settings
 from pydantic import SecretStr
@@ -484,6 +489,81 @@ def test_search_rejects_unverified_chunk_versions(
             task_id=task.id,
             content={"message": "version sentinel"},
         )
+
+
+def test_search_rejects_a_chunk_that_is_not_the_canonical_source_slice(
+    retrieval_harness: RetrievalHarness,
+) -> None:
+    with retrieval_harness.factory.begin() as session:
+        task = _task()
+        session.add(task)
+        session.flush()
+        _capture(
+            retrieval_harness,
+            session,
+            task_id=task.id,
+            content={"message": "canonical sentinel"},
+        )
+        task_id = task.id
+    service = _service(retrieval_harness)
+    service.rebuild_task_index_internal(
+        task_id,
+        index_version="retrieval-v1",
+        actor_id="retrieval-indexer",
+    )
+    with retrieval_harness.factory.begin() as session:
+        generation = session.scalar(
+            select(RetrievalIndexGeneration).where(
+                RetrievalIndexGeneration.task_id == task_id,
+                RetrievalIndexGeneration.deleted_at.is_(None),
+            )
+        )
+        chunk = session.scalar(
+            select(RetrievalIndexChunk).where(
+                RetrievalIndexChunk.task_id == task_id,
+                RetrievalIndexChunk.deleted_at.is_(None),
+            )
+        )
+        assert generation is not None and chunk is not None
+        derivative = session.get(EvidenceDerivative, chunk.derivative_id)
+        assert derivative is not None
+        content = load_evidence_derivative(
+            session,
+            retrieval_harness.store,
+            derivative,
+        ).content
+        assert isinstance(content, dict)
+        forged = dict(content)
+        forged_text = str(forged["text"]).replace("canonical", "malicious")
+        assert len(forged_text) == len(str(forged["text"]))
+        forged_hash = f"sha256:{hashlib.sha256(forged_text.encode()).hexdigest()}"
+        forged["text"] = forged_text
+        forged["chunk_hash"] = forged_hash
+        destroy_evidence_derivative(
+            retrieval_harness.store,
+            derivative,
+            deleted_at=retrieval_harness.now,
+        )
+        replacement = register_evidence_derivative(
+            session,
+            retrieval_harness.store,
+            evidence_id=chunk.evidence_id,
+            derivative_type=f"{RETRIEVAL_DERIVATIVE_TYPE_PREFIX}{task_id}",
+            payload=forged,
+            media_type="application/json",
+            actor_id="malformed-builder",
+            captured_at=retrieval_harness.now,
+        )
+        chunk.derivative_id = replacement.id
+        chunk.chunk_hash = forged_hash
+        chunk.lexical_term_frequencies = _term_frequencies(forged_text, generation.id)
+
+    with pytest.raises(RetrievalIndexValidationError, match="verification failed"):
+        service.search(
+            task_id,
+            "malicious",
+            _authentication(retrieval_harness.now),
+        )
         task_id = task.id
     service = _service(retrieval_harness)
     service.rebuild_task_index_internal(
@@ -731,7 +811,6 @@ def test_default_app_retrieval_service_uses_the_configured_artifact_root(
         artifact_root=artifact_root,
     )
     try:
-        app = create_app(settings, session_factory=factory)
         with factory.begin() as session:
             task = _task()
             session.add(task)
@@ -743,14 +822,68 @@ def test_default_app_retrieval_service_uses_the_configured_artifact_root(
                 content={"message": "default construction"},
             )
             task_id = task.id
-        built = app.state.retrieval_index_service.rebuild_task_index_internal(
-            task_id,
-            index_version="retrieval-v1",
-            actor_id="retrieval-indexer",
-        )
-        assert built.chunk_count == 1
+        app = create_app(settings, session_factory=factory)
+        with TestClient(app, base_url="https://localhost"):
+            pass
+        with factory() as session:
+            generation = session.scalar(
+                select(RetrievalIndexGeneration).where(
+                    RetrievalIndexGeneration.task_id == task_id,
+                    RetrievalIndexGeneration.deleted_at.is_(None),
+                )
+            )
+            assert generation is not None
+            assert generation.chunk_count == 1
     finally:
         engine.dispose()
+
+
+def test_refresh_worker_rebuilds_an_index_after_new_evidence_activity(
+    retrieval_harness: RetrievalHarness,
+) -> None:
+    with retrieval_harness.factory.begin() as session:
+        task = _task()
+        session.add(task)
+        session.flush()
+        _capture(
+            retrieval_harness,
+            session,
+            task_id=task.id,
+            content={"message": "initial evidence"},
+        )
+        task_id = task.id
+    first_service = _service(retrieval_harness)
+    assert first_service.refresh_stale_task_indexes_internal(actor_id="retrieval-index-worker") == (
+        task_id,
+    )
+    assert (
+        first_service.refresh_stale_task_indexes_internal(actor_id="retrieval-index-worker") == ()
+    )
+
+    later = retrieval_harness.now + timedelta(minutes=2)
+    later_harness = RetrievalHarness(
+        retrieval_harness.engine,
+        retrieval_harness.factory,
+        retrieval_harness.store,
+        later,
+    )
+    with retrieval_harness.factory.begin() as session:
+        second = _capture(
+            later_harness,
+            session,
+            task_id=task_id,
+            content={"message": "newly indexed evidence"},
+        )
+    later_service = _service(later_harness)
+    assert later_service.refresh_stale_task_indexes_internal(actor_id="retrieval-index-worker") == (
+        task_id,
+    )
+    result = later_service.search(
+        task_id,
+        "newly",
+        _authentication(later),
+    )
+    assert [hit.evidence_id for hit in result.hits] == [second.id]
 
 
 def test_default_retrieval_service_rejects_a_projection_store_mismatch(

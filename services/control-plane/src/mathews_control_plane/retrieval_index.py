@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import exists, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import Session
 
 from mathews_control_plane.artifacts import ArtifactStore
@@ -24,11 +24,14 @@ from mathews_control_plane.authentication import (
 )
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
+    EvidenceDeletionRequest,
     EvidenceDerivative,
     EvidenceRecord,
     RetrievalIndexChunk,
     RetrievalIndexGeneration,
     Task,
+    TaskEvent,
+    TaskEventEvidenceReference,
 )
 from mathews_control_plane.evidence import (
     EvidenceAccessClass,
@@ -58,6 +61,7 @@ RETRIEVAL_DERIVATIVE_TYPE_PREFIX = "retrieval-index:"
 RETRIEVAL_CHUNK_SCHEMA_VERSION = 1
 RETRIEVAL_CHUNKER_VERSION = "mvp-char-v1"
 RETRIEVAL_VERIFIER_VERSION = "evidence-envelope-v1"
+RETRIEVAL_DEFAULT_INDEX_VERSION = "mvp-lexical-v1"
 RETRIEVAL_CHUNK_CHARACTERS = 1_000
 RETRIEVAL_CHUNK_OVERLAP = 100
 MAX_INDEX_SOURCES = 1_000
@@ -65,6 +69,7 @@ MAX_INDEX_CHUNKS = 5_000
 MAX_SEARCH_RESULTS = 50
 MAX_SEARCH_VERIFY_CHUNKS = 500
 MAX_SEARCH_QUERY_CHARACTERS = 500
+MAX_REFRESH_TASKS = 1_000
 _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}\Z")
 _TERM = re.compile(r"[\w./:-]+", re.UNICODE)
 _CHUNK_KEYS = {
@@ -383,6 +388,77 @@ class RetrievalIndexService:
             self._artifact_store.delete_bytes(address)
         return removed
 
+    def refresh_stale_task_indexes_internal(
+        self,
+        *,
+        actor_id: str,
+        limit: int = MAX_REFRESH_TASKS,
+    ) -> tuple[UUID, ...]:
+        """Rebuild task indexes whose evidence activity is newer than generation."""
+
+        actor = _required_actor(actor_id)
+        if not 1 <= limit <= MAX_REFRESH_TASKS:
+            raise RetrievalIndexValidationError("retrieval refresh limit is invalid")
+        with self._factory() as session:
+            task_ids = tuple(session.scalars(select(Task.id).order_by(Task.id).limit(limit)))
+            stale = tuple(
+                task_id for task_id in task_ids if self._task_index_is_stale(session, task_id)
+            )
+        rebuilt: list[UUID] = []
+        for task_id in stale:
+            self.rebuild_task_index_internal(
+                task_id,
+                index_version=RETRIEVAL_DEFAULT_INDEX_VERSION,
+                actor_id=actor,
+            )
+            rebuilt.append(task_id)
+        return tuple(rebuilt)
+
+    @staticmethod
+    def _task_index_is_stale(session: Session, task_id: UUID) -> bool:
+        generation = session.scalar(
+            select(RetrievalIndexGeneration).where(
+                RetrievalIndexGeneration.task_id == task_id,
+                RetrievalIndexGeneration.deleted_at.is_(None),
+            )
+        )
+        if generation is None:
+            return True
+        referenced_ids = select(TaskEventEvidenceReference.evidence_id).where(
+            TaskEventEvidenceReference.task_id == task_id
+        )
+        related_ids = select(EvidenceRecord.id).where(
+            or_(
+                EvidenceRecord.task_id == task_id,
+                EvidenceRecord.id.in_(referenced_ids),
+            )
+        )
+        changed_evidence = exists().where(
+            EvidenceRecord.id.in_(related_ids),
+            or_(
+                EvidenceRecord.captured_at > generation.indexed_at,
+                EvidenceRecord.deleted_at > generation.indexed_at,
+            ),
+        )
+        changed_correction = exists().where(
+            EvidenceRecord.correction_of_id.in_(related_ids),
+            EvidenceRecord.captured_at > generation.indexed_at,
+        )
+        changed_reference = exists().where(
+            TaskEvent.id == TaskEventEvidenceReference.task_event_id,
+            TaskEventEvidenceReference.task_id == task_id,
+            TaskEvent.occurred_at > generation.indexed_at,
+        )
+        changed_deletion = exists().where(
+            EvidenceDeletionRequest.evidence_id.in_(related_ids),
+            EvidenceDeletionRequest.requested_at > generation.indexed_at,
+        )
+        return bool(
+            session.scalar(
+                select(changed_evidence | changed_correction | changed_reference | changed_deletion)
+            )
+        )
+
     def search(
         self,
         task_id: UUID,
@@ -452,7 +528,7 @@ class RetrievalIndexService:
                     )
                 )
             )
-            source_cache: dict[UUID, tuple[EvidenceRecord, str]] = {}
+            source_cache: dict[UUID, tuple[EvidenceRecord, str, str]] = {}
             candidates: list[RetrievalHit] = []
             for projected_score, chunk in selected:
                 if chunk.evidence_id in successor_ids:
@@ -475,7 +551,11 @@ class RetrievalIndexService:
                     source_hash_value = loaded_source.envelope.get("content_hash")
                     if not isinstance(source_hash_value, str):
                         raise RetrievalIndexValidationError("retrieval source hash is invalid")
-                    cached = (record, source_hash_value)
+                    cached = (
+                        record,
+                        source_hash_value,
+                        _source_text(loaded_source.content, loaded_source.media_type),
+                    )
                     source_cache[record.id] = cached
                 derivative = session.get(EvidenceDerivative, chunk.derivative_id)
                 if (
@@ -498,6 +578,7 @@ class RetrievalIndexService:
                     derivative=derivative,
                     record=cached[0],
                     source_hash=cached[1],
+                    source_text=cached[2],
                 )
                 score = _lexical_score(payload.text, terms)
                 if score <= 0 or score != projected_score:
@@ -738,7 +819,10 @@ def _verify_chunk_payload(
     derivative: EvidenceDerivative,
     record: EvidenceRecord,
     source_hash: str,
+    source_text: str,
 ) -> None:
+    expected_start = (payload.ordinal - 1) * (RETRIEVAL_CHUNK_CHARACTERS - RETRIEVAL_CHUNK_OVERLAP)
+    expected_end = min(len(source_text), expected_start + RETRIEVAL_CHUNK_CHARACTERS)
     if (
         payload.task_id != task_id
         or payload.task_id != chunk.task_id
@@ -771,6 +855,9 @@ def _verify_chunk_payload(
         or payload.ordinal != chunk.ordinal
         or payload.start_offset != chunk.start_offset
         or payload.end_offset != chunk.end_offset
+        or payload.start_offset != expected_start
+        or payload.end_offset != expected_end
+        or payload.text != source_text[expected_start:expected_end]
         or payload.chunk_hash != chunk.chunk_hash
         or payload.chunk_hash != _digest(payload.text.encode("utf-8"))
         or chunk.lexical_term_frequencies != _term_frequencies(payload.text, generation.id)

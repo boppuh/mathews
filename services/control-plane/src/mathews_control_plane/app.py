@@ -88,6 +88,8 @@ from mathews_control_plane.validation_evidence import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_RETRIEVAL_INDEX_ACTOR = "retrieval-index-worker"
+_RETRIEVAL_INDEX_REFRESH_SECONDS = 5
 
 
 class HealthResponse(BaseModel):
@@ -219,6 +221,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
         webhook_drain_task: asyncio.Task[None] | None = None
+        retrieval_refresh_task: asyncio.Task[None] | None = None
         if github_webhook_service is not None:
             webhook_batch_size = 100
             for _pass in range(10):
@@ -271,8 +274,32 @@ def create_app(
         ):
             pass
         try:
+            await run_in_threadpool(
+                retrieval_index_service.refresh_stale_task_indexes_internal,
+                actor_id=_RETRIEVAL_INDEX_ACTOR,
+            )
+        except Exception:
+            _LOGGER.exception("initial retrieval-index refresh failed")
+
+        async def refresh_retrieval_indexes() -> None:
+            while True:
+                await asyncio.sleep(_RETRIEVAL_INDEX_REFRESH_SECONDS)
+                try:
+                    await run_in_threadpool(
+                        retrieval_index_service.refresh_stale_task_indexes_internal,
+                        actor_id=_RETRIEVAL_INDEX_ACTOR,
+                    )
+                except Exception:
+                    _LOGGER.exception("retrieval-index refresh failed")
+
+        retrieval_refresh_task = asyncio.create_task(refresh_retrieval_indexes())
+        try:
             yield
         finally:
+            if retrieval_refresh_task is not None:
+                retrieval_refresh_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await retrieval_refresh_task
             if webhook_drain_task is not None:
                 webhook_drain_task.cancel()
                 with suppress(asyncio.CancelledError):

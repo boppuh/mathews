@@ -45,6 +45,11 @@ chunk, and derivative rows deleted while leaving canonical evidence untouched.
 A later rebuild reads the canonical sources again, so losing the entire index
 loses no source data or policy state.
 
+The application runs a trusted retrieval refresh worker at startup and every
+five seconds. It rebuilds task indexes that are missing or older than relevant
+evidence capture, correction, deletion, or task-reference activity, so normal
+task and evidence lifecycles populate the index without an out-of-band call.
+
 Canonical evidence deletion uses the existing derivative destruction path.
 Consequently its retrieval bytes disappear in the same deletion operation and
 cannot be recovered by searching or rebuilding. Deleted derivative rows retain
@@ -66,10 +71,11 @@ to the immutable source record but is never trusted to grant access.
 
 Before scoring, the service verifies the live canonical source, derivative
 artifact address, source-envelope binding, source/content/chunk hashes,
-timestamps, character span, and all version metadata. A corrected source's old
-chunks are excluded immediately, even before the next rebuild. A deleted source
-or derivative is absent from the candidate query and its bytes no longer exist.
-Every source whose chunk content is returned receives the canonical
+timestamps, character span, all version metadata, and the chunk text against
+the exact canonical source slice dictated by the versioned chunker. A corrected
+source's old chunks are excluded immediately, even before the next rebuild. A
+deleted source or derivative is absent from the candidate query and its bytes
+no longer exist. Every source whose chunk content is returned receives the canonical
 `CONTENT_DOWNLOADED` audit event without persisting the raw query.
 
 The MVP ranker is deterministic lexical occurrence scoring. Task 7.3 will
