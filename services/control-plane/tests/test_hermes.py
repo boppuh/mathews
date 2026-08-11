@@ -44,9 +44,16 @@ from mathews_control_plane.domain_models import (
     PromptTemplateVersion,
     ReconciliationTarget,
     ReconciliationTargetKind,
+    RetrievalIndexGeneration,
     Task,
     TaskEvent,
     TaskState,
+)
+from mathews_control_plane.evaluation_telemetry import (
+    AgentRunMetrics,
+    EvaluationTelemetryService,
+    EvaluationTelemetryValidationError,
+    QualityOutcome,
 )
 from mathews_control_plane.evidence import load_evidence
 from mathews_control_plane.hermes import (
@@ -72,6 +79,7 @@ from mathews_control_plane.prompt_compiler import (
     PromptRole,
     StructuredPromptTemplate,
 )
+from mathews_control_plane.retrieval_index import RetrievalSearchResult
 from sqlalchemy import Engine, func, select
 
 _NOW = datetime(2026, 8, 7, 17, 0, tzinfo=UTC)
@@ -185,6 +193,106 @@ def _started(harness: HermesHarness) -> tuple[HermesRunService, UUID]:
     started = service.record_started(harness.grant, run_id=run_id, external_run_id="run-1")
     assert started.status is HermesRunStatus.RUNNING
     return service, run_id
+
+
+def test_version_bound_run_evaluation_is_idempotent_and_comparable(
+    hermes_harness: HermesHarness,
+) -> None:
+    runs, run_id = _started(hermes_harness)
+    runs.ingest(
+        run_id,
+        event=HermesProviderEvent(
+            provider_event_id="completed-evaluation",
+            external_run_id="run-1",
+            sequence=1,
+            event_type=HermesEventType.COMPLETED,
+            payload={"usage": {"input_tokens": 100, "output_tokens": 20}},
+        ),
+    )
+    with hermes_harness.factory.begin() as session:
+        task = session.get(Task, hermes_harness.task_id)
+        assert task is not None
+        generation = RetrievalIndexGeneration(
+            task_id=task.id,
+            index_version="retrieval-v1",
+            chunker_version="mvp-char-v1",
+            verifier_version="evidence-envelope-v1",
+            indexed_at=_NOW,
+            source_count=0,
+            chunk_count=0,
+            owner_id=task.owner_id,
+            actor_id="retrieval-indexer",
+            root_correlation_id=task.root_correlation_id,
+        )
+        session.add(generation)
+        session.flush()
+        generation_id = generation.id
+
+    telemetry = EvaluationTelemetryService(
+        hermes_harness.factory,
+        clock=lambda: _NOW,
+    )
+    contract = telemetry.create_contract_version(
+        lineage_key="mvp-agent-evaluation",
+        promotion_thresholds={
+            "minimum_run_count": 1,
+            "minimum_quality_score": 0.8,
+            "maximum_average_cost_microusd": 2_000,
+            "minimum_regression_pass_rate": 1.0,
+        },
+        regression_cases=("baseline-task",),
+        actor_id="evaluation-worker",
+        activate=True,
+    )
+    retrieval = RetrievalSearchResult(
+        task_id=hermes_harness.task_id,
+        generation_id=generation_id,
+        index_version="retrieval-v1",
+        hits=(),
+    )
+    metrics = AgentRunMetrics(
+        model_provider="openai",
+        model_name="gpt-5",
+        model_version="2026-08-01",
+        input_tokens=100,
+        output_tokens=20,
+        cached_tokens=40,
+        cost_microusd=1_500,
+        quality_outcome=QualityOutcome.PASSED,
+        quality_score=0.95,
+        regression_results={"baseline-task": True},
+    )
+    recorded = telemetry.record(
+        run_id=run_id,
+        contract_id=contract.id,
+        retrieval=retrieval,
+        metrics=metrics,
+        actor_id="evaluation-worker",
+    )
+    replayed = telemetry.record(
+        run_id=run_id,
+        contract_id=contract.id,
+        retrieval=retrieval,
+        metrics=metrics,
+        actor_id="evaluation-worker",
+    )
+    assert replayed.id == recorded.id
+    comparison = telemetry.compare(contract.id)
+    assert len(comparison) == 1
+    assert comparison[0].promotion_eligible is True
+    assert comparison[0].average_quality_score == 0.95
+    assert comparison[0].regression_pass_rate == 1.0
+    with pytest.raises(
+        EvaluationTelemetryValidationError,
+        match="agent run evaluation conflicts",
+    ):
+        telemetry.record(
+            run_id=run_id,
+            contract_id=contract.id,
+            retrieval=retrieval,
+            metrics=replace(metrics, quality_score=0.5),
+            actor_id="evaluation-worker",
+        )
 
 
 def test_run_correlation_and_prose_safe_event_normalization(
