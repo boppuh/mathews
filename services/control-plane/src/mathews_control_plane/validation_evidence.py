@@ -75,6 +75,7 @@ from mathews_control_plane.host_gateway import (
     HostGatewayError,
     authority_for_job_lease,
 )
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.repair_loop import (
     RepairLoopError,
     RepairScheduleResult,
@@ -653,7 +654,7 @@ class ValidationEvidenceService:
         session_factory: SessionFactory,
         artifact_store: ArtifactStore,
         *,
-        principal_id: str = "local-user",
+        principal_id: str = LOCAL_OWNER_ID,
         clock: Callable[[], datetime] | None = None,
         configuration_digest: Callable[[RepositoryConfiguration], str] | None = None,
     ) -> None:

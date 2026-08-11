@@ -37,6 +37,7 @@ from mathews_control_plane.domain_models import (
     RepositoryConfiguration as RepositoryConfigurationRecord,
 )
 from mathews_control_plane.host_gateway import HostGatewayError
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.repository_configuration import (
     RepositoryConfigurationConflictError,
     RepositoryPreflightAttempt,
@@ -55,7 +56,7 @@ from mathews_control_plane.repository_configuration import (
 ALLOWED_REPOSITORY_KEY = "boppuh/mathews"
 MAX_REPOSITORY_BODY_BYTES = 512 * 1024
 _MAX_REPOSITORY_BODY_CHUNKS = 4096
-_OWNER_ID = "local-user"
+_OWNER_ID = LOCAL_OWNER_ID
 _USER_ID = 1
 _PREFLIGHT_LIFETIME = timedelta(seconds=30)
 

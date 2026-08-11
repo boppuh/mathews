@@ -43,6 +43,7 @@ from mathews_control_plane.evidence import (
     capture_evidence,
     load_evidence,
 )
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 
 VALIDATION_DECIDED_EVENT_TYPE = "VALIDATION_DECIDED"
 VALIDATION_DECISION_SCHEMA_VERSION = 1
@@ -107,7 +108,7 @@ class ValidationDecisionService:
         factory: SessionFactory,
         artifact_store: ArtifactStore,
         *,
-        principal_id: str = "local-user",
+        principal_id: str = LOCAL_OWNER_ID,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._factory = factory

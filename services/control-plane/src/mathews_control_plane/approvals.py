@@ -50,6 +50,13 @@ from mathews_control_plane.domain_models import (
     TaskEventEvidenceReference,
     TaskState,
 )
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceError,
+    invalidated_evidence_ids,
+    load_evidence,
+)
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.task_state_machine import (
     TaskTransitionError,
     TaskTransitionGateEvaluator,
@@ -121,7 +128,6 @@ _PRECONDITIONED_DECISIONS = _APPROVING_DECISIONS | {
 }
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_USER_ID = 1
-_LOCAL_OWNER_ID = "local-user"
 AuthenticatedApprovalSession = Annotated[
     AuthenticatedSession,
     Depends(require_authenticated_session),
@@ -208,7 +214,9 @@ class ApprovalInboxItem(BaseModel):
 
 class RuleInboxItem(BaseModel):
     candidate_id: UUID
-    approval_request_id: UUID
+    approval_request_id: UUID | None
+    authority: Literal["NON_AUTHORITATIVE"] = "NON_AUTHORITATIVE"
+    status: Literal["EVALUATED"] = "EVALUATED"
     task: ApprovalTaskSummary
     proposed_rule: str
     recurrence_assessment: str
@@ -871,6 +879,9 @@ def _candidate_evidence_ids(
     session: Session,
     task: Task,
     candidate: RuleCandidate,
+    *,
+    for_update: bool = False,
+    artifact_store: ArtifactStore | None = None,
 ) -> tuple[UUID, ...]:
     try:
         values = tuple(UUID(cast(str, value)) for value in candidate.cited_evidence_ids)
@@ -882,16 +893,33 @@ def _candidate_evidence_ids(
         or len(set(values)) != len(values)
     ):
         raise ApprovalConflictError("stored rule candidate evidence is invalid")
-    records = session.scalars(
-        select(EvidenceRecord).where(
-            EvidenceRecord.id.in_(values),
-            EvidenceRecord.task_id == task.id,
-            EvidenceRecord.owner_id == task.owner_id,
-            EvidenceRecord.deleted_at.is_(None),
-        )
-    ).all()
-    if len(records) != len(values):
+    records_query = select(EvidenceRecord).where(
+        EvidenceRecord.id.in_(values),
+        EvidenceRecord.task_id == task.id,
+        EvidenceRecord.owner_id == task.owner_id,
+        EvidenceRecord.deleted_at.is_(None),
+    )
+    if for_update:
+        records_query = records_query.with_for_update()
+    records = session.scalars(records_query).all()
+    if any(
+        record.access_classification
+        not in {
+            EvidenceAccessClass.TASK_OWNER.value,
+            EvidenceAccessClass.OWNER.value,
+        }
+        for record in records
+    ):
         raise ApprovalConflictError("rule candidate evidence is unavailable")
+    invalidated_ids = invalidated_evidence_ids(session, values)
+    if len(records) != len(values) or bool(invalidated_ids):
+        raise ApprovalConflictError("rule candidate evidence is unavailable")
+    if artifact_store is not None:
+        try:
+            for record in records:
+                load_evidence(session, artifact_store, record)
+        except EvidenceError:
+            raise ApprovalConflictError("rule candidate evidence is unavailable") from None
     return values
 
 
@@ -899,6 +927,8 @@ def _validated_rule_candidate(
     session: Session,
     task: Task,
     candidate: RuleCandidate,
+    *,
+    artifact_store: ArtifactStore | None = None,
 ) -> tuple[_EvaluatedReviewRule, tuple[UUID, ...], str]:
     if (
         not isinstance(candidate.proposed_rule, str)
@@ -917,7 +947,12 @@ def _validated_rule_candidate(
         field="rule candidate risks",
     )
     rule = _evaluated_review_rule(candidate)
-    cited_evidence_ids = _candidate_evidence_ids(session, task, candidate)
+    cited_evidence_ids = _candidate_evidence_ids(
+        session,
+        task,
+        candidate,
+        artifact_store=artifact_store,
+    )
     try:
         fingerprint = _fingerprint(
             {
@@ -975,7 +1010,7 @@ def _brief_fingerprint(brief: Brief) -> str:
 def _approval_principal(authentication: AuthenticatedSession) -> str:
     if authentication.user_id != _LOCAL_USER_ID:
         raise ApprovalNotFoundError("approval inbox is unavailable")
-    return _LOCAL_OWNER_ID
+    return LOCAL_OWNER_ID
 
 
 def _durable_preconditions_are_current(
@@ -1314,7 +1349,12 @@ class ApprovalService:
                     continue
                 try:
                     rule, stored_cited_evidence_ids, _candidate_fingerprint = (
-                        _validated_rule_candidate(session, task, candidate)
+                        _validated_rule_candidate(
+                            session,
+                            task,
+                            candidate,
+                            artifact_store=self._artifact_store,
+                        )
                     )
                     cited_evidence_ids = list(stored_cited_evidence_ids)
                     if not set(cited_evidence_ids).issubset(evidence_ids):
@@ -1349,6 +1389,61 @@ class ApprovalService:
                             field="rule candidate risks",
                         ),
                         cited_evidence_ids=cited_evidence_ids,
+                        lineage_key=rule.lineage_key,
+                        permitted_action=rule.permitted_action,
+                        risk_class=rule.risk_class,
+                        scope=rule.scope,
+                        matcher=rule.matcher,
+                        evidence_requirements=rule.evidence_requirements,
+                    )
+                )
+            projected_candidate_ids = {item.candidate_id for item in rule_candidates}
+            candidate_rows = session.execute(
+                select(RuleCandidate, Task)
+                .join(Task, Task.id == RuleCandidate.task_id)
+                .where(
+                    RuleCandidate.owner_id == owner_id,
+                    Task.owner_id == owner_id,
+                    RuleCandidate.status == RuleCandidateStatus.EVALUATED,
+                )
+                .order_by(RuleCandidate.created_at, RuleCandidate.id)
+            ).all()
+            for candidate, task in candidate_rows:
+                if candidate.id in projected_candidate_ids:
+                    continue
+                try:
+                    rule, candidate_evidence_ids, _candidate_fingerprint = (
+                        _validated_rule_candidate(
+                            session,
+                            task,
+                            candidate,
+                            artifact_store=self._artifact_store,
+                        )
+                    )
+                except ApprovalConflictError:
+                    _LOGGER.warning(
+                        "Skipped invalid candidate-only rule %s",
+                        candidate.id,
+                    )
+                    continue
+                rule_candidates.append(
+                    RuleInboxItem(
+                        candidate_id=candidate.id,
+                        approval_request_id=None,
+                        task=ApprovalTaskSummary(
+                            id=task.id,
+                            summary=task.summary,
+                            repository=task.repository,
+                            cockpit_path=f"/tasks/{task.id}",
+                        ),
+                        proposed_rule=candidate.proposed_rule,
+                        recurrence_assessment=candidate.recurrence_assessment,
+                        severity_assessment=candidate.severity_assessment,
+                        false_positive_risks=_stored_string_list(
+                            candidate.false_positive_risks,
+                            field="rule candidate risks",
+                        ),
+                        cited_evidence_ids=list(candidate_evidence_ids),
                         lineage_key=rule.lineage_key,
                         permitted_action=rule.permitted_action,
                         risk_class=rule.risk_class,
@@ -1996,7 +2091,13 @@ class ApprovalService:
         approved_at: datetime,
     ) -> None:
         definition = _evaluated_review_rule(candidate)
-        cited_evidence_ids = _candidate_evidence_ids(session, task, candidate)
+        cited_evidence_ids = _candidate_evidence_ids(
+            session,
+            task,
+            candidate,
+            for_update=True,
+            artifact_store=self._artifact_store,
+        )
         if not set(cited_evidence_ids).issubset(_stored_evidence_ids(request)):
             raise ApprovalConflictError("rule candidate evidence is not bound to the approval")
         _lock_policy_promotion(session, self._active_policy_lineage)

@@ -4,7 +4,6 @@ import Link from "next/link";
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   type ApprovalDecision,
-  type ApprovalInboxItem,
   type ApprovalInboxResponse,
   ApprovalRequestError,
   approvalClient,
@@ -43,18 +42,12 @@ function errorMessage(error: unknown, fallback = "Unable to load the approval in
   return fallback;
 }
 
-function EvidenceLinks({
-  approval,
-  evidenceIds = approval.supporting_evidence_ids,
-}: {
-  approval: ApprovalInboxItem;
-  evidenceIds?: string[];
-}) {
+function EvidenceLinks({ taskPath, evidenceIds }: { taskPath: string; evidenceIds: string[] }) {
   return (
     <div className="inbox-evidence">
       <span>Evidence</span>
       {evidenceIds.map((id) => (
-        <Link href={`${approval.task.cockpit_path}#evidence-${id}`} key={id}>
+        <Link href={`${taskPath}#evidence-${id}`} key={id}>
           {id.slice(0, 8)}
         </Link>
       ))}
@@ -177,7 +170,9 @@ export function DecisionInbox() {
   }
 
   const projectedRuleRequestIds = new Set(
-    state.inbox.rule_candidates.map((rule) => rule.approval_request_id),
+    state.inbox.rule_candidates.flatMap((rule) =>
+      rule.approval_request_id === null ? [] : [rule.approval_request_id],
+    ),
   );
   const approvals = state.inbox.approvals.filter(
     (approval) =>
@@ -193,7 +188,7 @@ export function DecisionInbox() {
           ← Work
         </Link>
         <span>
-          {total} pending {total === 1 ? "decision" : "decisions"}
+          {total} pending {total === 1 ? "item" : "items"}
         </span>
       </div>
       <header className="inbox-header">
@@ -355,7 +350,10 @@ export function DecisionInbox() {
                     </div>
                   </div>
                 ) : null}
-                <EvidenceLinks approval={approval} />
+                <EvidenceLinks
+                  taskPath={approval.task.cockpit_path}
+                  evidenceIds={approval.supporting_evidence_ids}
+                />
                 {!approval.actionable ? (
                   <p className="inbox-unavailable" role="status">
                     {approval.unavailable_reason === "BRIEF_UNAVAILABLE"
@@ -397,20 +395,25 @@ export function DecisionInbox() {
           <span>{state.inbox.rule_candidates.length}</span>
         </div>
         <p className="rule-safety-note">
-          Approval promotes only this evaluated rule into a new policy version. Prompt templates
-          remain unchanged.
+          Candidates are non-authoritative and cannot change policy or prompts. A separate approval
+          is required before any candidate can be promoted into a new policy version.
         </p>
         {state.inbox.rule_candidates.length === 0 ? (
-          <div className="inbox-empty">No evaluated rules are waiting for a human decision.</div>
+          <div className="inbox-empty">No evaluated rule candidates are available.</div>
         ) : (
           <div className="inbox-cards">
             {state.inbox.rule_candidates.map((rule) => {
-              const approval = approvalById.get(rule.approval_request_id);
-              if (!approval) return null;
+              const approval =
+                rule.approval_request_id === null
+                  ? undefined
+                  : approvalById.get(rule.approval_request_id);
+              if (rule.approval_request_id !== null && !approval) return null;
               return (
                 <article className="inbox-card rule-card" key={rule.candidate_id}>
                   <div className="inbox-card-topline">
-                    <span className="inbox-kind">Rule · {rule.lineage_key}</span>
+                    <span className="inbox-kind">
+                      {approval ? "Rule for approval" : "Candidate only"} · {rule.lineage_key}
+                    </span>
                     <span className="risk-chip">{rule.risk_class} risk</span>
                   </div>
                   <h3>{rule.proposed_rule}</h3>
@@ -459,22 +462,31 @@ export function DecisionInbox() {
                       </ul>
                     </div>
                   </div>
-                  <EvidenceLinks approval={approval} evidenceIds={rule.cited_evidence_ids} />
+                  <EvidenceLinks
+                    taskPath={rule.task.cockpit_path}
+                    evidenceIds={rule.cited_evidence_ids}
+                  />
                   <div className="inbox-card-footer">
                     <Link href={rule.task.cockpit_path}>Open task</Link>
-                    <div className="decision-actions">
-                      {approval.options.map((option) => (
-                        <button
-                          className={option === "APPROVE" ? "primary" : ""}
-                          disabled={pendingRequest !== null}
-                          key={option}
-                          onClick={() => void decide(approval.id, option)}
-                          type="button"
-                        >
-                          {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}
-                        </button>
-                      ))}
-                    </div>
+                    {approval ? (
+                      <div className="decision-actions">
+                        {approval.options.map((option) => (
+                          <button
+                            className={option === "APPROVE" ? "primary" : ""}
+                            disabled={pendingRequest !== null}
+                            key={option}
+                            onClick={() => void decide(approval.id, option)}
+                            type="button"
+                          >
+                            {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="inbox-unavailable">
+                        Non-authoritative · no approval requested
+                      </span>
+                    )}
                   </div>
                 </article>
               );

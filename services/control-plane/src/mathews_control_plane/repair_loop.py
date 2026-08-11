@@ -72,6 +72,7 @@ from mathews_control_plane.host_gateway import (
     HostGatewayError,
     authority_for_job_lease,
 )
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.prompt_compiler import PromptCompilerService, PromptRole
 from mathews_control_plane.repository_configuration import (
     validated_repository_configuration,
@@ -208,7 +209,7 @@ class ValidationRepairService:
         self._decisions = ValidationDecisionService(
             factory,
             artifact_store,
-            principal_id="local-user",
+            principal_id=LOCAL_OWNER_ID,
             clock=self._clock,
         )
 
@@ -236,7 +237,7 @@ class ValidationRepairService:
                 session,
                 self._store,
                 validation_run_id,
-                principal_id="local-user",
+                principal_id=LOCAL_OWNER_ID,
                 now=now,
             )
             task = session.get(Task, context.task_id)

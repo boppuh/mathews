@@ -58,6 +58,7 @@ from mathews_control_plane.github_webhooks import (
     GITHUB_PULL_REQUEST_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
 )
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.readiness import (
     HandoffResult,
     ReadinessError,
@@ -91,7 +92,7 @@ TASK_EVENT_POLL_INTERVAL_SECONDS = 1.0
 TASK_EVENT_HEARTBEAT_SECONDS = 15.0
 MAX_TASK_EVENT_SEQUENCE = (1 << 63) - 1
 _LOCAL_USER_ID = 1
-_LOCAL_OWNER_ID = "local-user"
+_LOCAL_OWNER_ID = LOCAL_OWNER_ID
 
 RepositoryText = Annotated[
     str,

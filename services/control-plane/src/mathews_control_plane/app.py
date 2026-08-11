@@ -27,6 +27,11 @@ from mathews_control_plane.authentication import (
     AuthenticationService,
     create_authentication_router,
 )
+from mathews_control_plane.candidate_learning import (
+    CandidateLearningBodyLimitMiddleware,
+    CandidateLearningService,
+    create_candidate_learning_router,
+)
 from mathews_control_plane.database import (
     SessionFactory,
     create_database_engine,
@@ -114,6 +119,7 @@ def create_app(
     task_service: TaskService | None = None,
     approval_service: ApprovalService | None = None,
     approval_continuation: ApprovalContinuation | None = None,
+    candidate_learning_service: CandidateLearningService | None = None,
     repository_service: RepositoryService | None = None,
     validation_evidence_scheduler: ValidationEvidenceJobScheduler | None = None,
     validation_decision_service: ValidationDecisionService | None = None,
@@ -172,6 +178,11 @@ def create_app(
         )
     if approval_service is None:
         approval_service = ApprovalService(
+            session_factory,
+            artifact_store,
+        )
+    if candidate_learning_service is None:
+        candidate_learning_service = CandidateLearningService(
             session_factory,
             artifact_store,
         )
@@ -328,6 +339,7 @@ def create_app(
     application.state.evaluation_telemetry_service = evaluation_telemetry_service
     application.state.task_service = task_service
     application.state.approval_service = approval_service
+    application.state.candidate_learning_service = candidate_learning_service
     application.state.repository_service = repository_service
     application.state.validation_evidence_scheduler = validation_evidence_scheduler
     application.state.validation_decision_service = validation_decision_service
@@ -340,6 +352,9 @@ def create_app(
     application.include_router(create_retrieval_index_router(retrieval_index_service))
     application.include_router(create_evidence_router(evidence_service))
     application.include_router(create_task_router(task_service))
+    application.include_router(
+        create_candidate_learning_router(candidate_learning_service)
+    )
     application.include_router(
         create_approval_router(approval_service, approval_continuation)
     )
@@ -383,6 +398,7 @@ def create_app(
     application.add_middleware(AuthenticationBodyLimitMiddleware)
     application.add_middleware(EvidenceBodyLimitMiddleware)
     application.add_middleware(TaskBodyLimitMiddleware)
+    application.add_middleware(CandidateLearningBodyLimitMiddleware)
     application.add_middleware(ApprovalBodyLimitMiddleware)
     application.add_middleware(RepositoryBodyLimitMiddleware)
     application.add_middleware(ValidationEvidenceBodyLimitMiddleware)

@@ -32,11 +32,16 @@ from mathews_control_plane.domain_models import (
     EvidenceAuditEvent,
     EvidenceDeletionRequest,
     EvidenceDerivative,
+    EvidenceDerivativeCitation,
     EvidenceRecord,
     EvidenceTombstone,
     RetrievalIndexChunk,
+    RuleCandidate,
+    RuleCandidateCitation,
+    RuleCandidateStatus,
     Task,
 )
+from mathews_control_plane.principals import LOCAL_OWNER_ID
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -49,7 +54,6 @@ MAX_EVIDENCE_NODES = 100_000
 MAX_EVIDENCE_REQUEST_BYTES = MAX_EVIDENCE_BYTES + 64 * 1024
 
 _LOCAL_USER_ID = 1
-_LOCAL_OWNER_ID = "local-user"
 _DIGEST_PREFIX = "sha256:"
 _METADATA_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
 _ENVELOPE_KEYS = {
@@ -141,7 +145,7 @@ _OPAQUE_TOKEN = re.compile(
 _JWT = re.compile(
     r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
 )
-_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
+_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])")
 _PHONE = re.compile(r"(?<!\w)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\w)")
 
 
@@ -912,7 +916,7 @@ def _principal(authentication: AuthenticatedSession, *, now: datetime) -> str:
         or _as_utc(authentication.absolute_expires_at) <= now
     ):
         raise EvidenceNotFoundError("evidence is unavailable")
-    return _LOCAL_OWNER_ID
+    return LOCAL_OWNER_ID
 
 
 def _authorize(
@@ -1011,6 +1015,30 @@ def _live_record(
     return record
 
 
+def invalidated_evidence_ids(
+    session: Session,
+    evidence_ids: Sequence[UUID],
+) -> set[UUID]:
+    """Return cited records superseded by correction or fenced for deletion."""
+
+    corrected = {
+        value
+        for value in session.scalars(
+            select(EvidenceRecord.correction_of_id).where(
+                EvidenceRecord.correction_of_id.in_(evidence_ids)
+            )
+        )
+        if value is not None
+    }
+    return corrected | set(
+        session.scalars(
+            select(EvidenceDeletionRequest.evidence_id).where(
+                EvidenceDeletionRequest.evidence_id.in_(evidence_ids)
+            )
+        )
+    )
+
+
 def _source_kind(loaded: LoadedEvidence) -> EvidenceSourceKind:
     value = loaded.envelope.get("source_kind")
     if not isinstance(value, str):
@@ -1090,8 +1118,10 @@ def register_evidence_derivative(
     payload: object,
     media_type: Literal["application/json", "text/plain; charset=utf-8"],
     actor_id: str,
+    derivative_id: UUID | None = None,
     captured_at: datetime | None = None,
     secrets: Sequence[SecretValue] = (),
+    artifact_observer: Callable[[str], None] | None = None,
 ) -> EvidenceDerivative:
     """Register rebuildable content so source deletion can destroy it."""
 
@@ -1103,10 +1133,10 @@ def register_evidence_derivative(
         maximum=255,
     )
     prepared = redact_evidence_content(payload, media_type=media_type, secrets=secrets)
-    derivative_id = uuid4()
+    resolved_derivative_id = derivative_id or uuid4()
     derivative_envelope = {
         "schema_version": 1,
-        "derivative_id": str(derivative_id),
+        "derivative_id": str(resolved_derivative_id),
         "evidence_id": str(record.id),
         "derivative_type": _required_metadata_identifier(
             derivative_type,
@@ -1121,8 +1151,10 @@ def register_evidence_derivative(
         "content": prepared.value,
     }
     artifact = artifact_store.put_bytes(_canonical_json_bytes(derivative_envelope))
+    if artifact_observer is not None:
+        artifact_observer(artifact.address)
     derivative = EvidenceDerivative(
-        id=derivative_id,
+        id=resolved_derivative_id,
         evidence_id=record.id,
         derivative_type=derivative_envelope["derivative_type"],
         content_hash=artifact.address,
@@ -1287,7 +1319,7 @@ def _finalize_deletion(
     )
     if record is None:
         raise EvidenceNotFoundError("evidence is unavailable")
-    derivatives = list(
+    direct_derivatives = tuple(
         session.scalars(
             select(EvidenceDerivative)
             .where(
@@ -1297,12 +1329,48 @@ def _finalize_deletion(
             .with_for_update()
         )
     )
+    cited_derivatives = tuple(
+        session.scalars(
+            select(EvidenceDerivative)
+            .join(
+                EvidenceDerivativeCitation,
+                EvidenceDerivativeCitation.derivative_id == EvidenceDerivative.id,
+            )
+            .where(
+                EvidenceDerivativeCitation.evidence_id == record.id,
+                EvidenceDerivative.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+    )
+    unique_derivatives = {
+        derivative.id: derivative
+        for derivative in (*direct_derivatives, *cited_derivatives)
+    }
+    derivatives = list(unique_derivatives.values())
     for derivative in derivatives:
         destroy_evidence_derivative(
             artifact_store,
             derivative,
             deleted_at=now,
         )
+    removable_candidates = tuple(
+        session.scalars(
+            select(RuleCandidate)
+            .join(
+                RuleCandidateCitation,
+                RuleCandidateCitation.candidate_id == RuleCandidate.id,
+            )
+            .where(
+                RuleCandidateCitation.evidence_id == record.id,
+                RuleCandidate.status != RuleCandidateStatus.APPROVED,
+            )
+            .with_for_update()
+        )
+    )
+    for candidate in removable_candidates:
+        session.delete(candidate)
+    session.flush()
     retrieval_chunks = tuple(
         session.scalars(
             select(RetrievalIndexChunk)
@@ -1362,6 +1430,7 @@ def _finalize_deletion(
         occurred_at=now,
         details={
             "deletion_request_id": str(request.id),
+            "removed_candidate_count": len(removable_candidates),
             "removed_derivative_count": len(derivatives),
             "tombstone_id": str(tombstone.id),
         },

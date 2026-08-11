@@ -38,10 +38,11 @@ complete here unless its backlog definition of done is satisfied on `main`.
   exact-head review resolution, and `6.5` exact-head readiness and explicit
   human handoff,
   `7.1` verified-source projections and provenance views, `7.2` rebuildable
-  retrieval index, and `7.3` version-bound retrieval and prompt telemetry.
-- Remaining: 2 of 40 MVP tasks.
+  retrieval index, `7.3` version-bound retrieval and prompt telemetry, and
+  `7.4` cited candidate-only learning.
+- Remaining: 1 of 40 MVP tasks.
 - Active next wave: Wave 7 pull request, review, and controlled learning.
-- Next completion target: `7.4`.
+- Next completion target: `7.5`.
 
 ## Operating model
 

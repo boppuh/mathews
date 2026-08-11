@@ -42,6 +42,8 @@ const approval = {
 const rule = {
   candidate_id: candidateId,
   approval_request_id: requestId,
+  authority: "NON_AUTHORITATIVE",
+  status: "EVALUATED",
   task: approval.task,
   proposed_rule: "Retry exact formatting failures once.",
   recurrence_assessment: "Repeated",
@@ -65,6 +67,14 @@ describe("parseApprovalInbox", () => {
     expect(parseApprovalInbox({ approvals: [approval], rule_candidates: [rule] })).toEqual({
       approvals: [approval],
       rule_candidates: [rule],
+    });
+  });
+
+  it("accepts a visibly non-authoritative candidate without an approval", () => {
+    const candidateOnly = { ...rule, approval_request_id: null };
+    expect(parseApprovalInbox({ approvals: [], rule_candidates: [candidateOnly] })).toEqual({
+      approvals: [],
+      rule_candidates: [candidateOnly],
     });
   });
 
