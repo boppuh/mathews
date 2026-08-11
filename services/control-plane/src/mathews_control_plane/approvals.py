@@ -52,7 +52,9 @@ from mathews_control_plane.domain_models import (
 )
 from mathews_control_plane.evidence import (
     EvidenceAccessClass,
+    EvidenceError,
     invalidated_evidence_ids,
+    load_evidence,
 )
 from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.task_state_machine import (
@@ -879,6 +881,7 @@ def _candidate_evidence_ids(
     candidate: RuleCandidate,
     *,
     for_update: bool = False,
+    artifact_store: ArtifactStore | None = None,
 ) -> tuple[UUID, ...]:
     try:
         values = tuple(UUID(cast(str, value)) for value in candidate.cited_evidence_ids)
@@ -911,6 +914,12 @@ def _candidate_evidence_ids(
     invalidated_ids = invalidated_evidence_ids(session, values)
     if len(records) != len(values) or bool(invalidated_ids):
         raise ApprovalConflictError("rule candidate evidence is unavailable")
+    if artifact_store is not None:
+        try:
+            for record in records:
+                load_evidence(session, artifact_store, record)
+        except EvidenceError:
+            raise ApprovalConflictError("rule candidate evidence is unavailable") from None
     return values
 
 
@@ -918,6 +927,8 @@ def _validated_rule_candidate(
     session: Session,
     task: Task,
     candidate: RuleCandidate,
+    *,
+    artifact_store: ArtifactStore | None = None,
 ) -> tuple[_EvaluatedReviewRule, tuple[UUID, ...], str]:
     if (
         not isinstance(candidate.proposed_rule, str)
@@ -936,7 +947,12 @@ def _validated_rule_candidate(
         field="rule candidate risks",
     )
     rule = _evaluated_review_rule(candidate)
-    cited_evidence_ids = _candidate_evidence_ids(session, task, candidate)
+    cited_evidence_ids = _candidate_evidence_ids(
+        session,
+        task,
+        candidate,
+        artifact_store=artifact_store,
+    )
     try:
         fingerprint = _fingerprint(
             {
@@ -1333,7 +1349,12 @@ class ApprovalService:
                     continue
                 try:
                     rule, stored_cited_evidence_ids, _candidate_fingerprint = (
-                        _validated_rule_candidate(session, task, candidate)
+                        _validated_rule_candidate(
+                            session,
+                            task,
+                            candidate,
+                            artifact_store=self._artifact_store,
+                        )
                     )
                     cited_evidence_ids = list(stored_cited_evidence_ids)
                     if not set(cited_evidence_ids).issubset(evidence_ids):
@@ -1392,7 +1413,12 @@ class ApprovalService:
                     continue
                 try:
                     rule, candidate_evidence_ids, _candidate_fingerprint = (
-                        _validated_rule_candidate(session, task, candidate)
+                        _validated_rule_candidate(
+                            session,
+                            task,
+                            candidate,
+                            artifact_store=self._artifact_store,
+                        )
                     )
                 except ApprovalConflictError:
                     _LOGGER.warning(
@@ -2070,6 +2096,7 @@ class ApprovalService:
             task,
             candidate,
             for_update=True,
+            artifact_store=self._artifact_store,
         )
         if not set(cited_evidence_ids).issubset(_stored_evidence_ids(request)):
             raise ApprovalConflictError("rule candidate evidence is not bound to the approval")

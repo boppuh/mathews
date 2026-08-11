@@ -6,18 +6,23 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import cast
+from typing import Annotated, Literal, cast
 from uuid import UUID
 
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.authentication import (
+    AuthenticatedSession,
+    require_authenticated_session,
+)
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
     EvidenceDerivative,
@@ -45,7 +50,12 @@ CANDIDATE_LEARNING_SCHEMA_VERSION = 1
 DERIVED_SUMMARY_TYPE = "candidate-learning-summary-v1"
 NON_AUTHORITATIVE = "NON_AUTHORITATIVE"
 MAX_CITATIONS = 100
+MAX_RULE_DEFINITION_BYTES = 64 * 1024
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
+AuthenticatedLearningSession = Annotated[
+    AuthenticatedSession,
+    Depends(require_authenticated_session),
+]
 
 
 class CandidateLearningError(RuntimeError):
@@ -119,6 +129,14 @@ class ReviewRuleDefinition(BaseModel):
 
     @model_validator(mode="after")
     def _executable(self) -> ReviewRuleDefinition:
+        if len(
+            json.dumps(
+                {"matcher": self.matcher, "scope": self.scope},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ) > MAX_RULE_DEFINITION_BYTES:
+            raise ValueError("review rule definition is too large")
         executable_review_rule(
             scope=self.scope,
             matcher=self.matcher,
@@ -181,6 +199,39 @@ class RuleCandidateResult:
     status: RuleCandidateStatus
     authority: str = NON_AUTHORITATIVE
     replayed: bool = False
+
+
+class CreateCitedSummaryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    summary_id: UUID
+    draft: CitedSummaryDraft
+
+
+class CreateRuleCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    candidate_id: UUID
+    draft: RuleCandidateDraft
+
+
+class CitedSummaryResponse(BaseModel):
+    task_id: UUID
+    summary_id: UUID
+    cited_evidence_ids: tuple[UUID, ...]
+    source_hashes: tuple[str, ...]
+    authority: Literal["NON_AUTHORITATIVE"]
+    replayed: bool
+
+
+class RuleCandidateResponse(BaseModel):
+    task_id: UUID
+    candidate_id: UUID
+    summary_id: UUID
+    cited_evidence_ids: tuple[UUID, ...]
+    status: RuleCandidateStatus
+    authority: Literal["NON_AUTHORITATIVE"]
+    replayed: bool
 
 
 class CandidateLearningService:
@@ -372,7 +423,38 @@ class CandidateLearningService:
                     RuleCandidateStatus.EVALUATED,
                 )
         except IntegrityError:
-            raise CandidateLearningError("RULE_CANDIDATE_CONFLICT") from None
+            try:
+                with self._factory() as session:
+                    task = _task(session, task_id)
+                    summary = session.get(
+                        EvidenceDerivative,
+                        normalized_draft.summary_id,
+                    )
+                    citations, _hashes, _content = _validated_summary(
+                        session,
+                        self._store,
+                        task,
+                        summary,
+                    )
+                    existing = session.get(RuleCandidate, candidate_id)
+                    if existing is None:
+                        raise CandidateLearningError("RULE_CANDIDATE_CONFLICT")
+                    _require_same_candidate(
+                        existing,
+                        task,
+                        normalized_draft,
+                        citations,
+                    )
+                    return RuleCandidateResult(
+                        task.id,
+                        existing.id,
+                        normalized_draft.summary_id,
+                        citations,
+                        RuleCandidateStatus(existing.status),
+                        replayed=True,
+                    )
+            except CandidateLearningError:
+                raise CandidateLearningError("RULE_CANDIDATE_CONFLICT") from None
 
 
 def _task(session: Session, task_id: UUID) -> Task:
@@ -581,7 +663,11 @@ def _require_same_candidate(
 def _validate_json(value: object, *, depth: int = 0) -> None:
     if depth > 10:
         raise ValueError("rule JSON is too deep")
-    if value is None or isinstance(value, str | bool | int):
+    if isinstance(value, str):
+        if len(value) > 2_000:
+            raise ValueError("rule JSON string is too large")
+        return
+    if value is None or isinstance(value, bool | int):
         return
     if isinstance(value, float):
         if value != value or value in {float("inf"), float("-inf")}:
@@ -623,3 +709,63 @@ def _fingerprint(value: Mapping[str, object]) -> str:
     except (TypeError, ValueError):
         raise CandidateLearningError("LEARNING_PAYLOAD_INVALID") from None
     return hashlib.sha256(encoded).hexdigest()
+
+
+def create_candidate_learning_router(service: CandidateLearningService) -> APIRouter:
+    """Expose authenticated non-authoritative learning ingestion."""
+
+    router = APIRouter(prefix="/api/tasks", tags=["candidate-learning"])
+
+    @router.post(
+        "/{task_id}/learning-summaries",
+        response_model=CitedSummaryResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_summary(
+        task_id: UUID,
+        body: CreateCitedSummaryRequest,
+        _authentication: AuthenticatedLearningSession,
+        response: Response,
+    ) -> CitedSummaryResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            result = service.create_summary(
+                task_id,
+                summary_id=body.summary_id,
+                draft=body.draft,
+                actor_id="candidate-learning-api",
+            )
+        except CandidateLearningError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="candidate learning conflicts with durable evidence",
+            ) from None
+        return CitedSummaryResponse.model_validate(asdict(result))
+
+    @router.post(
+        "/{task_id}/rule-candidates",
+        response_model=RuleCandidateResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_candidate(
+        task_id: UUID,
+        body: CreateRuleCandidateRequest,
+        _authentication: AuthenticatedLearningSession,
+        response: Response,
+    ) -> RuleCandidateResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            result = service.create_rule_candidate(
+                task_id,
+                candidate_id=body.candidate_id,
+                draft=body.draft,
+                actor_id="candidate-learning-api",
+            )
+        except CandidateLearningError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="candidate learning conflicts with durable evidence",
+            ) from None
+        return RuleCandidateResponse.model_validate(asdict(result))
+
+    return router

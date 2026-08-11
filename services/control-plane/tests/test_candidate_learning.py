@@ -8,9 +8,10 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import FastAPI
 from mathews_control_plane.approvals import ApprovalService
 from mathews_control_plane.artifacts import ArtifactStore
-from mathews_control_plane.authentication import AuthenticatedSession
+from mathews_control_plane.authentication import AuthenticatedSession, require_authenticated_session
 from mathews_control_plane.candidate_learning import (
     NON_AUTHORITATIVE,
     CandidateLearningError,
@@ -19,6 +20,7 @@ from mathews_control_plane.candidate_learning import (
     CitedSummaryDraft,
     ReviewRuleDefinition,
     RuleCandidateDraft,
+    create_candidate_learning_router,
 )
 from mathews_control_plane.database import (
     Base,
@@ -52,6 +54,7 @@ from mathews_control_plane.evidence import (
     load_evidence_derivative,
 )
 from sqlalchemy import Engine, func, select
+from starlette.testclient import TestClient
 
 _NOW = datetime(2026, 8, 11, 15, 0, tzinfo=UTC)
 
@@ -544,6 +547,104 @@ def test_candidate_definition_must_match_the_runtime_rule_contract(
             risk_class=CandidateRisk.HIGH,
             evidence_requirements=("unknown-evidence",),
         )
+
+    with pytest.raises(ValueError, match="too large"):
+        ReviewRuleDefinition(
+            lineage_key="oversized-rule",
+            scope={"path_prefixes": ["Sources"], "max_files": 1},
+            matcher={
+                "categories": ["x" * 2_001],
+                "required_labels": [],
+            },
+            permitted_action="repair.format",
+            risk_class=CandidateRisk.LOW,
+            evidence_requirements=("validation-decision",),
+        )
+
+
+def test_authenticated_api_creates_candidate_learning_outputs(
+    learning_harness: LearningHarness,
+) -> None:
+    authentication = AuthenticatedSession(
+        session_id=uuid4(),
+        user_id=1,
+        csrf_token_digest=b"test",
+        expires_at=_NOW + timedelta(hours=1),
+        absolute_expires_at=_NOW + timedelta(hours=1),
+        reauthenticated_until=_NOW + timedelta(hours=1),
+        evaluated_at=_NOW,
+        recent_password_verified=True,
+    )
+    application = FastAPI()
+    application.include_router(create_candidate_learning_router(_service(learning_harness)))
+    application.dependency_overrides[require_authenticated_session] = lambda: authentication
+    summary_id = uuid4()
+    candidate_id = uuid4()
+    client = TestClient(application)
+
+    summary = client.post(
+        f"/api/tasks/{learning_harness.task_id}/learning-summaries",
+        json={
+            "summary_id": str(summary_id),
+            "draft": _summary(learning_harness).model_dump(mode="json"),
+        },
+    )
+    candidate = client.post(
+        f"/api/tasks/{learning_harness.task_id}/rule-candidates",
+        json={
+            "candidate_id": str(candidate_id),
+            "draft": _candidate(summary_id).model_dump(mode="json"),
+        },
+    )
+
+    assert summary.status_code == 201
+    assert summary.json()["authority"] == NON_AUTHORITATIVE
+    assert candidate.status_code == 201
+    assert candidate.json()["candidate_id"] == str(candidate_id)
+    assert candidate.json()["status"] == RuleCandidateStatus.EVALUATED.value
+
+
+def test_rule_inbox_skips_candidate_with_missing_source_artifact(
+    learning_harness: LearningHarness,
+) -> None:
+    service = _service(learning_harness)
+    summary_id = uuid4()
+    candidate_id = uuid4()
+    service.create_summary(
+        learning_harness.task_id,
+        summary_id=summary_id,
+        draft=_summary(learning_harness),
+        actor_id="candidate-learning",
+    )
+    service.create_rule_candidate(
+        learning_harness.task_id,
+        candidate_id=candidate_id,
+        draft=_candidate(summary_id),
+        actor_id="candidate-learning",
+    )
+    with learning_harness.factory() as session:
+        source = session.get(EvidenceRecord, learning_harness.source_ids[1])
+        assert source is not None and source.content_address is not None
+        address = source.content_address
+    assert learning_harness.store.delete_bytes(address)
+
+    inbox = ApprovalService(
+        learning_harness.factory,
+        learning_harness.store,
+        clock=lambda: _NOW,
+    ).inbox(
+        AuthenticatedSession(
+            session_id=uuid4(),
+            user_id=1,
+            csrf_token_digest=b"test",
+            expires_at=_NOW + timedelta(hours=1),
+            absolute_expires_at=_NOW + timedelta(hours=1),
+            reauthenticated_until=_NOW + timedelta(hours=1),
+            evaluated_at=_NOW,
+            recent_password_verified=True,
+        )
+    )
+    assert inbox.rule_candidates == []
 
 
 def test_candidate_replay_preserves_a_terminal_review_status(

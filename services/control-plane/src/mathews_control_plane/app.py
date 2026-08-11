@@ -27,7 +27,10 @@ from mathews_control_plane.authentication import (
     AuthenticationService,
     create_authentication_router,
 )
-from mathews_control_plane.candidate_learning import CandidateLearningService
+from mathews_control_plane.candidate_learning import (
+    CandidateLearningService,
+    create_candidate_learning_router,
+)
 from mathews_control_plane.database import (
     SessionFactory,
     create_database_engine,
@@ -348,6 +351,9 @@ def create_app(
     application.include_router(create_retrieval_index_router(retrieval_index_service))
     application.include_router(create_evidence_router(evidence_service))
     application.include_router(create_task_router(task_service))
+    application.include_router(
+        create_candidate_learning_router(candidate_learning_service)
+    )
     application.include_router(
         create_approval_router(approval_service, approval_continuation)
     )

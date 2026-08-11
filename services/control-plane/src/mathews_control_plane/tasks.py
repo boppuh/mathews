@@ -1819,7 +1819,14 @@ class TaskBodyLimitMiddleware:
             len(parts) == 5
             and parts[:3] == ["", "api", "tasks"]
             and bool(parts[3])
-            and parts[4] in {"steering", "cancellations", "handoff"}
+            and parts[4]
+            in {
+                "steering",
+                "cancellations",
+                "handoff",
+                "learning-summaries",
+                "rule-candidates",
+            }
         )
 
     @staticmethod

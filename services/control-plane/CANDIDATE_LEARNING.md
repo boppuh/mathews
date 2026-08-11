@@ -18,8 +18,8 @@ canonical redacted payload always declares `NON_AUTHORITATIVE` and binds:
 Every citation must be live, readable, task-owned, unsuperseded, and free of a
 pending deletion request. A correction, deletion request, missing artifact, or
 hash mismatch makes the summary unavailable for subsequent candidate creation.
-The first cited source anchors the derivative so normal evidence deletion also
-removes its stored bytes.
+Exact lineage is stored for every source, so deleting any citation destroys the
+summary bytes and removes any unapproved candidate derived from it.
 
 ## Rule candidates
 
@@ -33,3 +33,13 @@ idempotent by caller-provided UUID and conflicts on changed content.
 approval, prompt-promotion, policy, transition, or host-operation services. A
 separate human-governed promotion flow must revalidate all cited evidence and
 the exact evaluated definition before creating any authority-bearing record.
+
+## Production ingestion
+
+Authenticated control-plane clients submit bounded learning drafts through the
+task-scoped `learning-summaries` and `rule-candidates` API routes. The routes
+invoke the same idempotent service boundary and always attribute writes to the
+fixed `candidate-learning-api` actor. Authentication and CSRF enforcement,
+task-request body limits, deterministic redaction, exact runtime-rule
+validation, and evidence integrity checks all apply before an output can appear
+in the Rule Inbox.

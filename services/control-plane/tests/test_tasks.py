@@ -1301,7 +1301,16 @@ def test_handoff_requires_recent_password_and_exact_acknowledgement(
     assert rejected.status_code == 422
 
 
-@pytest.mark.parametrize("operation", ["steering", "cancellations", "handoff"])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "steering",
+        "cancellations",
+        "handoff",
+        "learning-summaries",
+        "rule-candidates",
+    ],
+)
 def test_task_control_rejects_oversized_body_before_parsing(
     task_harness: TaskHarness,
     operation: str,

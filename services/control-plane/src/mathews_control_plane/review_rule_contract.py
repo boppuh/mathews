@@ -47,14 +47,30 @@ def executable_review_rule(
         or set(matcher) != {"categories", "required_labels"}
     ):
         raise ValueError("review rule is not executable")
-    categories = _unique_strings(matcher.get("categories"), required=True)
-    labels = _unique_strings(matcher.get("required_labels"), required=False)
+    categories = _unique_strings(
+        matcher.get("categories"),
+        required=True,
+        maximum=100,
+    )
+    labels = _unique_strings(
+        matcher.get("required_labels"),
+        required=False,
+        maximum=100,
+    )
     prefixes = tuple(
         _path(value)
-        for value in _unique_strings(scope.get("path_prefixes"), required=True)
+        for value in _unique_strings(
+            scope.get("path_prefixes"),
+            required=True,
+            maximum=500,
+        )
     )
     maximum = scope.get("max_files")
-    requirements = _unique_strings(evidence_requirements, required=True)
+    requirements = _unique_strings(
+        evidence_requirements,
+        required=True,
+        maximum=100,
+    )
     if (
         isinstance(maximum, bool)
         or not isinstance(maximum, int)
@@ -65,11 +81,19 @@ def executable_review_rule(
     return ExecutableReviewRule(categories, labels, prefixes, maximum, requirements)
 
 
-def _unique_strings(value: object, *, required: bool) -> tuple[str, ...]:
+def _unique_strings(
+    value: object,
+    *,
+    required: bool,
+    maximum: int,
+) -> tuple[str, ...]:
     if (
         not isinstance(value, list | tuple)
         or (required and not value)
-        or any(not isinstance(item, str) or not item for item in value)
+        or any(
+            not isinstance(item, str) or not item or len(item) > maximum
+            for item in value
+        )
     ):
         raise ValueError("review rule is not executable")
     values = tuple(cast(str, item) for item in value)
