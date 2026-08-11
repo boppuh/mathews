@@ -33,6 +33,7 @@ from mathews_control_plane.evidence import (
     load_evidence,
     redact_evidence_content,
 )
+from mathews_control_plane.readiness_contract import HANDOFF_MEANING
 
 TASK_TRANSITION_EVENT_TYPE = "TASK_STATE_TRANSITION"
 TASK_TRANSITION_SCHEMA_VERSION = 1
@@ -796,11 +797,7 @@ def _transition_task(
         "kind": plan.kind.value,
         "gate_facts": gate_facts,
         "invalidated_ids": invalidated_ids,
-        "meaning": (
-            "automation responsibility handed off; not merged, deployed, or released"
-            if plan.to_state is TaskState.HANDED_OFF
-            else None
-        ),
+        "meaning": HANDOFF_MEANING if plan.to_state is TaskState.HANDED_OFF else None,
     }
     if validation_candidate is not None:
         payload["validation_candidate"] = {

@@ -32,6 +32,7 @@ from mathews_control_plane.hermes_adapter import (
     UnavailableHermesRuntime,
 )
 from mathews_control_plane.host_gateway import configured_local_host_gateway
+from mathews_control_plane.readiness import ReadinessService
 from mathews_control_plane.reliability import (
     OwnedProcessTerminator,
     OwnedWorkspaceCleaner,
@@ -42,6 +43,12 @@ from mathews_control_plane.reliability import (
 from mathews_control_plane.repair_loop import (
     VALIDATION_REPAIR_JOB_TYPE,
     RepairJobHandler,
+)
+from mathews_control_plane.review_resolution import (
+    REVIEW_RESOLUTION_JOB_TYPE,
+    ConservativeReviewClassifier,
+    ReviewClassifier,
+    ReviewResolutionService,
 )
 from mathews_control_plane.settings import Settings, settings
 from mathews_control_plane.validation_evidence import (
@@ -65,9 +72,19 @@ def build_worker(
     handlers: dict[str, BackgroundJobHandler] | None = None,
     hermes_runtime: HermesRuntime | None = None,
     host_gateway: HostGateway | None = None,
+    review_classifier: ReviewClassifier | None = None,
+    review_resolution_handler: BackgroundJobHandler | None = None,
 ) -> tuple[DurableJobWorker, Engine]:
     """Build one database-backed worker and return its disposable engine."""
 
+    if (
+        handlers is None
+        and review_classifier is not None
+        and review_resolution_handler is None
+    ):
+        raise ValueError(
+            "an automatic review classifier requires a review-resolution handler"
+        )
     engine = create_database_engine(runtime_settings.database_url)
     factory = create_session_factory(engine)
     store = ArtifactStore(runtime_settings.artifact_root)
@@ -88,10 +105,21 @@ def build_worker(
             runtime,
             tool_execution,
         )
+        readiness = ReadinessService(factory, store)
+        review_resolution = ReviewResolutionService(
+            factory,
+            store,
+            review_classifier or ConservativeReviewClassifier(),
+        )
         handler_registry: dict[str, BackgroundJobHandler] = {
             "hermes-run": hermes_handler,
-            "github-webhook": GitHubWebhookJobHandler(),
+            "github-webhook": GitHubWebhookJobHandler(
+                readiness,
+                review_resolution,
+            ),
         }
+        if review_resolution_handler is not None:
+            handler_registry[REVIEW_RESOLUTION_JOB_TYPE] = review_resolution_handler
         if gateway is not None:
             validation_handler = ValidationEvidenceJobHandler(
                 factory,

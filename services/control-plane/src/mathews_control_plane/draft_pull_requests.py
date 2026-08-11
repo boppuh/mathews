@@ -27,7 +27,7 @@ from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
 from mathews_control_plane.artifacts import ArtifactStore
-from mathews_control_plane.background_jobs import JobLeaseGrant
+from mathews_control_plane.background_jobs import BackgroundJobService, JobLeaseGrant
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
     ApprovalRequest,
@@ -187,6 +187,15 @@ class PullRequestBinder(Protocol):
         head_sha: str,
         required_checks: Sequence[str],
     ) -> UUID: ...
+
+
+class PostDraftReadinessReconciler(Protocol):
+    def reconcile(
+        self,
+        task_id: UUID,
+        *,
+        trigger_event_id: UUID,
+    ) -> object: ...
 
 
 class HostGateway(Protocol):
@@ -466,6 +475,8 @@ class VerifiedDraftPullRequestService:
         binder: PullRequestBinder,
         installation_id: int,
         repository_id: int,
+        required_checks: Sequence[str],
+        readiness: PostDraftReadinessReconciler | None = None,
         principal_id: str = "control-plane",
         active_policy_lineage: str = "mvp",
         clock: Callable[[], datetime] | None = None,
@@ -478,6 +489,24 @@ class VerifiedDraftPullRequestService:
         self._binder = binder
         self._installation_id = installation_id
         self._repository_id = repository_id
+        self._required_checks = _required_check_names(required_checks)
+        if readiness is None:
+            from mathews_control_plane.readiness import ReadinessService
+
+            readiness = ReadinessService(
+                factory,
+                artifact_store,
+                principal_id=principal_id,
+                active_policy_lineage=active_policy_lineage,
+                clock=clock,
+            )
+        self._readiness = readiness
+        self._jobs = BackgroundJobService(
+            factory,
+            artifact_store,
+            principal_id=principal_id,
+            clock=clock or (lambda: datetime.now(UTC)),
+        )
         self._principal = principal_id
         self._policy_lineage = active_policy_lineage
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -560,9 +589,44 @@ class VerifiedDraftPullRequestService:
             reason_code="VERIFIED_DRAFT_PR_OPENED",
             evidence_ids=(decision.decision_evidence_id, proof_id),
         )
+        self._reconcile_after_activation(
+            task_id,
+            transition_event_id=transition.event_id,
+            head_sha=commit,
+        )
         return DraftPullRequestResult(
             task_id, observed.number, observed.url, commit, proof_id, transition
         )
+
+    def _reconcile_after_activation(
+        self,
+        task_id: UUID,
+        *,
+        transition_event_id: UUID,
+        head_sha: str,
+    ) -> None:
+        try:
+            self._readiness.reconcile(
+                task_id,
+                trigger_event_id=transition_event_id,
+            )
+        except Exception:
+            # Publication and PR activation are already durable. Convert a failed
+            # synchronous projection into idempotent durable work so callers can
+            # safely retry without reopening or duplicating the pull request.
+            self._jobs.schedule(
+                task_id=task_id,
+                job_type="github-webhook",
+                idempotency_key=f"post-draft-readiness:{transition_event_id}",
+                input_payload={
+                    "schema_version": 1,
+                    "delivery_id": f"post-draft:{transition_event_id}",
+                    "task_event_id": str(transition_event_id),
+                    "head_sha": head_sha,
+                    "resource_type": "post_draft_activation",
+                    "resource_state": "ACTIVE",
+                },
+            )
 
     def _context(self, task_id: UUID) -> _TaskContext:
         with self._factory() as session:
@@ -605,7 +669,7 @@ class VerifiedDraftPullRequestService:
                 configuration,
                 title,
                 body,
-                tuple(operation.operation_id for operation in configuration.operations),
+                self._required_checks,
             )
 
     def _current_pass(
@@ -855,6 +919,19 @@ def _pull_request(value: object, *, repository_key: str) -> DraftPullRequestObse
 def _require_pr_head(value: DraftPullRequestObservation, *, branch: str, head_sha: str) -> None:
     if not value.is_draft or value.branch_name != branch or value.head_sha != head_sha:
         raise DraftPullRequestError("PULL_REQUEST_HEAD_MISMATCH")
+
+
+def _required_check_names(values: Sequence[str]) -> tuple[str, ...]:
+    normalized = tuple(value.strip() for value in values if isinstance(value, str))
+    if (
+        not normalized
+        or len(normalized) != len(values)
+        or len(normalized) > 50
+        or len(normalized) != len(set(normalized))
+        or any(not value or len(value) > 255 for value in normalized)
+    ):
+        raise DraftPullRequestError("GITHUB_REQUIRED_CHECKS_INVALID")
+    return normalized
 
 
 def _require_local(

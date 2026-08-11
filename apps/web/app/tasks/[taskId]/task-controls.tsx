@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  TASK_HANDOFF_ACKNOWLEDGEMENT,
   TASK_STEERING_IMPACTS,
   type TaskState,
   type TaskSteeringImpact,
@@ -33,9 +34,11 @@ function controlError(error: unknown, fallback: string): string {
 
 export function TaskControls({
   task,
+  verifiedHeadSha,
   onRefresh,
 }: {
   task: TaskSummary;
+  verifiedHeadSha: string | null;
   onRefresh: () => Promise<boolean>;
 }) {
   const [message, setMessage] = useState("");
@@ -48,8 +51,15 @@ export function TaskControls({
   const [cancelError, setCancelError] = useState("");
   const [reauthenticationRequired, setReauthenticationRequired] = useState(false);
   const [password, setPassword] = useState("");
+  const [handoffConfirming, setHandoffConfirming] = useState(false);
+  const [handoffPending, setHandoffPending] = useState(false);
+  const [handoffError, setHandoffError] = useState("");
+  const [handoffReauthenticationRequired, setHandoffReauthenticationRequired] = useState(false);
+  const [handoffPassword, setHandoffPassword] = useState("");
+  const [handoffCompletedTaskId, setHandoffCompletedTaskId] = useState<string | null>(null);
   const steeringCommand = useRef<CommandIdentity | null>(null);
   const cancellationCommand = useRef<CommandIdentity | null>(null);
+  const handoffCommand = useRef<string | null>(null);
   const disabled = terminalStates.has(task.state);
 
   const resetSteeringIdentity = () => {
@@ -147,6 +157,57 @@ export function TaskControls({
       setPassword("");
       setCancelError(controlError(error, "Unable to verify your password."));
       setCancelPending(false);
+    }
+  }
+
+  async function completeHandoff(afterReauthentication = false) {
+    if (handoffPending || task.state !== "READY_FOR_HUMAN_MERGE" || !verifiedHeadSha) return;
+    const command = handoffCommand.current ?? crypto.randomUUID();
+    handoffCommand.current = command;
+    setHandoffPending(true);
+    setHandoffError("");
+    try {
+      await taskClient.acknowledgeHandoff(task.id, {
+        handoff_id: command,
+        expected_head_sha: verifiedHeadSha,
+        acknowledgement: TASK_HANDOFF_ACKNOWLEDGEMENT,
+      });
+      setHandoffCompletedTaskId(task.id);
+      handoffCommand.current = null;
+      setHandoffConfirming(false);
+      setHandoffReauthenticationRequired(false);
+      setHandoffPassword("");
+      await onRefresh();
+    } catch (error) {
+      if (!afterReauthentication && error instanceof TaskRequestError && error.status === 403) {
+        setHandoffReauthenticationRequired(true);
+      } else {
+        setHandoffError(controlError(error, "Unable to complete the automation handoff."));
+        if (error instanceof TaskRequestError && [404, 409].includes(error.status)) {
+          handoffCommand.current = null;
+          await onRefresh();
+        }
+      }
+    } finally {
+      setHandoffPending(false);
+    }
+  }
+
+  async function reauthenticateAndHandoff(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!handoffPassword || handoffPending) return;
+    setHandoffPending(true);
+    setHandoffError("");
+    try {
+      await authClient.reauthenticate(handoffPassword);
+      setHandoffPassword("");
+      setHandoffReauthenticationRequired(false);
+      setHandoffPending(false);
+      await completeHandoff(true);
+    } catch (error) {
+      setHandoffPassword("");
+      setHandoffError(controlError(error, "Unable to verify your password."));
+      setHandoffPending(false);
     }
   }
 
@@ -298,6 +359,89 @@ export function TaskControls({
           {cancelError ? (
             <p className="task-error" role="alert">
               {cancelError}
+            </p>
+          ) : null}
+        </div>
+
+        <div className="handoff-control">
+          <div>
+            <h3>Complete automation handoff</h3>
+            <p>
+              Acknowledge the exact verified head only when you are ready to take responsibility for
+              any merge, deployment, delivery, or release decision.
+            </p>
+          </div>
+          {task.state === "HANDED_OFF" || handoffCompletedTaskId === task.id ? (
+            <p className="task-control-notice">Automation handoff is complete.</p>
+          ) : task.state !== "READY_FOR_HUMAN_MERGE" || !verifiedHeadSha ? (
+            <p className="task-control-muted">
+              Available after every exact-head readiness gate passes.
+            </p>
+          ) : !handoffConfirming ? (
+            <button type="button" onClick={() => setHandoffConfirming(true)}>
+              Acknowledge handoff…
+            </button>
+          ) : handoffReauthenticationRequired ? (
+            <form className="task-handoff-reauthentication" onSubmit={reauthenticateAndHandoff}>
+              <label htmlFor="task-handoff-password">Re-enter your password to confirm</label>
+              <input
+                id="task-handoff-password"
+                type="password"
+                autoComplete="current-password"
+                value={handoffPassword}
+                disabled={handoffPending}
+                onChange={(event) => setHandoffPassword(event.currentTarget.value)}
+                required
+              />
+              <button type="submit" disabled={handoffPending || !handoffPassword}>
+                {handoffPending ? "Recording…" : "Verify and acknowledge"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={handoffPending}
+                onClick={() => {
+                  handoffCommand.current = null;
+                  setHandoffConfirming(false);
+                  setHandoffReauthenticationRequired(false);
+                  setHandoffPassword("");
+                  setHandoffError("");
+                }}
+              >
+                Keep automation active
+              </button>
+            </form>
+          ) : (
+            <div className="task-handoff-confirmation" role="alert">
+              <strong>End automation responsibility for this task?</strong>
+              <p>
+                This records handoff only. It does not merge, deploy, deliver, or release the
+                change.
+              </p>
+              <button
+                type="button"
+                disabled={handoffPending}
+                onClick={() => void completeHandoff()}
+              >
+                {handoffPending ? "Recording…" : "Yes, acknowledge handoff"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={handoffPending}
+                onClick={() => {
+                  handoffCommand.current = null;
+                  setHandoffConfirming(false);
+                  setHandoffError("");
+                }}
+              >
+                Keep automation active
+              </button>
+            </div>
+          )}
+          {handoffError ? (
+            <p className="task-error" role="alert">
+              {handoffError}
             </p>
           ) : null}
         </div>

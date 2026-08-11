@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -18,6 +19,7 @@ from mathews_configuration import (
 from mathews_control_plane.app import create_app
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import AuthenticatedSession
+from mathews_control_plane.background_jobs import LeasedJobContext
 from mathews_control_plane.database import (
     SessionFactory,
     create_database_engine,
@@ -38,8 +40,10 @@ from mathews_control_plane.github_app import GitHubWebhookVerifier
 from mathews_control_plane.github_webhooks import (
     GITHUB_CHECK_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
+    GitHubWebhookJobHandler,
     GitHubWebhookService,
 )
+from mathews_control_plane.readiness_contract import ReadinessError
 from mathews_control_plane.settings import Settings
 from mathews_control_plane.tasks import TaskService
 from pydantic import SecretStr
@@ -158,6 +162,8 @@ def _check_payload(
     status: str = "completed",
     conclusion: str | None = "success",
     check_id: int = 901,
+    pull_request_number: int = 42,
+    branch_name: str = "codex/task-6-3",
 ) -> dict[str, object]:
     return {
         "action": "completed" if status == "completed" else "rerequested",
@@ -170,10 +176,67 @@ def _check_payload(
             "conclusion": conclusion,
             "head_sha": head_sha,
             "updated_at": updated_at,
-            "check_suite": {"id": 801, "head_branch": "codex/task-6-3"},
-            "pull_requests": [{"number": 42}],
+            "check_suite": {"id": 801, "head_branch": branch_name},
+            "pull_requests": [{"number": pull_request_number}],
         },
     }
+
+
+def test_binding_replays_an_exact_webhook_that_arrived_before_correlation(
+    webhook_harness: WebhookHarness,
+) -> None:
+    task_id = uuid4()
+    branch = "codex/pre-binding"
+    with webhook_harness.factory.begin() as session:
+        session.add(
+            Task(
+                id=task_id,
+                repository="boppuh/mathews",
+                base_revision="0" * 40,
+                requester="local-user",
+                raw_request="evidence://pre-binding",
+                summary="Bind after webhook",
+                state=TaskState.PR_ACTIVE,
+                retry_count=0,
+                owner_id="local-user",
+                actor_id="local-user",
+                root_correlation_id=task_id,
+                causation_id=task_id,
+            )
+        )
+
+    response = _post(
+        webhook_harness,
+        _check_payload(pull_request_number=43, branch_name=branch),
+        delivery="before-binding",
+    )
+    assert response.json()["disposition"] == "QUARANTINED"
+
+    webhook_harness.service.bind_pull_request(
+        task_id,
+        installation_id=202,
+        repository_id=303,
+        pull_request_number=43,
+        task_branch=branch,
+        head_sha=_HEAD_SHA,
+        required_checks=("test",),
+    )
+
+    with webhook_harness.factory() as session:
+        delivery = session.scalar(
+            select(WebhookDelivery).where(
+                WebhookDelivery.provider_delivery_id == "before-binding"
+            )
+        )
+        assert delivery is not None
+        assert delivery.quarantine_reason is None
+        assert delivery.processing_result is not None
+        assert delivery.processing_result["disposition"] == "ACCEPTED"
+        assert session.scalar(
+            select(func.count(BackgroundJob.id)).where(
+                BackgroundJob.task_id == task_id,
+            )
+        ) == 1
 
 
 def _review_payload(
@@ -314,6 +377,91 @@ def test_verified_delivery_is_persisted_correlated_and_wakes_task(
     assert cockpit.github.ci_status == "PASSED"
     assert cockpit.github.checks_total == 1
     assert cockpit.github.checks_passed == 1
+
+
+def test_durable_webhook_wakeup_reconciles_exact_task_readiness() -> None:
+    task_id = uuid4()
+    event_id = uuid4()
+    calls: list[tuple[str, UUID]] = []
+
+    class Reconciler:
+        def __init__(self) -> None:
+            self.calls: list[tuple[UUID, UUID]] = []
+
+        def reconcile(self, task_id: UUID, *, trigger_event_id: UUID) -> object:
+            self.calls.append((task_id, trigger_event_id))
+            calls.append(("readiness", trigger_event_id))
+            return SimpleNamespace(status=SimpleNamespace(value="READY"))
+
+    class ReviewScheduler:
+        def schedule(self, task_event_id: UUID) -> object:
+            calls.append(("review", task_event_id))
+            return SimpleNamespace(status=SimpleNamespace(value="IGNORED"))
+
+    reconciler = Reconciler()
+    context = SimpleNamespace(
+        grant=SimpleNamespace(
+            task_id=task_id,
+            input_payload={
+                "delivery_id": "delivery-1",
+                "task_event_id": str(event_id),
+                "head_sha": _HEAD_SHA,
+                "resource_type": "review_comment",
+                "resource_state": "OPEN",
+            },
+        )
+    )
+
+    result = GitHubWebhookJobHandler(reconciler, ReviewScheduler())(
+        cast(LeasedJobContext, context)
+    )
+
+    assert reconciler.calls == [(task_id, event_id)]
+    assert calls == [("review", event_id), ("readiness", event_id)]
+    assert result["review_resolution_status"] == "IGNORED"
+    assert result["readiness_status"] == "READY"
+
+
+def test_durable_webhook_wakeup_reports_unconfigured_readiness() -> None:
+    context = SimpleNamespace(
+        grant=SimpleNamespace(
+            task_id=uuid4(),
+            input_payload={
+                "delivery_id": "delivery-2",
+                "task_event_id": str(uuid4()),
+                "head_sha": _HEAD_SHA,
+            },
+        )
+    )
+
+    result = GitHubWebhookJobHandler()(cast(LeasedJobContext, context))
+
+    assert result["readiness_status"] == "NOT_CONFIGURED"
+    assert result["workflow_woken"] is True
+
+
+def test_durable_webhook_wakeup_reports_bounded_readiness_refusal() -> None:
+    class RefusingReadiness:
+        def reconcile(self, _task_id: UUID, *, trigger_event_id: UUID) -> object:
+            assert isinstance(trigger_event_id, UUID)
+            raise ReadinessError("READINESS_POLICY_UNAVAILABLE")
+
+    context = SimpleNamespace(
+        grant=SimpleNamespace(
+            task_id=uuid4(),
+            input_payload={
+                "delivery_id": "delivery-3",
+                "task_event_id": str(uuid4()),
+                "head_sha": _HEAD_SHA,
+            },
+        )
+    )
+
+    result = GitHubWebhookJobHandler(RefusingReadiness())(
+        cast(LeasedJobContext, context)
+    )
+
+    assert result["readiness_status"] == "REFUSED:READINESS_POLICY_UNAVAILABLE"
 
 
 def test_duplicate_delivery_replays_without_duplicate_event_or_job(

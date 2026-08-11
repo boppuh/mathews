@@ -4,6 +4,8 @@ import type {
   TaskCancellationResponse,
   TaskCockpitResponse,
   TaskEvidenceSummary,
+  TaskHandoffRequest,
+  TaskHandoffResponse,
   TaskListResponse,
   TaskSteeringRequest,
   TaskSteeringResponse,
@@ -14,6 +16,7 @@ import { cookieValue, normalizeControlPlaneUrl } from "./auth";
 import {
   parseTaskCancellationResponse,
   parseTaskCockpit,
+  parseTaskHandoffResponse,
   parseTaskList,
   parseTaskSteeringResponse,
   parseTaskSummary,
@@ -145,6 +148,19 @@ export const taskClient = {
       },
     );
     return parseTaskCancellationResponse(await response.json());
+  },
+
+  async acknowledgeHandoff(taskId: string, body: TaskHandoffRequest): Promise<TaskHandoffResponse> {
+    const response = await request(
+      `/api/tasks/${encodeURIComponent(taskId)}/handoff`,
+      { method: "POST", headers: csrfHeaders(), body: JSON.stringify(body) },
+      "Unable to complete the automation handoff.",
+      {
+        403: "Re-enter your password to complete this handoff.",
+        409: "Readiness changed before handoff was recorded. Refresh and try again.",
+      },
+    );
+    return parseTaskHandoffResponse(await response.json());
   },
 };
 

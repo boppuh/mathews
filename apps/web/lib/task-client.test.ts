@@ -198,6 +198,40 @@ describe("taskClient", () => {
     });
   });
 
+  it("records an exact-head handoff with CSRF and validates the result", async () => {
+    const body = {
+      handoff_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expected_head_sha: "a".repeat(40),
+      acknowledgement:
+        "I acknowledge that automation is complete and that merge, deployment, delivery, and release remain human responsibilities." as const,
+    };
+    const result = {
+      handoff_id: body.handoff_id,
+      task_id: task.id,
+      task_state: "HANDED_OFF",
+      head_sha: body.expected_head_sha,
+      acknowledgement_evidence_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      event_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      meaning:
+        "Automation responsibility has ended; this does not mean merged, deployed, delivered, or released.",
+      replayed: false,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(result), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "__Host-mathews-csrf=csrf-token" });
+
+    await expect(taskClient.acknowledgeHandoff(task.id, body)).resolves.toEqual(result);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`http://localhost:8000/api/tasks/${task.id}/handoff`);
+    expect(init).toMatchObject({ method: "POST", credentials: "include" });
+    expect(JSON.parse(String(init.body))).toEqual(body);
+  });
+
   it.each([
     [401, "Your session expired"],
     [404, "task is unavailable"],

@@ -25,8 +25,10 @@ from mathews_control_plane.background_jobs import (
 )
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
+    ApprovalRequest,
     ApprovalRequestType,
     ApprovalStatus,
+    EvidenceRecord,
     ReviewRule,
     TaskState,
     ValidationOutcome,
@@ -44,6 +46,7 @@ from mathews_control_plane.review_resolution import (
     ReviewResolutionJobInput,
     ReviewResolutionService,
     ReviewRisk,
+    ReviewScheduleResult,
     ReviewScheduleStatus,
     _Authorization,
     _review_fingerprint,
@@ -322,6 +325,67 @@ def test_unsafe_review_requests_bounded_one_off_approval_without_rule(
         "review.repair"
     )
     assert cast(_FakeJobs, service._jobs).calls == []
+
+
+def test_approved_one_off_resumes_the_exact_review_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task_id = uuid4()
+    request_id = uuid4()
+    assessment_id = uuid4()
+    task_event_id = uuid4()
+    request = SimpleNamespace(
+        id=request_id,
+        task_id=task_id,
+        status=ApprovalStatus.APPROVED,
+        request_type=ApprovalRequestType.REVIEW_CONFLICT.value,
+        blocked_operation={
+            "operation_name": "review.repair",
+            "checkpoint_evidence_id": str(assessment_id),
+        },
+    )
+    assessment = SimpleNamespace(id=assessment_id, task_id=task_id)
+
+    class _Session:
+        def __enter__(self) -> _Session:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, model: object, identity: UUID) -> object | None:
+            if model is ApprovalRequest and identity == request_id:
+                return request
+            if model is EvidenceRecord and identity == assessment_id:
+                return assessment
+            return None
+
+    service = _service(tmp_path, _classification(), _FakeApprovals())
+    service._factory = cast(SessionFactory, _Session)
+    scheduled = ReviewScheduleResult(
+        task_id,
+        task_event_id,
+        ReviewScheduleStatus.SCHEDULED,
+        assessment_id,
+        job_id=uuid4(),
+    )
+    calls: list[UUID] = []
+
+    def schedule(event_id: UUID) -> ReviewScheduleResult:
+        calls.append(event_id)
+        return scheduled
+
+    monkeypatch.setattr(
+        review_module,
+        "load_evidence",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            content={"task_event_id": str(task_event_id)}
+        ),
+    )
+    monkeypatch.setattr(service, "schedule", schedule)
+
+    assert service.resume_approved(request_id) is scheduled
+    assert calls == [task_event_id]
 
 
 class _FakeTransitions:

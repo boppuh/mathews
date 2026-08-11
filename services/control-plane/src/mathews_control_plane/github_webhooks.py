@@ -9,7 +9,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -49,6 +49,8 @@ from mathews_control_plane.github_app import (
     GitHubWebhookVerificationError,
     GitHubWebhookVerifier,
 )
+from mathews_control_plane.readiness_contract import ReadinessError
+from mathews_control_plane.task_state_machine import TaskTransitionError
 
 GITHUB_PR_BOUND_EVENT = "GITHUB_PR_BOUND"
 GITHUB_CHECK_UPDATED_EVENT = "GITHUB_CHECK_UPDATED"
@@ -100,8 +102,29 @@ class GitHubWebhookIngestionResponse(BaseModel):
     job_id: UUID | None = None
 
 
+class GitHubWorkflowReconciler(Protocol):
+    def reconcile(
+        self,
+        task_id: UUID,
+        *,
+        trigger_event_id: UUID,
+    ) -> object: ...
+
+
+class GitHubReviewScheduler(Protocol):
+    def schedule(self, task_event_id: UUID) -> object: ...
+
+
 class GitHubWebhookJobHandler:
     """Consume one durable GitHub wake-up after its task event is committed."""
+
+    def __init__(
+        self,
+        readiness: GitHubWorkflowReconciler | None = None,
+        review_scheduler: GitHubReviewScheduler | None = None,
+    ) -> None:
+        self._readiness = readiness
+        self._review_scheduler = review_scheduler
 
     def __call__(self, context: LeasedJobContext) -> Mapping[str, object]:
         payload = context.grant.input_payload
@@ -114,11 +137,65 @@ class GitHubWebhookJobHandler:
             head_sha,
         )):
             raise ValueError("github webhook wake-up payload is invalid")
+        try:
+            event_id = UUID(cast(str, task_event_id))
+        except ValueError:
+            raise ValueError("github webhook wake-up payload is invalid") from None
+        review_status = "NOT_APPLICABLE"
+        if (
+            payload.get("resource_type") == "review_comment"
+            and payload.get("resource_state") == "OPEN"
+        ):
+            if self._review_scheduler is None:
+                raise ValueError("github review scheduler is unavailable")
+            try:
+                scheduled = self._review_scheduler.schedule(event_id)
+            except RuntimeError as error:
+                if (
+                    getattr(error, "code", None) != "REVIEW_TASK_NOT_ACTIVE"
+                    or self._readiness is None
+                ):
+                    raise
+                invalidation = self._readiness.reconcile(
+                    context.grant.task_id,
+                    trigger_event_id=event_id,
+                )
+                invalidation_status = getattr(invalidation, "status", None)
+                if getattr(invalidation_status, "value", invalidation_status) != (
+                    "INVALIDATED"
+                ):
+                    raise
+                scheduled = self._review_scheduler.schedule(event_id)
+            scheduled_status = getattr(scheduled, "status", None)
+            review_status = str(
+                getattr(scheduled_status, "value", scheduled_status)
+            )
+        readiness_status = "NOT_CONFIGURED"
+        if self._readiness is not None:
+            try:
+                result = self._readiness.reconcile(
+                    context.grant.task_id,
+                    trigger_event_id=event_id,
+                )
+            except ReadinessError as error:
+                readiness_status = f"REFUSED:{error.code}"
+            except TaskTransitionError:
+                readiness_status = "REFUSED:TASK_TRANSITION"
+            else:
+                result_status = getattr(result, "status", None)
+                readiness_status = (
+                    str(result_status.value)
+                    if result_status is not None
+                    and isinstance(getattr(result_status, "value", None), str)
+                    else "UNKNOWN"
+                )
         return {
             "delivery_id": cast(str, delivery_id),
             "task_event_id": cast(str, task_event_id),
             "head_sha": cast(str, head_sha),
             "workflow_woken": True,
+            "review_resolution_status": review_status,
+            "readiness_status": readiness_status,
         }
 
 
@@ -249,6 +326,7 @@ class GitHubWebhookService:
             "head_sha": sha,
             "required_checks": list(checks),
         }
+        replay_ids: tuple[UUID, ...]
         with self._factory.begin() as session:
             task = session.scalar(
                 select(Task).where(Task.id == task_id).with_for_update()
@@ -260,18 +338,49 @@ class GitHubWebhookService:
                 or TaskState(task.state) in _TERMINAL_STATES
             ):
                 raise GitHubWebhookPayloadError("task cannot be bound")
+            carryover = _review_state_carryover(session, task.id)
+            if carryover is not None:
+                payload["review_state_carryover"] = carryover
             current = _latest_binding(session, task.id)
             if current is not None and current.payload == payload:
-                return current.id
-            event = _append_task_event(
-                session,
-                task,
-                event_type=GITHUB_PR_BOUND_EVENT,
-                payload=payload,
-                occurred_at=_utc(self._clock()),
-                causation_id=task.id,
+                binding_id = current.id
+            else:
+                binding_id = _append_task_event(
+                    session,
+                    task,
+                    event_type=GITHUB_PR_BOUND_EVENT,
+                    payload=payload,
+                    occurred_at=_utc(self._clock()),
+                    causation_id=task.id,
+                ).id
+            deferred = tuple(
+                session.scalars(
+                    select(WebhookDelivery)
+                    .where(
+                        WebhookDelivery.provider == "github",
+                        WebhookDelivery.installation_id == str(installation_id),
+                        WebhookDelivery.repository_id == str(repository_id),
+                        WebhookDelivery.pull_request_number == pull_request_number,
+                        WebhookDelivery.head_sha == sha,
+                        WebhookDelivery.quarantine_reason == "correlation_unknown",
+                    )
+                    .order_by(WebhookDelivery.received_at, WebhookDelivery.id)
+                    .with_for_update()
+                )
             )
-            return event.id
+            for delivery in deferred:
+                prior = cast(dict[str, object], delivery.processing_result or {})
+                delivery.processing_result = {
+                    **prior,
+                    "stage": "RECEIVED",
+                    "replayed_after_binding": True,
+                }
+                delivery.quarantine_reason = None
+                delivery.processed_at = None
+            replay_ids = tuple(delivery.id for delivery in deferred)
+        for delivery_id in replay_ids:
+            self._process(delivery_id)
+        return binding_id
 
     def ingest(
         self,
@@ -545,6 +654,8 @@ class GitHubWebhookService:
                 "delivery_id": delivery.provider_delivery_id,
                 "task_event_id": str(event.id),
                 "head_sha": update.head_sha,
+                "resource_type": update.resource_type,
+                "resource_state": update.state,
             }
             job = BackgroundJob(
                 task_id=task.id,
@@ -949,6 +1060,47 @@ def _latest_binding(session: Session, task_id: UUID) -> TaskEvent | None:
         .order_by(TaskEvent.sequence.desc(), TaskEvent.id.desc())
         .limit(1)
     )
+
+
+def _review_state_carryover(
+    session: Session,
+    task_id: UUID,
+) -> dict[str, object] | None:
+    reviews: dict[str, str] = {}
+    threads: dict[str, str] = {}
+    events = session.scalars(
+        select(TaskEvent)
+        .where(
+            TaskEvent.task_id == task_id,
+            TaskEvent.event_type == GITHUB_REVIEW_UPDATED_EVENT,
+        )
+        .order_by(TaskEvent.sequence, TaskEvent.id)
+    )
+    for event in events:
+        resource_type = event.payload.get("resource_type")
+        resource_id = event.payload.get("resource_id")
+        state = event.payload.get("state")
+        if not isinstance(resource_id, str) or not isinstance(state, str):
+            continue
+        if resource_type == "review":
+            if state != "COMMENTED" or resource_id not in reviews:
+                reviews[resource_id] = state
+        elif resource_type == "review_thread":
+            threads[resource_id] = state
+    blocking_reviews = sorted(
+        resource_id
+        for resource_id, state in reviews.items()
+        if state == "CHANGES_REQUESTED"
+    )
+    open_threads = sorted(
+        resource_id for resource_id, state in threads.items() if state == "OPEN"
+    )
+    if not blocking_reviews and not open_threads:
+        return None
+    return {
+        "changes_requested_review_ids": blocking_reviews,
+        "open_review_thread_ids": open_threads,
+    }
 
 
 def _effective_task_head(session: Session, task_id: UUID) -> str | None:

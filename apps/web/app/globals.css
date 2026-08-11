@@ -1604,12 +1604,13 @@ section {
 
 .task-control-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(18rem, 0.55fr);
+  grid-template-columns: minmax(0, 1.2fr) repeat(2, minmax(16rem, 0.6fr));
   gap: 1rem;
 }
 
 .steering-form,
-.cancellation-control {
+.cancellation-control,
+.handoff-control {
   display: grid;
   align-content: start;
   gap: 1rem;
@@ -1620,13 +1621,15 @@ section {
 }
 
 .steering-form h3,
-.cancellation-control h3 {
+.cancellation-control h3,
+.handoff-control h3 {
   margin: 0 0 0.45rem;
   font-size: 1rem;
 }
 
 .steering-form p,
-.cancellation-control p {
+.cancellation-control p,
+.handoff-control p {
   margin: 0;
   color: var(--muted);
   font-size: 0.8rem;
@@ -1635,6 +1638,7 @@ section {
 
 .steering-form > label,
 .task-cancel-reauthentication label,
+.task-handoff-reauthentication label,
 .steering-form legend {
   color: #c7d3df;
   font-size: 0.72rem;
@@ -1642,7 +1646,8 @@ section {
 }
 
 .steering-form textarea,
-.task-cancel-reauthentication input {
+.task-cancel-reauthentication input,
+.task-handoff-reauthentication input {
   width: 100%;
   border: 1px solid var(--border);
   border-radius: 0.65rem;
@@ -1657,12 +1662,14 @@ section {
   resize: vertical;
 }
 
-.task-cancel-reauthentication input {
+.task-cancel-reauthentication input,
+.task-handoff-reauthentication input {
   padding: 0.75rem;
 }
 
 .steering-form textarea:focus,
-.task-cancel-reauthentication input:focus {
+.task-cancel-reauthentication input:focus,
+.task-handoff-reauthentication input:focus {
   border-color: var(--accent);
   outline: 2px solid rgb(112 225 200 / 18%);
 }
@@ -1699,11 +1706,20 @@ section {
 }
 
 .steering-form button,
-.cancellation-control button {
+.cancellation-control button,
+.handoff-control button {
   justify-self: start;
 }
 
 .steering-form .task-control-notice {
+  color: var(--accent);
+}
+
+.handoff-control {
+  border-color: rgb(255 201 120 / 32%);
+}
+
+.handoff-control .task-control-notice {
   color: var(--accent);
 }
 
@@ -1718,11 +1734,18 @@ section {
 }
 
 .task-cancel-confirmation,
-.task-cancel-reauthentication {
+.task-cancel-reauthentication,
+.task-handoff-confirmation,
+.task-handoff-reauthentication {
   display: grid;
   gap: 0.8rem;
   padding-top: 1rem;
   border-top: 1px solid rgb(255 157 157 / 25%);
+}
+
+.task-handoff-confirmation,
+.task-handoff-reauthentication {
+  border-top-color: rgb(255 201 120 / 28%);
 }
 
 .task-cancel-confirmation strong {

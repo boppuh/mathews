@@ -362,6 +362,28 @@ export interface TaskCancellationResponse {
   replayed: boolean;
 }
 
+export const TASK_HANDOFF_ACKNOWLEDGEMENT =
+  "I acknowledge that automation is complete and that merge, deployment, delivery, and release remain human responsibilities." as const;
+export const TASK_HANDOFF_MEANING =
+  "Automation responsibility has ended; this does not mean merged, deployed, delivered, or released." as const;
+
+export interface TaskHandoffRequest {
+  handoff_id: string;
+  expected_head_sha: string;
+  acknowledgement: typeof TASK_HANDOFF_ACKNOWLEDGEMENT;
+}
+
+export interface TaskHandoffResponse {
+  handoff_id: string;
+  task_id: string;
+  task_state: "HANDED_OFF";
+  head_sha: string;
+  acknowledgement_evidence_id: string;
+  event_id: string;
+  meaning: typeof TASK_HANDOFF_MEANING;
+  replayed: boolean;
+}
+
 export interface ServiceHealth {
   service: "api" | "host-agent" | "web" | "worker";
   status: "ok";

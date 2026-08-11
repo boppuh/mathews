@@ -392,6 +392,10 @@ class ApprovalPreconditionEvaluator(Protocol):
     ) -> bool: ...
 
 
+class ApprovalContinuation(Protocol):
+    def resume_approved(self, request_id: UUID) -> object: ...
+
+
 class DurableOnlyApprovalPreconditionEvaluator:
     """Use the service's exact durable recheck with no additional adapter."""
 
@@ -2246,7 +2250,10 @@ class ApprovalBodyLimitMiddleware:
         await response(scope, receive, send)
 
 
-def create_approval_router(service: ApprovalService) -> APIRouter:
+def create_approval_router(
+    service: ApprovalService,
+    continuation: ApprovalContinuation | None = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api/approvals", tags=["approvals"])
 
     @router.get("/inbox", response_model=ApprovalInboxResponse)
@@ -2290,6 +2297,8 @@ def create_approval_router(service: ApprovalService) -> APIRouter:
             )
             if result.decision is ApprovalDecision.EXPIRE:
                 raise ApprovalConflictError("approval request expired")
+            if result.decision is ApprovalDecision.APPROVE and continuation is not None:
+                continuation.resume_approved(request_id)
         except ApprovalNotFoundError as error:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
