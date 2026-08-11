@@ -12,8 +12,8 @@ from enum import StrEnum
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import exists, select
+from sqlalchemy.orm import Session, aliased
 
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.database import SessionFactory
@@ -43,7 +43,12 @@ from mathews_control_plane.github_webhooks import (
     GITHUB_PULL_REQUEST_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
 )
-from mathews_control_plane.review_resolution import REVIEW_RESOLUTION_JOB_TYPE
+from mathews_control_plane.review_resolution import (
+    REVIEW_RESOLUTION_JOB_TYPE,
+    REVIEW_RESOLUTION_SCHEMA_VERSION,
+    ReviewClassification,
+    ReviewDisposition,
+)
 from mathews_control_plane.task_state_machine import (
     DraftPrGateFacts,
     ReadinessGateFacts,
@@ -647,14 +652,22 @@ def _github_facts(events: Sequence[TaskEvent]) -> _GitHubFacts:
             or event.payload.get("task_branch") != branch
         ):
             continue
-        latest[
-            (event.payload.get("resource_type"), event.payload.get("resource_id"))
-        ] = event
+        key = (event.payload.get("resource_type"), event.payload.get("resource_id"))
+        previous = latest.get(key)
+        if (
+            key[0] == "review"
+            and event.payload.get("state") == "COMMENTED"
+            and previous is not None
+        ):
+            continue
+        latest[key] = event
     check_events: dict[str, TaskEvent] = {}
     for (resource_type, _resource_id), event in latest.items():
         label = event.payload.get("resource_label")
         if resource_type == "check_run" and isinstance(label, str):
-            check_events[label] = event
+            previous = check_events.get(label)
+            if previous is None or _event_recency(event) > _event_recency(previous):
+                check_events[label] = event
     check_states = tuple(
         (name, str(check_events[name].payload.get("state")))
         for name in required_checks
@@ -728,11 +741,16 @@ def _repairs_authorized(
         return False
     if not open_review_event_ids:
         return True
+    correction = aliased(EvidenceRecord)
     records = tuple(
         session.scalars(
             select(EvidenceRecord).where(
                 EvidenceRecord.task_id == task.id,
                 EvidenceRecord.evidence_type == "review-resolution-assessment",
+                EvidenceRecord.origin == "control-plane:review-resolution",
+                EvidenceRecord.correction_of_id.is_(None),
+                EvidenceRecord.deleted_at.is_(None),
+                ~exists().where(correction.correction_of_id == EvidenceRecord.id),
             )
         )
     )
@@ -742,21 +760,49 @@ def _repairs_authorized(
             payload = load_evidence(session, store, record).content
         except EvidenceError:
             continue
-        if not isinstance(payload, dict) or payload.get("original_head_sha") != current_head:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != REVIEW_RESOLUTION_SCHEMA_VERSION
+            or payload.get("task_id") != str(task.id)
+            or payload.get("original_head_sha") != current_head
+        ):
             continue
         raw_event_id = payload.get("task_event_id")
         classification = payload.get("classification")
-        if (
-            not isinstance(raw_event_id, str)
-            or not isinstance(classification, dict)
-            or classification.get("disposition") != "INFORMATIONAL"
-        ):
+        fingerprint = payload.get("assessment_fingerprint")
+        if not isinstance(raw_event_id, str) or not isinstance(fingerprint, str):
             continue
         try:
-            informational.add(UUID(raw_event_id))
-        except ValueError:
+            event_id = UUID(raw_event_id)
+            parsed = ReviewClassification.model_validate(classification)
+        except (TypeError, ValueError):
             continue
+        unsigned = dict(payload)
+        unsigned.pop("assessment_fingerprint", None)
+        expected_id = uuid5(
+            NAMESPACE_URL,
+            f"mathews:review-assessment:{event_id}:{fingerprint}",
+        )
+        if (
+            record.id != expected_id
+            or fingerprint != _fingerprint(unsigned)
+            or parsed.disposition is not ReviewDisposition.INFORMATIONAL
+        ):
+            continue
+        informational.add(event_id)
     return set(open_review_event_ids).issubset(informational)
+
+
+def _event_recency(event: TaskEvent) -> tuple[datetime, int, str]:
+    raw = event.payload.get("source_updated_at")
+    if isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                return parsed.astimezone(UTC), event.sequence, str(event.id)
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=UTC), event.sequence, str(event.id)
 
 
 def _assessment_payload(

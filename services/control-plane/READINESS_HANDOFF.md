@@ -15,15 +15,19 @@ different meanings:
 ## Authoritative readiness facts
 
 Each durable GitHub webhook wake-up reevaluates readiness from canonical task
-state while the eventual transition is protected by the task lock. A head is
+state while the eventual transition is protected by the task lock. Review
+comments are classified or escalated before that reconciliation. Opening the
+verified draft also triggers reconciliation after the task enters `PR_ACTIVE`,
+so webhook signals received during publication are not stranded. A head is
 ready only when all of these facts agree:
 
 1. the latest `OPEN_VERIFIED_DRAFT_PR` transition has readable immutable proof
    for a complete passing validation contract;
 2. the current GitHub binding, verified draft proof, validation result, local
    branch, remote branch, and pull-request head identify the same commit;
-3. every required check named by the binding is present and has a passing or
-   neutral terminal result on that head;
+3. every required check named by the binding is present and the most recently
+   updated run for each name has a passing or neutral terminal result on that
+   head;
 4. no current reviewer has requested changes and no review thread is open;
 5. no review-resolution job is queued or running, and every still-open review
    comment is classified as informational on that exact head;
@@ -34,6 +38,12 @@ The service stores the fact set and blocker codes as immutable
 `pull-request-readiness-assessment` evidence. The transition evaluator derives
 the facts again inside the locked transaction and requires an exact match with
 that evidence before entering `READY_FOR_HUMAN_MERGE`.
+
+Only live, unsuperseded assessments created by the control plane can settle an
+open informational review comment. User corrections remain visible evidence,
+but cannot grant or revoke readiness authority. When no bounded production
+classifier is configured, review text fails closed to a human approval instead
+of being treated as informational or safe to repair.
 
 ## Invalidation
 

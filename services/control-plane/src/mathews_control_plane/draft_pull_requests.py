@@ -189,6 +189,15 @@ class PullRequestBinder(Protocol):
     ) -> UUID: ...
 
 
+class PostDraftReadinessReconciler(Protocol):
+    def reconcile(
+        self,
+        task_id: UUID,
+        *,
+        trigger_event_id: UUID,
+    ) -> object: ...
+
+
 class HostGateway(Protocol):
     def execute(self, request: HostRequestMessage) -> HostResponseMessage: ...
 
@@ -466,6 +475,7 @@ class VerifiedDraftPullRequestService:
         binder: PullRequestBinder,
         installation_id: int,
         repository_id: int,
+        readiness: PostDraftReadinessReconciler | None = None,
         principal_id: str = "control-plane",
         active_policy_lineage: str = "mvp",
         clock: Callable[[], datetime] | None = None,
@@ -478,6 +488,17 @@ class VerifiedDraftPullRequestService:
         self._binder = binder
         self._installation_id = installation_id
         self._repository_id = repository_id
+        if readiness is None:
+            from mathews_control_plane.readiness import ReadinessService
+
+            readiness = ReadinessService(
+                factory,
+                artifact_store,
+                principal_id=principal_id,
+                active_policy_lineage=active_policy_lineage,
+                clock=clock,
+            )
+        self._readiness = readiness
         self._principal = principal_id
         self._policy_lineage = active_policy_lineage
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -559,6 +580,10 @@ class VerifiedDraftPullRequestService:
             kind=TaskTransitionKind.OPEN_VERIFIED_DRAFT_PR,
             reason_code="VERIFIED_DRAFT_PR_OPENED",
             evidence_ids=(decision.decision_evidence_id, proof_id),
+        )
+        self._readiness.reconcile(
+            task_id,
+            trigger_event_id=transition.event_id,
         )
         return DraftPullRequestResult(
             task_id, observed.number, observed.url, commit, proof_id, transition

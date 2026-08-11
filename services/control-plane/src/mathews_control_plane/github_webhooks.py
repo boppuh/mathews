@@ -109,11 +109,20 @@ class GitHubWorkflowReconciler(Protocol):
     ) -> object: ...
 
 
+class GitHubReviewScheduler(Protocol):
+    def schedule(self, task_event_id: UUID) -> object: ...
+
+
 class GitHubWebhookJobHandler:
     """Consume one durable GitHub wake-up after its task event is committed."""
 
-    def __init__(self, readiness: GitHubWorkflowReconciler | None = None) -> None:
+    def __init__(
+        self,
+        readiness: GitHubWorkflowReconciler | None = None,
+        review_scheduler: GitHubReviewScheduler | None = None,
+    ) -> None:
         self._readiness = readiness
+        self._review_scheduler = review_scheduler
 
     def __call__(self, context: LeasedJobContext) -> Mapping[str, object]:
         payload = context.grant.input_payload
@@ -126,11 +135,41 @@ class GitHubWebhookJobHandler:
             head_sha,
         )):
             raise ValueError("github webhook wake-up payload is invalid")
+        event_id = UUID(cast(str, task_event_id))
+        review_status = "NOT_APPLICABLE"
+        if (
+            payload.get("resource_type") == "review_comment"
+            and payload.get("resource_state") == "OPEN"
+        ):
+            if self._review_scheduler is None:
+                raise ValueError("github review scheduler is unavailable")
+            try:
+                scheduled = self._review_scheduler.schedule(event_id)
+            except RuntimeError as error:
+                if (
+                    getattr(error, "code", None) != "REVIEW_TASK_NOT_ACTIVE"
+                    or self._readiness is None
+                ):
+                    raise
+                invalidation = self._readiness.reconcile(
+                    context.grant.task_id,
+                    trigger_event_id=event_id,
+                )
+                invalidation_status = getattr(invalidation, "status", None)
+                if getattr(invalidation_status, "value", invalidation_status) != (
+                    "INVALIDATED"
+                ):
+                    raise
+                scheduled = self._review_scheduler.schedule(event_id)
+            scheduled_status = getattr(scheduled, "status", None)
+            review_status = str(
+                getattr(scheduled_status, "value", scheduled_status)
+            )
         readiness_status = "NOT_CONFIGURED"
         if self._readiness is not None:
             result = self._readiness.reconcile(
                 context.grant.task_id,
-                trigger_event_id=UUID(cast(str, task_event_id)),
+                trigger_event_id=event_id,
             )
             result_status = getattr(result, "status", None)
             readiness_status = str(getattr(result_status, "value", result_status))
@@ -139,6 +178,7 @@ class GitHubWebhookJobHandler:
             "task_event_id": cast(str, task_event_id),
             "head_sha": cast(str, head_sha),
             "workflow_woken": True,
+            "review_resolution_status": review_status,
             "readiness_status": readiness_status,
         }
 
@@ -566,6 +606,8 @@ class GitHubWebhookService:
                 "delivery_id": delivery.provider_delivery_id,
                 "task_event_id": str(event.id),
                 "head_sha": update.head_sha,
+                "resource_type": update.resource_type,
+                "resource_state": update.state,
             }
             job = BackgroundJob(
                 task_id=task.id,

@@ -204,6 +204,23 @@ class BoundedReviewClassifier:
             raise ReviewResolutionError("REVIEW_CLASSIFICATION_INVALID") from None
 
 
+class ConservativeReviewClassifier:
+    """Fail closed to a human decision when no bounded classifier is configured."""
+
+    def classify(self, comment: ReviewComment) -> ReviewClassification:
+        return ReviewClassification(
+            disposition=ReviewDisposition.AMBIGUOUS,
+            category="unclassified-review",
+            action="code.edit",
+            risk=ReviewRisk.HIGH,
+            labels=("human-classification-required",),
+            proposed_paths=(comment.path,),
+            rationale=(
+                "No production review classifier is configured; human review is required."
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewScheduleResult:
     task_id: UUID

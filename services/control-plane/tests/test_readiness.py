@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import mathews_control_plane.readiness as readiness_module
 import pytest
@@ -21,6 +21,12 @@ from mathews_control_plane.domain_models import (
     TaskEvent,
     TaskState,
 )
+from mathews_control_plane.evidence import (
+    EvidenceAccessClass,
+    EvidenceRetentionClass,
+    EvidenceSourceKind,
+    capture_evidence,
+)
 from mathews_control_plane.github_webhooks import (
     GITHUB_CHECK_UPDATED_EVENT,
     GITHUB_PR_BOUND_EVENT,
@@ -31,9 +37,17 @@ from mathews_control_plane.readiness import (
     HANDOFF_ACKNOWLEDGEMENT,
     ReadinessReconcileStatus,
     ReadinessService,
+    _fingerprint,
     _github_facts,
     _GitHubFacts,
     _ReadinessAssessment,
+    _repairs_authorized,
+)
+from mathews_control_plane.review_resolution import (
+    REVIEW_RESOLUTION_SCHEMA_VERSION,
+    ReviewClassification,
+    ReviewDisposition,
+    ReviewRisk,
 )
 from mathews_control_plane.task_state_machine import (
     DraftPrGateFacts,
@@ -202,6 +216,7 @@ def _github_event_payload(**overrides: object) -> dict[str, object]:
         "pull_request_number": 42,
         "task_branch": "codex/task",
         "head_sha": _HEAD,
+        "source_updated_at": _NOW.isoformat(),
     }
     payload.update(overrides)
     return payload
@@ -285,6 +300,184 @@ def test_head_change_discards_prior_check_success() -> None:
 
     assert facts.head_sha == changed
     assert not facts.required_ci_green
+
+
+def test_check_projection_uses_authoritative_update_time_across_runs() -> None:
+    earlier = datetime(2026, 8, 11, 13, 0, tzinfo=UTC).isoformat()
+    later = datetime(2026, 8, 11, 14, 0, tzinfo=UTC).isoformat()
+    facts = _github_facts(
+        (
+            _event(
+                1,
+                GITHUB_PR_BOUND_EVENT,
+                {**_github_event_payload(), "required_checks": ["verify"]},
+            ),
+            _event(
+                2,
+                GITHUB_CHECK_UPDATED_EVENT,
+                _github_event_payload(
+                    resource_type="check_run",
+                    resource_id="new-suite:verify",
+                    resource_label="verify",
+                    state="QUEUED",
+                    source_updated_at=later,
+                ),
+            ),
+            _event(
+                3,
+                GITHUB_CHECK_UPDATED_EVENT,
+                _github_event_payload(
+                    resource_type="check_run",
+                    resource_id="old-suite:verify",
+                    resource_label="verify",
+                    state="PASSED",
+                    source_updated_at=earlier,
+                ),
+            ),
+        )
+    )
+
+    assert facts.check_states == (("verify", "QUEUED"),)
+    assert not facts.required_ci_green
+
+
+def test_commented_review_does_not_clear_an_outstanding_change_request() -> None:
+    facts = _github_facts(
+        (
+            _event(
+                1,
+                GITHUB_PR_BOUND_EVENT,
+                {**_github_event_payload(), "required_checks": ["verify"]},
+            ),
+            _event(
+                2,
+                GITHUB_REVIEW_UPDATED_EVENT,
+                _github_event_payload(
+                    resource_type="review",
+                    resource_id="reviewer-1",
+                    state="CHANGES_REQUESTED",
+                ),
+            ),
+            _event(
+                3,
+                GITHUB_REVIEW_UPDATED_EVENT,
+                _github_event_payload(
+                    resource_type="review",
+                    resource_id="reviewer-1",
+                    state="COMMENTED",
+                ),
+            ),
+        )
+    )
+
+    assert facts.blocking_reviews == 1
+    assert not facts.no_blocking_review
+
+
+@pytest.mark.parametrize(
+    ("source_disposition", "correction_disposition"),
+    [
+        (ReviewDisposition.INFORMATIONAL, ReviewDisposition.ACTIONABLE),
+        (ReviewDisposition.ACTIONABLE, ReviewDisposition.INFORMATIONAL),
+    ],
+)
+def test_corrected_review_assessments_never_satisfy_readiness(
+    readiness_harness: ReadinessHarness,
+    source_disposition: ReviewDisposition,
+    correction_disposition: ReviewDisposition,
+) -> None:
+    review_event_id = uuid4()
+    classification = ReviewClassification(
+        disposition=source_disposition,
+        category="review",
+        action="code.edit",
+        risk=ReviewRisk.LOW,
+        proposed_paths=("service.py",),
+        rationale="Test classification",
+    )
+    unsigned: dict[str, object] = {
+        "schema_version": REVIEW_RESOLUTION_SCHEMA_VERSION,
+        "task_id": str(readiness_harness.task_id),
+        "task_event_id": str(review_event_id),
+        "original_head_sha": _HEAD,
+        "classification": classification.model_dump(mode="json"),
+    }
+    fingerprint = _fingerprint(unsigned)
+    payload = {**unsigned, "assessment_fingerprint": fingerprint}
+    assessment_id = uuid5(
+        NAMESPACE_URL,
+        f"mathews:review-assessment:{review_event_id}:{fingerprint}",
+    )
+    with readiness_harness.factory.begin() as session:
+        task = session.get_one(Task, readiness_harness.task_id)
+        source = capture_evidence(
+            session,
+            readiness_harness.store,
+            payload=payload,
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.RESULT,
+            evidence_type="review-resolution-assessment",
+            origin="control-plane:review-resolution",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.AUDIT,
+            owner_id=task.owner_id,
+            actor_id="control-plane",
+            root_correlation_id=task.root_correlation_id,
+            task_id=task.id,
+            causation_id=review_event_id,
+            evidence_id=assessment_id,
+            captured_at=_NOW,
+        )
+        source_id = source.record.id
+
+    with readiness_harness.factory() as session:
+        initially_authorized = _repairs_authorized(
+            session,
+            readiness_harness.store,
+            session.get_one(Task, readiness_harness.task_id),
+            current_head=_HEAD,
+            open_review_event_ids=(review_event_id,),
+        )
+    assert initially_authorized is (
+        source_disposition is ReviewDisposition.INFORMATIONAL
+    )
+
+    with readiness_harness.factory.begin() as session:
+        task = session.get_one(Task, readiness_harness.task_id)
+        corrected = {
+            **payload,
+            "classification": {
+                **classification.model_dump(mode="json"),
+                "disposition": correction_disposition.value,
+            },
+        }
+        capture_evidence(
+            session,
+            readiness_harness.store,
+            payload=corrected,
+            media_type="application/json",
+            source_kind=EvidenceSourceKind.RESULT,
+            evidence_type="review-resolution-assessment",
+            origin="local-user:correction",
+            access_classification=EvidenceAccessClass.TASK_OWNER,
+            retention_policy=EvidenceRetentionClass.AUDIT,
+            owner_id=task.owner_id,
+            actor_id=task.owner_id,
+            root_correlation_id=task.root_correlation_id,
+            task_id=task.id,
+            causation_id=source_id,
+            correction_of_id=source_id,
+            captured_at=_NOW,
+        )
+
+    with readiness_harness.factory() as session:
+        assert not _repairs_authorized(
+            session,
+            readiness_harness.store,
+            session.get_one(Task, readiness_harness.task_id),
+            current_head=_HEAD,
+            open_review_event_ids=(review_event_id,),
+        )
 
 
 def test_reconcile_marks_ready_then_invalidates_on_current_failure(

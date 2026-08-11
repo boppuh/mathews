@@ -322,6 +322,7 @@ def test_verified_delivery_is_persisted_correlated_and_wakes_task(
 def test_durable_webhook_wakeup_reconciles_exact_task_readiness() -> None:
     task_id = uuid4()
     event_id = uuid4()
+    calls: list[tuple[str, UUID]] = []
 
     class Reconciler:
         def __init__(self) -> None:
@@ -329,7 +330,13 @@ def test_durable_webhook_wakeup_reconciles_exact_task_readiness() -> None:
 
         def reconcile(self, task_id: UUID, *, trigger_event_id: UUID) -> object:
             self.calls.append((task_id, trigger_event_id))
+            calls.append(("readiness", trigger_event_id))
             return SimpleNamespace(status=SimpleNamespace(value="READY"))
+
+    class ReviewScheduler:
+        def schedule(self, task_event_id: UUID) -> object:
+            calls.append(("review", task_event_id))
+            return SimpleNamespace(status=SimpleNamespace(value="IGNORED"))
 
     reconciler = Reconciler()
     context = SimpleNamespace(
@@ -339,15 +346,19 @@ def test_durable_webhook_wakeup_reconciles_exact_task_readiness() -> None:
                 "delivery_id": "delivery-1",
                 "task_event_id": str(event_id),
                 "head_sha": _HEAD_SHA,
+                "resource_type": "review_comment",
+                "resource_state": "OPEN",
             },
         )
     )
 
-    result = GitHubWebhookJobHandler(reconciler)(
+    result = GitHubWebhookJobHandler(reconciler, ReviewScheduler())(
         cast(LeasedJobContext, context)
     )
 
     assert reconciler.calls == [(task_id, event_id)]
+    assert calls == [("review", event_id), ("readiness", event_id)]
+    assert result["review_resolution_status"] == "IGNORED"
     assert result["readiness_status"] == "READY"
 
 

@@ -44,6 +44,11 @@ from mathews_control_plane.repair_loop import (
     VALIDATION_REPAIR_JOB_TYPE,
     RepairJobHandler,
 )
+from mathews_control_plane.review_resolution import (
+    ConservativeReviewClassifier,
+    ReviewClassifier,
+    ReviewResolutionService,
+)
 from mathews_control_plane.settings import Settings, settings
 from mathews_control_plane.validation_evidence import (
     LEGACY_VALIDATION_EVIDENCE_JOB_TYPE,
@@ -66,6 +71,7 @@ def build_worker(
     handlers: dict[str, BackgroundJobHandler] | None = None,
     hermes_runtime: HermesRuntime | None = None,
     host_gateway: HostGateway | None = None,
+    review_classifier: ReviewClassifier | None = None,
 ) -> tuple[DurableJobWorker, Engine]:
     """Build one database-backed worker and return its disposable engine."""
 
@@ -89,10 +95,17 @@ def build_worker(
             runtime,
             tool_execution,
         )
+        readiness = ReadinessService(factory, store)
+        review_resolution = ReviewResolutionService(
+            factory,
+            store,
+            review_classifier or ConservativeReviewClassifier(),
+        )
         handler_registry: dict[str, BackgroundJobHandler] = {
             "hermes-run": hermes_handler,
             "github-webhook": GitHubWebhookJobHandler(
-                ReadinessService(factory, store)
+                readiness,
+                review_resolution,
             ),
         }
         if gateway is not None:
