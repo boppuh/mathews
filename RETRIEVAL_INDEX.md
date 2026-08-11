@@ -10,6 +10,8 @@ Chunk content is stored only as a registered `EvidenceDerivative` artifact.
 The canonical evidence record remains the source of truth. Each derivative is
 bound to one source envelope hash and uses a task-scoped derivative type so a
 taskless GitHub source may safely participate in more than one task index.
+The database stores one explicit current generation per task plus a non-content
+lexical projection whose term keys are salted hashes scoped to that generation.
 
 Every chunk carries:
 
@@ -34,11 +36,14 @@ sources, then reloads and verifies every canonical envelope before creating a
 chunk derivative. It never indexes deletion-pending, deleted, superseded, or
 integrity-failed evidence.
 
-Rebuilding first destroys all live chunks in that task's prior generation.
-Deleting an index removes the derivative artifacts and marks their derivative
-rows deleted while leaving canonical evidence untouched. A later rebuild reads
-the canonical sources again, so losing the entire index loses no source data or
-policy state.
+Rebuilding locks the task and atomically retires the prior generation while
+installing exactly one new current generation. A database uniqueness fence
+prevents two live generations for the same task. Once that transaction commits,
+the retired derivative artifacts are destroyed. Deleting an index clears its
+lexical projections, removes the derivative artifacts, and marks its generation,
+chunk, and derivative rows deleted while leaving canonical evidence untouched.
+A later rebuild reads the canonical sources again, so losing the entire index
+loses no source data or policy state.
 
 Canonical evidence deletion uses the existing derivative destruction path.
 Consequently its retrieval bytes disappear in the same deletion operation and
@@ -51,9 +56,10 @@ The authenticated browser endpoint is:
 
 - `GET /api/retrieval/tasks/{task_id}/search?q={query}&limit={1..50}`.
 
-Responses disable browser caching. The service selects only the latest live
-task-scoped generation, then reauthorizes every candidate against the original
-evidence record. `INTERNAL` sources are never returned to the browser;
+Responses disable browser caching. The service selects the task's explicit
+current generation and ranks the non-content lexical projections before opening
+a bounded candidate window. It then reauthorizes every candidate against the
+original evidence record. `INTERNAL` sources are never returned to the browser;
 `RECENT_PASSWORD` sources require an active reauthentication window; and
 task-owner evidence rechecks task ownership. A cached access field is compared
 to the immutable source record but is never trusted to grant access.

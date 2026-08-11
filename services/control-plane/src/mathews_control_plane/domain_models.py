@@ -21,6 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -661,6 +662,94 @@ class TaskEventEvidenceReference(RecordContext, Base):
     task_event_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     evidence_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class RetrievalIndexGeneration(RecordContext, Base):
+    """Task-scoped identity for one disposable retrieval-index generation."""
+
+    __tablename__ = "retrieval_index_generations"
+    __table_args__ = (
+        CheckConstraint("source_count >= 0", name="source_count_non_negative"),
+        CheckConstraint("chunk_count >= 0", name="chunk_count_non_negative"),
+        UniqueConstraint("id", "task_id", name="uq_retrieval_generations_id_task"),
+        Index(
+            "uq_retrieval_generations_active_task",
+            "task_id",
+            unique=True,
+            sqlite_where=text("deleted_at IS NULL"),
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    index_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    chunker_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    verifier_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    indexed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RetrievalIndexChunk(RecordContext, Base):
+    """Non-content lexical projection pointing to one derivative artifact."""
+
+    __tablename__ = "retrieval_index_chunks"
+    __table_args__ = (
+        CheckConstraint("ordinal > 0", name="ordinal_positive"),
+        CheckConstraint("start_offset >= 0", name="start_offset_non_negative"),
+        CheckConstraint("end_offset > start_offset", name="span_positive"),
+        UniqueConstraint(
+            "generation_id",
+            "evidence_id",
+            "ordinal",
+            name="uq_retrieval_chunks_source_ordinal",
+        ),
+        UniqueConstraint("derivative_id", name="uq_retrieval_chunks_derivative"),
+        ForeignKeyConstraint(
+            ["generation_id", "task_id"],
+            ["retrieval_index_generations.id", "retrieval_index_generations.task_id"],
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ix_retrieval_chunks_generation_live",
+            "generation_id",
+            "deleted_at",
+        ),
+        Index("ix_retrieval_chunks_evidence", "evidence_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    generation_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    task_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    derivative_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence_derivatives.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    projection_class: Mapped[str] = mapped_column(String(64), nullable=False)
+    access_classification: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_envelope_hash: Mapped[str] = mapped_column(String(80), nullable=False)
+    chunk_hash: Mapped[str] = mapped_column(String(80), nullable=False)
+    index_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    chunker_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    verifier_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    indexed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_offset: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_offset: Mapped[int] = mapped_column(Integer, nullable=False)
+    lexical_term_frequencies: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ValidationContract(RecordContext, Base):

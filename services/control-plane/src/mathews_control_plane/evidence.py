@@ -34,6 +34,7 @@ from mathews_control_plane.domain_models import (
     EvidenceDerivative,
     EvidenceRecord,
     EvidenceTombstone,
+    RetrievalIndexChunk,
     Task,
 )
 
@@ -1302,6 +1303,19 @@ def _finalize_deletion(
             derivative,
             deleted_at=now,
         )
+    retrieval_chunks = tuple(
+        session.scalars(
+            select(RetrievalIndexChunk)
+            .where(
+                RetrievalIndexChunk.evidence_id == record.id,
+                RetrievalIndexChunk.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+    )
+    for chunk in retrieval_chunks:
+        chunk.lexical_term_frequencies = {}
+        chunk.deleted_at = now
 
     if record.evidence_type == "task-request" and record.task_id is not None:
         task = session.scalar(

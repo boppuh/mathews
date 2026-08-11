@@ -61,6 +61,8 @@ EXPECTED_DOMAIN_TABLES = {
     "policy_versions",
     "prompt_template_versions",
     "repository_configurations",
+    "retrieval_index_chunks",
+    "retrieval_index_generations",
     "review_rules",
     "rule_candidates",
     "task_events",

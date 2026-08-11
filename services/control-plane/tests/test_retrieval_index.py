@@ -27,6 +27,8 @@ from mathews_control_plane.domain_models import (
     EvidenceAuditEvent,
     EvidenceDerivative,
     EvidenceRecord,
+    RetrievalIndexChunk,
+    RetrievalIndexGeneration,
     Task,
     TaskEvent,
     TaskEventEvidenceReference,
@@ -49,10 +51,12 @@ from mathews_control_plane.retrieval_index import (
     RETRIEVAL_DERIVATIVE_TYPE_PREFIX,
     RETRIEVAL_VERIFIER_VERSION,
     RetrievalIndexService,
+    RetrievalIndexValidationError,
 )
 from mathews_control_plane.settings import Settings
 from pydantic import SecretStr
 from sqlalchemy import Engine, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 _ORIGIN = "http://localhost:3000"
@@ -271,8 +275,7 @@ def test_rebuild_indexes_verified_sources_and_filters_every_search_by_access(
                 select(func.count())
                 .select_from(EvidenceDerivative)
                 .where(
-                    EvidenceDerivative.derivative_type
-                    .startswith(RETRIEVAL_DERIVATIVE_TYPE_PREFIX)
+                    EvidenceDerivative.derivative_type.startswith(RETRIEVAL_DERIVATIVE_TYPE_PREFIX)
                 )
             )
             == 3
@@ -280,8 +283,7 @@ def test_rebuild_indexes_verified_sources_and_filters_every_search_by_access(
         downloaded = set(
             session.scalars(
                 select(EvidenceAuditEvent.evidence_id).where(
-                    EvidenceAuditEvent.event_type
-                    == EvidenceAuditEventType.CONTENT_DOWNLOADED.value
+                    EvidenceAuditEvent.event_type == EvidenceAuditEventType.CONTENT_DOWNLOADED.value
                 )
             )
         )
@@ -332,6 +334,13 @@ def test_source_deletion_destroys_chunks_and_rebuild_cannot_reconstruct_them(
     )
     with pytest.raises(ArtifactNotFoundError):
         retrieval_harness.store.get_bytes(address)
+    with retrieval_harness.factory() as session:
+        deleted_chunk = session.scalar(
+            select(RetrievalIndexChunk).where(RetrievalIndexChunk.evidence_id == source.id)
+        )
+        assert deleted_chunk is not None
+        assert deleted_chunk.deleted_at is not None
+        assert deleted_chunk.lexical_term_frequencies == {}
     result = service.search(
         task_id,
         "sentinel",
@@ -413,6 +422,131 @@ def test_index_deletion_and_rebuild_preserve_canonical_source(
     assert searched.generation_id == second.generation_id
     assert searched.index_version == "retrieval-v2"
     assert [hit.evidence_id for hit in searched.hits] == [source.id]
+    with retrieval_harness.factory() as session:
+        generations = tuple(
+            session.scalars(
+                select(RetrievalIndexGeneration)
+                .where(RetrievalIndexGeneration.task_id == task_id)
+                .order_by(RetrievalIndexGeneration.indexed_at)
+            )
+        )
+        assert len(generations) == 2
+        assert [item.id for item in generations if item.deleted_at is None] == [
+            second.generation_id
+        ]
+        live_chunk_generations = set(
+            session.scalars(
+                select(RetrievalIndexChunk.generation_id).where(
+                    RetrievalIndexChunk.deleted_at.is_(None)
+                )
+            )
+        )
+        assert live_chunk_generations == {second.generation_id}
+
+
+def test_database_rejects_two_current_generations_for_one_task(
+    retrieval_harness: RetrievalHarness,
+) -> None:
+    with retrieval_harness.factory.begin() as session:
+        task = _task()
+        session.add(task)
+        session.flush()
+        task_id = task.id
+        context = {
+            "task_id": task_id,
+            "index_version": "retrieval-v1",
+            "chunker_version": RETRIEVAL_CHUNKER_VERSION,
+            "verifier_version": RETRIEVAL_VERIFIER_VERSION,
+            "indexed_at": retrieval_harness.now,
+            "source_count": 0,
+            "chunk_count": 0,
+            "owner_id": task.owner_id,
+            "actor_id": "retrieval-indexer",
+            "root_correlation_id": task.root_correlation_id,
+        }
+        session.add(RetrievalIndexGeneration(**context))
+
+    with pytest.raises(IntegrityError):
+        with retrieval_harness.factory.begin() as session:
+            session.add(RetrievalIndexGeneration(**context))
+
+
+def test_search_rejects_unverified_chunk_versions(
+    retrieval_harness: RetrievalHarness,
+) -> None:
+    with retrieval_harness.factory.begin() as session:
+        task = _task()
+        session.add(task)
+        session.flush()
+        _capture(
+            retrieval_harness,
+            session,
+            task_id=task.id,
+            content={"message": "version sentinel"},
+        )
+        task_id = task.id
+    service = _service(retrieval_harness)
+    service.rebuild_task_index_internal(
+        task_id,
+        index_version="retrieval-v1",
+        actor_id="retrieval-indexer",
+    )
+    with retrieval_harness.factory.begin() as session:
+        chunk = session.scalar(
+            select(RetrievalIndexChunk).where(
+                RetrievalIndexChunk.task_id == task_id,
+                RetrievalIndexChunk.deleted_at.is_(None),
+            )
+        )
+        assert chunk is not None
+        chunk.chunker_version = "unsupported-v0"
+
+    with pytest.raises(RetrievalIndexValidationError, match="verification failed"):
+        service.search(
+            task_id,
+            "sentinel",
+            _authentication(retrieval_harness.now),
+        )
+
+
+def test_search_verifies_only_a_bounded_ranked_candidate_window(
+    retrieval_harness: RetrievalHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with retrieval_harness.factory.begin() as session:
+        task = _task()
+        session.add(task)
+        session.flush()
+        _capture(
+            retrieval_harness,
+            session,
+            task_id=task.id,
+            content={"message": f"{'filler ' * 20_000} needlespecial"},
+        )
+        task_id = task.id
+    service = _service(retrieval_harness)
+    built = service.rebuild_task_index_internal(
+        task_id,
+        index_version="retrieval-v1",
+        actor_id="retrieval-indexer",
+    )
+    assert built.chunk_count > 100
+    artifact_reads = 0
+    original_get_bytes = retrieval_harness.store.get_bytes
+
+    def counted_get_bytes(address: str) -> bytes:
+        nonlocal artifact_reads
+        artifact_reads += 1
+        return original_get_bytes(address)
+
+    monkeypatch.setattr(retrieval_harness.store, "get_bytes", counted_get_bytes)
+    result = service.search(
+        task_id,
+        "needlespecial",
+        _authentication(retrieval_harness.now),
+    )
+    assert len(result.hits) == 1
+    assert artifact_reads <= 4
 
 
 def test_task_scoped_generations_do_not_delete_shared_source_chunks(
@@ -457,10 +591,13 @@ def test_task_scoped_generations_do_not_delete_shared_source_chunks(
         actor_id="retrieval-indexer",
     )
 
-    assert service.delete_task_index_internal(
-        first_task_id,
-        actor_id="retrieval-indexer",
-    ) == 1
+    assert (
+        service.delete_task_index_internal(
+            first_task_id,
+            actor_id="retrieval-indexer",
+        )
+        == 1
+    )
     second_result = service.search(
         second_task_id,
         "shared",
@@ -577,4 +714,66 @@ def test_retrieval_route_requires_authentication_and_disables_caching(
         assert response.json()["index_version"] == "retrieval-v1"
     finally:
         client.close()
+        engine.dispose()
+
+
+def test_default_app_retrieval_service_uses_the_configured_artifact_root(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'default-retrieval.sqlite3'}"
+    engine = create_database_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    artifact_root = tmp_path / "configured-artifacts"
+    store = ArtifactStore(artifact_root)
+    settings = Settings(
+        database_url=SecretStr(database_url),
+        artifact_root=artifact_root,
+    )
+    try:
+        app = create_app(settings, session_factory=factory)
+        with factory.begin() as session:
+            task = _task()
+            session.add(task)
+            session.flush()
+            _capture(
+                RetrievalHarness(engine, factory, store, datetime.now(UTC)),
+                session,
+                task_id=task.id,
+                content={"message": "default construction"},
+            )
+            task_id = task.id
+        built = app.state.retrieval_index_service.rebuild_task_index_internal(
+            task_id,
+            index_version="retrieval-v1",
+            actor_id="retrieval-indexer",
+        )
+        assert built.chunk_count == 1
+    finally:
+        engine.dispose()
+
+
+def test_default_retrieval_service_rejects_a_projection_store_mismatch(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'mismatched-retrieval.sqlite3'}"
+    engine = create_database_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    configured_root = tmp_path / "configured-artifacts"
+    projections = EvidenceProjectionService(
+        factory,
+        ArtifactStore(tmp_path / "different-artifacts"),
+    )
+    try:
+        with pytest.raises(ValueError, match="must share an artifact root"):
+            create_app(
+                Settings(
+                    database_url=SecretStr(database_url),
+                    artifact_root=configured_root,
+                ),
+                session_factory=factory,
+                evidence_projection_service=projections,
+            )
+    finally:
         engine.dispose()

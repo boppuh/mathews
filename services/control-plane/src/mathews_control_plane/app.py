@@ -148,6 +148,10 @@ def create_app(
             artifact_store,
         )
     if retrieval_index_service is None:
+        if evidence_projection_service.artifact_root != artifact_store.root:
+            raise ValueError(
+                "the retrieval index and evidence projections must share an artifact root"
+            )
         retrieval_index_service = RetrievalIndexService(
             session_factory,
             artifact_store,
