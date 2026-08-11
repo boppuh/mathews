@@ -39,7 +39,7 @@ the exact evaluated definition before creating any authority-bearing record.
 Authenticated control-plane clients submit bounded learning drafts through the
 task-scoped `learning-summaries` and `rule-candidates` API routes. The routes
 invoke the same idempotent service boundary and always attribute writes to the
-fixed `candidate-learning-api` actor. Authentication and CSRF enforcement,
-task-request body limits, deterministic redaction, exact runtime-rule
+fixed `candidate-learning-api` actor. Authentication and CSRF enforcement, a
+candidate-specific 192 KiB body limit, deterministic redaction, exact runtime-rule
 validation, and evidence integrity checks all apply before an output can appear
 in the Rule Inbox.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -90,6 +91,7 @@ MAX_REVIEW_REPAIRS = 5
 _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_LOGGER = logging.getLogger(__name__)
 class ReviewResolutionError(RuntimeError):
     """Stable review-resolution refusal without review or artifact contents."""
 
@@ -1104,6 +1106,7 @@ def _rule_matches(rule: ReviewRule, classification: ReviewClassification) -> boo
             evidence_requirements=rule.evidence_requirements,
         )
     except ValueError:
+        _LOGGER.warning("Ignoring non-executable review rule %s", rule.id)
         return False
     if (
         classification.category not in contract.categories

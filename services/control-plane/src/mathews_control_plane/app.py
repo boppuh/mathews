@@ -28,6 +28,7 @@ from mathews_control_plane.authentication import (
     create_authentication_router,
 )
 from mathews_control_plane.candidate_learning import (
+    CandidateLearningBodyLimitMiddleware,
     CandidateLearningService,
     create_candidate_learning_router,
 )
@@ -397,6 +398,7 @@ def create_app(
     application.add_middleware(AuthenticationBodyLimitMiddleware)
     application.add_middleware(EvidenceBodyLimitMiddleware)
     application.add_middleware(TaskBodyLimitMiddleware)
+    application.add_middleware(CandidateLearningBodyLimitMiddleware)
     application.add_middleware(ApprovalBodyLimitMiddleware)
     application.add_middleware(RepositoryBodyLimitMiddleware)
     application.add_middleware(ValidationEvidenceBodyLimitMiddleware)

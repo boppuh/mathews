@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
@@ -51,6 +53,7 @@ DERIVED_SUMMARY_TYPE = "candidate-learning-summary-v1"
 NON_AUTHORITATIVE = "NON_AUTHORITATIVE"
 MAX_CITATIONS = 100
 MAX_RULE_DEFINITION_BYTES = 64 * 1024
+MAX_CANDIDATE_LEARNING_REQUEST_BYTES = 192 * 1024
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
 AuthenticatedLearningSession = Annotated[
     AuthenticatedSession,
@@ -234,6 +237,91 @@ class RuleCandidateResponse(BaseModel):
     replayed: bool
 
 
+class CandidateLearningBodyLimitMiddleware:
+    """Bound candidate-learning JSON before request parsing buffers it."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        maximum_bytes: int = MAX_CANDIDATE_LEARNING_REQUEST_BYTES,
+    ) -> None:
+        self._app = app
+        self._maximum_bytes = maximum_bytes
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if not self._bounded(scope):
+            await self._app(scope, receive, send)
+            return
+        content_length = self._content_length(scope)
+        if content_length is not None and content_length > self._maximum_bytes:
+            await self._too_large(scope, receive, send)
+            return
+        received = 0
+        messages: list[Message] = []
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            received += len(message.get("body", b""))
+            if received > self._maximum_bytes:
+                await self._too_large(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+        index = 0
+
+        async def replay() -> Message:
+            nonlocal index
+            if index < len(messages):
+                message = messages[index]
+                index += 1
+                return message
+            return await receive()
+
+        await self._app(scope, replay, send)
+
+    @staticmethod
+    def _bounded(scope: Scope) -> bool:
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            return False
+        parts = str(scope.get("path", "")).split("/")
+        return (
+            len(parts) == 5
+            and parts[:3] == ["", "api", "tasks"]
+            and bool(parts[3])
+            and parts[4] in {"learning-summaries", "rule-candidates"}
+        )
+
+    @staticmethod
+    def _content_length(scope: Scope) -> int | None:
+        for name, value in scope["headers"]:
+            if name.lower() != b"content-length":
+                continue
+            try:
+                return max(0, int(value))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    async def _too_large(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            {"detail": "candidate learning request body too large"},
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+        await response(scope, receive, send)
+
+
 class CandidateLearningService:
     """Persist learning outputs without granting them workflow authority."""
 
@@ -314,14 +402,40 @@ class CandidateLearningService:
                     source_hashes,
                 )
         except IntegrityError:
-            self._delete_unreferenced_artifact(
-                artifact_addresses[-1] if artifact_addresses else None
-            )
-            raise CandidateLearningError("LEARNING_SUMMARY_CONFLICT") from None
+            try:
+                self._delete_unreferenced_artifact(
+                    artifact_addresses[-1] if artifact_addresses else None
+                )
+            except SQLAlchemyError:
+                raise CandidateLearningError(
+                    "LEARNING_SUMMARY_PERSISTENCE_FAILED"
+                ) from None
+            try:
+                with self._factory() as session:
+                    task = _task(session, task_id)
+                    existing = session.get(EvidenceDerivative, summary_id)
+                    if existing is None:
+                        raise CandidateLearningError("LEARNING_SUMMARY_CONFLICT")
+                    return _replayed_summary(
+                        session,
+                        self._store,
+                        task,
+                        existing,
+                        draft,
+                    )
+            except CandidateLearningError:
+                raise CandidateLearningError("LEARNING_SUMMARY_CONFLICT") from None
+            except SQLAlchemyError:
+                raise CandidateLearningError(
+                    "LEARNING_SUMMARY_PERSISTENCE_FAILED"
+                ) from None
         except SQLAlchemyError:
-            self._delete_unreferenced_artifact(
-                artifact_addresses[-1] if artifact_addresses else None
-            )
+            try:
+                self._delete_unreferenced_artifact(
+                    artifact_addresses[-1] if artifact_addresses else None
+                )
+            except SQLAlchemyError:
+                pass
             raise CandidateLearningError("LEARNING_SUMMARY_PERSISTENCE_FAILED") from None
 
     def _delete_unreferenced_artifact(self, address: str | None) -> None:
@@ -455,6 +569,12 @@ class CandidateLearningService:
                     )
             except CandidateLearningError:
                 raise CandidateLearningError("RULE_CANDIDATE_CONFLICT") from None
+            except SQLAlchemyError:
+                raise CandidateLearningError(
+                    "RULE_CANDIDATE_PERSISTENCE_FAILED"
+                ) from None
+        except SQLAlchemyError:
+            raise CandidateLearningError("RULE_CANDIDATE_PERSISTENCE_FAILED") from None
 
 
 def _task(session: Session, task_id: UUID) -> Task:
@@ -474,6 +594,7 @@ def _citation_records(
         session.scalars(
             select(EvidenceRecord)
             .where(EvidenceRecord.id.in_(evidence_ids))
+            .order_by(EvidenceRecord.id)
             .with_for_update()
         )
     )
@@ -735,11 +856,8 @@ def create_candidate_learning_router(service: CandidateLearningService) -> APIRo
                 draft=body.draft,
                 actor_id="candidate-learning-api",
             )
-        except CandidateLearningError:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="candidate learning conflicts with durable evidence",
-            ) from None
+        except CandidateLearningError as error:
+            raise _learning_http_error(error) from None
         return CitedSummaryResponse.model_validate(asdict(result))
 
     @router.post(
@@ -761,11 +879,29 @@ def create_candidate_learning_router(service: CandidateLearningService) -> APIRo
                 draft=body.draft,
                 actor_id="candidate-learning-api",
             )
-        except CandidateLearningError:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="candidate learning conflicts with durable evidence",
-            ) from None
+        except CandidateLearningError as error:
+            raise _learning_http_error(error) from None
         return RuleCandidateResponse.model_validate(asdict(result))
 
     return router
+
+
+_LEARNING_ERROR_STATUS = {
+    "LEARNING_TASK_UNAVAILABLE": status.HTTP_404_NOT_FOUND,
+    "LEARNING_CITATION_UNAVAILABLE": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "LEARNING_SUMMARY_UNAVAILABLE": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "LEARNING_SUMMARY_INVALID": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "LEARNING_SUMMARY_STALE": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "LEARNING_PAYLOAD_INVALID": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "RULE_CANDIDATE_REDACTION_INVALID": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "LEARNING_SUMMARY_PERSISTENCE_FAILED": status.HTTP_503_SERVICE_UNAVAILABLE,
+    "RULE_CANDIDATE_PERSISTENCE_FAILED": status.HTTP_503_SERVICE_UNAVAILABLE,
+}
+
+
+def _learning_http_error(error: CandidateLearningError) -> HTTPException:
+    code = str(error)
+    return HTTPException(
+        status_code=_LEARNING_ERROR_STATUS.get(code, status.HTTP_409_CONFLICT),
+        detail={"code": code},
+    )

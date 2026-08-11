@@ -13,7 +13,9 @@ from mathews_control_plane.approvals import ApprovalService
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import AuthenticatedSession, require_authenticated_session
 from mathews_control_plane.candidate_learning import (
+    MAX_CANDIDATE_LEARNING_REQUEST_BYTES,
     NON_AUTHORITATIVE,
+    CandidateLearningBodyLimitMiddleware,
     CandidateLearningError,
     CandidateLearningService,
     CandidateRisk,
@@ -577,6 +579,7 @@ def test_authenticated_api_creates_candidate_learning_outputs(
     )
     application = FastAPI()
     application.include_router(create_candidate_learning_router(_service(learning_harness)))
+    application.add_middleware(CandidateLearningBodyLimitMiddleware)
     application.dependency_overrides[require_authenticated_session] = lambda: authentication
     summary_id = uuid4()
     candidate_id = uuid4()
@@ -602,6 +605,24 @@ def test_authenticated_api_creates_candidate_learning_outputs(
     assert candidate.status_code == 201
     assert candidate.json()["candidate_id"] == str(candidate_id)
     assert candidate.json()["status"] == RuleCandidateStatus.EVALUATED.value
+
+    missing = client.post(
+        f"/api/tasks/{uuid4()}/learning-summaries",
+        json={
+            "summary_id": str(uuid4()),
+            "draft": _summary(learning_harness).model_dump(mode="json"),
+        },
+    )
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": {"code": "LEARNING_TASK_UNAVAILABLE"}}
+
+    oversized = client.post(
+        f"/api/tasks/{learning_harness.task_id}/rule-candidates",
+        content=b"x" * (MAX_CANDIDATE_LEARNING_REQUEST_BYTES + 1),
+        headers={"Content-Type": "application/json"},
+    )
+    assert oversized.status_code == 413
+    assert oversized.json() == {"detail": "candidate learning request body too large"}
 
 
 def test_rule_inbox_skips_candidate_with_missing_source_artifact(
