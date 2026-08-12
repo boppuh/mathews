@@ -89,11 +89,16 @@ Compose, Xcode, and the configured simulator runtime. Install workspace
 dependencies without changing lockfiles:
 
 ```bash
-npm install
-uv sync --all-packages
+npm ci
+uv sync --all-packages --locked
+node --version
+npm --version
+uv --version
+uv run python --version
 ```
 
-The working tree must remain clean after installation.
+The working tree must remain clean after installation. Record the exact Node.js,
+npm, uv, and Python versions in the report.
 
 ### 1.2 Configuration and credential custody
 
@@ -230,11 +235,17 @@ In the web UI:
    are redacted before persistence.
 5. Review the generated versioned brief, exclusions, typed criteria, risks,
    affected flow, and validation plan.
-6. If human approval is required, reauthenticate and approve the exact displayed
-   brief version.
+6. Require exactly one durable authorization outcome for the exact displayed
+   brief: either a human approval-decision ID or an unambiguous policy-bypass ID
+   and version. Never record both or neither.
+7. Confirm that the selected authorization binds the accepted brief ID/version
+   and active policy ID/version. For a human approval, reauthenticate before
+   approving.
 
-Pass only when the accepted brief and approval are durable, exact-version
-bound, and visible in the task cockpit.
+Pass only when the accepted brief and its single authorization outcome are
+durable, exact-version bound, and visible in the task cockpit. The same
+authorization identity must remain visible and bound to the accepted brief at
+readiness and handoff; otherwise the task may not reach `HANDED_OFF`.
 
 ### 3.3 Workspace and implementation
 
@@ -318,18 +329,32 @@ timing-sensitive cases. Record the named tests below as a matrix, together with
 the exact Mathews SHA and test-run result. Live checks are additive and must use
 the acceptance task or a disposable companion task.
 
+Every automated-test bullet below is an exact pytest node ID. First prove that
+pytest collects it, then execute it individually:
+
+```bash
+uv run pytest --collect-only -q <node-id>
+uv run pytest -q <node-id>
+```
+
+Collection must identify exactly the requested test, and execution must pass.
+A missing, deselected, xfailed, or skipped required test fails the gate. Add one
+report row for every node ID and one separate row for every required live
+observation; each row records the exact Mathews SHA, command or observation,
+result, and evidence reference.
+
 ### 4.1 Authentication and evidence safety
 
 Required automated coverage:
 
-- `test_bootstrap_requires_exact_origin_and_preauthentication_csrf`
-- `test_authenticated_mutations_require_exact_origin_and_bound_csrf`
-- `test_reauthentication_rotates_session_and_gates_three_sensitive_mutations`
-- `test_redaction_is_deterministic_and_precedes_persistence`
-- `test_correction_is_a_single_append_only_successor`
-- `test_deletion_fences_reads_destroys_derivatives_and_appends_tombstone`
-- `test_browser_views_preserve_each_original_access_class`
-- `test_provenance_navigation_omits_inaccessible_related_nodes`
+- `services/control-plane/tests/test_authentication.py::test_bootstrap_requires_exact_origin_and_preauthentication_csrf`
+- `services/control-plane/tests/test_authentication.py::test_authenticated_mutations_require_exact_origin_and_bound_csrf`
+- `services/control-plane/tests/test_authentication.py::test_reauthentication_rotates_session_and_gates_three_sensitive_mutations`
+- `services/control-plane/tests/test_evidence.py::test_redaction_is_deterministic_and_precedes_persistence`
+- `services/control-plane/tests/test_evidence.py::test_correction_is_a_single_append_only_successor`
+- `services/control-plane/tests/test_evidence.py::test_deletion_fences_reads_destroys_derivatives_and_appends_tombstone`
+- `services/control-plane/tests/test_evidence_projections.py::test_browser_views_preserve_each_original_access_class`
+- `services/control-plane/tests/test_evidence_projections.py::test_provenance_navigation_omits_inaccessible_related_nodes`
 
 Required live observations:
 
@@ -344,13 +369,13 @@ Required live observations:
 
 Required automated coverage:
 
-- `test_expired_takeover_recovers_checkpoint_and_fences_old_worker`
-- `test_effect_intent_result_and_checkpoint_are_fenced_and_idempotent`
-- `test_restart_reconciles_prepared_effect_without_duplicate_execution`
-- `test_ambiguous_prepared_effect_is_never_reissued`
-- `test_control_plane_lease_survives_host_restart_and_fences_stale_worker`
-- `test_takeover_fences_old_completion_and_reconciles_crash_as_ambiguous`
-- `test_concurrent_logical_duplicates_reserve_exactly_once`
+- `services/control-plane/tests/test_background_jobs.py::test_expired_takeover_recovers_checkpoint_and_fences_old_worker`
+- `services/control-plane/tests/test_background_jobs.py::test_effect_intent_result_and_checkpoint_are_fenced_and_idempotent`
+- `services/control-plane/tests/test_background_jobs.py::test_restart_reconciles_prepared_effect_without_duplicate_execution`
+- `services/control-plane/tests/test_background_jobs.py::test_ambiguous_prepared_effect_is_never_reissued`
+- `services/control-plane/tests/test_host_gateway.py::test_control_plane_lease_survives_host_restart_and_fences_stale_worker`
+- `services/host-agent/tests/test_journal.py::test_takeover_fences_old_completion_and_reconciles_crash_as_ambiguous`
+- `services/host-agent/tests/test_journal.py::test_concurrent_logical_duplicates_reserve_exactly_once`
 
 Required live observation:
 
@@ -366,11 +391,11 @@ the live restart check as blocked, which produces `NO-GO` until resolved.
 
 Required automated coverage:
 
-- `test_cancellation_fences_jobs_grants_and_late_results`
-- `test_cancellation_closes_pending_approval_before_resource_fence`
-- `test_out_of_order_and_cancelled_events_are_durably_fenced`
-- `test_cancellation_cannot_overwrite_a_timed_out_run`
-- `test_exact_owned_group_is_terminated_once_and_replayed`
+- `services/control-plane/tests/test_reliability.py::test_cancellation_fences_jobs_grants_and_late_results`
+- `services/control-plane/tests/test_reliability.py::test_cancellation_closes_pending_approval_before_resource_fence`
+- `services/control-plane/tests/test_hermes.py::test_out_of_order_and_cancelled_events_are_durably_fenced`
+- `services/control-plane/tests/test_hermes.py::test_cancellation_cannot_overwrite_a_timed_out_run`
+- `services/host-agent/tests/test_processes.py::test_exact_owned_group_is_terminated_once_and_replayed`
 
 Required live observations on disposable companion tasks:
 
@@ -385,12 +410,12 @@ owned workspace/processes.
 
 Required automated coverage:
 
-- `test_hermes_outage_uses_bounded_background_job_retry`
-- `test_host_outage_is_evidenced_as_ambiguous_before_retry`
-- `test_worker_escalates_exhausted_dependency_outage`
-- `test_outage_exhaustion_escalates_and_retry_creates_new_job_generation`
-- `test_startup_recovers_expired_lease_and_all_external_target_kinds`
-- `test_publisher_reconciles_an_ambiguous_create_without_duplication`
+- `services/control-plane/tests/test_hermes.py::test_hermes_outage_uses_bounded_background_job_retry`
+- `services/control-plane/tests/test_code_change_execution.py::test_host_outage_is_evidenced_as_ambiguous_before_retry`
+- `services/control-plane/tests/test_background_jobs.py::test_worker_escalates_exhausted_dependency_outage`
+- `services/control-plane/tests/test_reliability.py::test_outage_exhaustion_escalates_and_retry_creates_new_job_generation`
+- `services/control-plane/tests/test_reliability.py::test_startup_recovers_expired_lease_and_all_external_target_kinds`
+- `services/control-plane/tests/test_draft_pull_requests.py::test_publisher_reconciles_an_ambiguous_create_without_duplication`
 
 Required live observations, using bounded and reversible dependency blocking:
 
@@ -400,8 +425,12 @@ Required live observations, using bounded and reversible dependency blocking:
 2. Make the host socket unavailable for a disposable task, restore the
    LaunchAgent, and confirm the same resumable behavior without duplicate host
    mutation.
-3. Make GitHub unavailable at a pre-PR or observation checkpoint, restore it,
-   and confirm reconciliation creates or observes exactly one PR/effect.
+3. Make GitHub unavailable at a pre-PR checkpoint, restore it, and confirm
+   reconciliation creates exactly one draft PR and one corresponding durable
+   effect.
+4. Make GitHub unavailable at a post-PR observation checkpoint, restore it, and
+   confirm reconciliation finds the existing draft PR and its one corresponding
+   durable effect without creating another PR or effect.
 
 Record outage-attempt IDs, retry counts, escalation approval IDs, old/new job
 generation IDs, and recovery result. Never simulate an outage by corrupting a
@@ -411,13 +440,13 @@ credential or changing durable rows.
 
 Required automated coverage:
 
-- `test_duplicate_delivery_replays_without_duplicate_event_or_job`
-- `test_stale_and_old_head_deliveries_are_audited_without_regression`
-- `test_review_updates_cockpit_and_unknown_events_are_quarantined`
-- `test_reused_delivery_id_with_different_body_is_a_conflict`
-- `test_ambiguous_exact_correlation_is_quarantined`
-- `test_unreadable_committed_receipt_is_quarantined_without_blocking_drain`
-- `test_synchronized_pr_head_wakes_reconciliation_and_invalidates_projection`
+- `services/control-plane/tests/test_github_webhooks.py::test_duplicate_delivery_replays_without_duplicate_event_or_job`
+- `services/control-plane/tests/test_github_webhooks.py::test_stale_and_old_head_deliveries_are_audited_without_regression`
+- `services/control-plane/tests/test_github_webhooks.py::test_review_updates_cockpit_and_unknown_events_are_quarantined`
+- `services/control-plane/tests/test_github_webhooks.py::test_reused_delivery_id_with_different_body_is_a_conflict`
+- `services/control-plane/tests/test_github_webhooks.py::test_ambiguous_exact_correlation_is_quarantined`
+- `services/control-plane/tests/test_github_webhooks.py::test_unreadable_committed_receipt_is_quarantined_without_blocking_drain`
+- `services/control-plane/tests/test_github_webhooks.py::test_synchronized_pr_head_wakes_reconciliation_and_invalidates_projection`
 
 Required live observation:
 
@@ -431,13 +460,13 @@ Required live observation:
 
 Required automated coverage:
 
-- `test_capture_rejects_any_inexact_host_binding_before_writing_artifact`
-- `test_rejects_mismatched_host_head_without_partial_records`
-- `test_immutable_gate_reloads_exact_passing_run_and_all_four_heads`
-- `test_verified_draft_gate_rejects_every_mismatched_dimension`
-- `test_readiness_requires_every_current_head_gate`
-- `test_head_change_discards_prior_check_success`
-- `test_handoff_is_explicit_idempotent_and_never_means_merged`
+- `services/control-plane/tests/test_repository_configuration.py::test_capture_rejects_any_inexact_host_binding_before_writing_artifact`
+- `services/control-plane/tests/test_validation_evidence.py::test_rejects_mismatched_host_head_without_partial_records`
+- `services/control-plane/tests/test_draft_pull_requests.py::test_immutable_gate_reloads_exact_passing_run_and_all_four_heads`
+- `services/control-plane/tests/test_task_state_machine.py::test_verified_draft_gate_rejects_every_mismatched_dimension`
+- `services/control-plane/tests/test_task_state_machine.py::test_readiness_requires_every_current_head_gate`
+- `services/control-plane/tests/test_readiness.py::test_head_change_discards_prior_check_success`
+- `services/control-plane/tests/test_readiness.py::test_handoff_is_explicit_idempotent_and_never_means_merged`
 
 Required live observation:
 
@@ -549,7 +578,10 @@ Copy this section to `MVP_RELEASE_GATE_REPORT.md` for the actual run.
 - Task ID:
 - Intake event/evidence IDs:
 - Accepted brief ID/version:
-- Approval decision ID:
+- Authorization outcome type: APPROVAL | POLICY_BYPASS
+- Approval decision ID, when selected:
+- Policy bypass ID/version, when selected:
+- Authorization's accepted brief and active policy bindings:
 - Workspace and lease IDs:
 - Hermes run ID and version bindings:
 - Candidate commit/tree SHAs:
@@ -564,22 +596,15 @@ Copy this section to `MVP_RELEASE_GATE_REPORT.md` for the actual run.
 - Final state:
 - Proof that no merge/release/deployment occurred:
 
-## Safety and recovery matrix
+## Safety and recovery evidence
 
-| Requirement | Automated evidence | Live evidence | Result | Notes/defect |
-| --- | --- | --- | --- | --- |
-| Authentication and reauthentication | | | | |
-| Redaction and access control | | | | |
-| Correction, deletion, tombstones | | | | |
-| Lease expiry and fencing | | | | |
-| Restart and duplicate-effect prevention | | | | |
-| Hermes cancellation | | | | |
-| Host-operation cancellation | | | | |
-| Hermes outage and resume | | | | |
-| Host outage and resume | | | | |
-| GitHub outage and reconciliation | | | | |
-| Webhook ordering/idempotency/ambiguity | | | | |
-| Exact commit/tree/config/contract/head binding | | | | |
+Add one row for every required automated test node ID and every required live
+observation. Do not combine rows.
+
+| Evidence type | Exact test node ID or live observation | Mathews SHA | Command/time | Result | Evidence/defect |
+| --- | --- | --- | --- | --- | --- |
+| AUTOMATED_TEST | | | | | |
+| LIVE_OBSERVATION | | | | | |
 
 ## Exact-proof reconciliation
 
@@ -592,6 +617,12 @@ Copy this section to `MVP_RELEASE_GATE_REPORT.md` for the actual run.
 | Remote branch/PR head | | | |
 | PR head/CI and review | | | |
 | PR head/readiness/handoff | | | |
+| Validation contract ID/version/digest | | | |
+| Repository configuration ID/version/digest | | | |
+| Policy and prompt bindings | | | |
+| Accepted brief/single authorization outcome | | | |
+| Recent authentication for protected decisions | | | |
+| Duplicate or unauthorized effects | | | |
 
 ## Deviations and defects
 
