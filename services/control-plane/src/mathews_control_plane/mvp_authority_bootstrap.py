@@ -36,12 +36,15 @@ from mathews_control_plane.policy_activation import (
     lock_policy_promotion,
     policy_fingerprint,
 )
-from mathews_control_plane.principals import LOCAL_OWNER_ID
+from mathews_control_plane.principals import (
+    LOCAL_OWNER_ID,
+    MVP_AUTHORITY_BOOTSTRAP_ACTOR,
+)
 from mathews_control_plane.prompt_compiler import PromptRole, StructuredPromptTemplate
 from mathews_control_plane.review_rule_contract import executable_review_rule
 from mathews_control_plane.settings import Settings, settings
 
-BOOTSTRAP_ACTOR = "mathews-bootstrap-mvp-authority"
+BOOTSTRAP_ACTOR = MVP_AUTHORITY_BOOTSTRAP_ACTOR
 BOOTSTRAP_APPROVED_AT = datetime(2026, 8, 12, tzinfo=UTC)
 BOOTSTRAP_POLICY_LINEAGE = "mvp"
 BOOTSTRAP_NAMESPACE = UUID("b6bc2975-7883-41f7-83d7-efdb7a2f9bd5")
@@ -113,6 +116,64 @@ class MvpAuthorityDefinition:
     review_scope: dict[str, object]
     review_matcher: dict[str, object]
     review_provenance: dict[str, object]
+
+    @property
+    def proposed_rule(self) -> str:
+        return (
+            "Permit one formatter-labeled repair to the acceptance app's "
+            "ContentView.swift file only."
+        )
+
+    @property
+    def false_positive_risks(self) -> list[str]:
+        return ["A formatting classification could conceal a broader requested change."]
+
+    @property
+    def candidate_evaluation(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "eligible": True,
+            "source": "MVP_RELEASE_GATE_RUNBOOK.md",
+            "review_rule": {
+                "lineage_key": "mvp-format-content-view",
+                "scope": self.review_scope,
+                "matcher": self.review_matcher,
+                "permitted_action": "repair.format",
+                "risk_class": "LOW",
+                "evidence_requirements": list(_REVIEW_EVIDENCE),
+            },
+        }
+
+    @property
+    def request_fingerprint(self) -> str:
+        return canonical_fingerprint(
+            {
+                "candidate_id": str(self.candidate_id),
+                "repository": self.repository,
+                "review_rule_fingerprint": self.review_rule_fingerprint,
+            }
+        )
+
+    @property
+    def precondition_fingerprint(self) -> str:
+        return canonical_fingerprint(
+            {
+                "policy_lineage": BOOTSTRAP_POLICY_LINEAGE,
+                "expected_version": 1,
+                "existing_policy": None,
+            }
+        )
+
+    @property
+    def decision_fingerprint(self) -> str:
+        return canonical_fingerprint(
+            {
+                "request_fingerprint": self.request_fingerprint,
+                "decision": "APPROVE",
+                "decided_by": LOCAL_OWNER_ID,
+                "decided_at": BOOTSTRAP_APPROVED_AT.isoformat(),
+            }
+        )
 
     @property
     def review_rule_fingerprint(self) -> str:
@@ -247,7 +308,7 @@ def mvp_authority_definition(repository: str) -> MvpAuthorityDefinition:
             _stable_id(f"membership:prompt:{position}") for position in range(1, len(prompts) + 1)
         ),
         prompts=prompts,
-        workflow_thresholds=_workflow_thresholds(),
+        workflow_thresholds=_workflow_thresholds(repository),
         review_scope={
             "path_prefixes": ["mathews-ios-acceptance/ContentView.swift"],
             "max_files": 1,
@@ -356,57 +417,18 @@ class MvpAuthorityBootstrapService:
         candidate = RuleCandidate(
             id=definition.candidate_id,
             task_id=task.id,
-            proposed_rule=(
-                "Permit one formatter-labeled repair to the acceptance app's "
-                "ContentView.swift file only."
-            ),
+            proposed_rule=definition.proposed_rule,
             cited_evidence_ids=[],
             recurrence_assessment="Initial release-gate control; no recurrence claim.",
             severity_assessment="LOW",
-            false_positive_risks=[
-                "A formatting classification could conceal a broader requested change."
-            ],
-            evaluation_result={
-                "schema_version": 1,
-                "eligible": True,
-                "source": "MVP_RELEASE_GATE_RUNBOOK.md",
-                "review_rule": {
-                    "lineage_key": "mvp-format-content-view",
-                    "scope": definition.review_scope,
-                    "matcher": definition.review_matcher,
-                    "permitted_action": "repair.format",
-                    "risk_class": "LOW",
-                    "evidence_requirements": list(_REVIEW_EVIDENCE),
-                },
-            },
+            false_positive_risks=definition.false_positive_risks,
+            evaluation_result=definition.candidate_evaluation,
             status=RuleCandidateStatus.APPROVED,
             **_record_context(definition.audit_task_id, causation_id=task.id),
         )
         session.add(candidate)
         session.flush()
 
-        request_fingerprint = canonical_fingerprint(
-            {
-                "candidate_id": str(candidate.id),
-                "repository": definition.repository,
-                "review_rule_fingerprint": definition.review_rule_fingerprint,
-            }
-        )
-        precondition_fingerprint = canonical_fingerprint(
-            {
-                "policy_lineage": BOOTSTRAP_POLICY_LINEAGE,
-                "expected_version": 1,
-                "existing_policy": None,
-            }
-        )
-        decision_fingerprint = canonical_fingerprint(
-            {
-                "request_fingerprint": request_fingerprint,
-                "decision": "APPROVE",
-                "decided_by": LOCAL_OWNER_ID,
-                "decided_at": BOOTSTRAP_APPROVED_AT.isoformat(),
-            }
-        )
         approval = ApprovalRequest(
             id=definition.approval_request_id,
             task_id=task.id,
@@ -419,8 +441,8 @@ class MvpAuthorityBootstrapService:
             requesting_state=TaskState.INTAKE,
             expires_at=None,
             status=ApprovalStatus.APPROVED,
-            request_fingerprint=request_fingerprint,
-            precondition_fingerprint=precondition_fingerprint,
+            request_fingerprint=definition.request_fingerprint,
+            precondition_fingerprint=definition.precondition_fingerprint,
             resume_state=TaskState.INTAKE,
             blocked_operation={
                 "operation": "bootstrap-review-rule",
@@ -429,7 +451,7 @@ class MvpAuthorityBootstrapService:
             retry_history=[],
             decision="APPROVE",
             decision_id=definition.approval_decision_id,
-            decision_fingerprint=decision_fingerprint,
+            decision_fingerprint=definition.decision_fingerprint,
             decided_by=LOCAL_OWNER_ID,
             decided_at=BOOTSTRAP_APPROVED_AT,
             **_record_context(definition.audit_task_id, causation_id=candidate.id),
@@ -619,8 +641,12 @@ def _prompt_template(role: PromptRole) -> StructuredPromptTemplate:
     )
 
 
-def _workflow_thresholds() -> dict[str, object]:
+def _workflow_thresholds(repository: str) -> dict[str, object]:
     return {
+        "repository_authority": {
+            "schema_version": 1,
+            "repository": repository,
+        },
         "brief_approval_policy": {
             "schema_version": 1,
             "preallowed_operations": ["inspect", "edit", "test"],
@@ -670,41 +696,6 @@ def _support_records_match(
     candidate: RuleCandidate | None,
     approval: ApprovalRequest | None,
 ) -> bool:
-    expected_candidate_evaluation = {
-        "schema_version": 1,
-        "eligible": True,
-        "source": "MVP_RELEASE_GATE_RUNBOOK.md",
-        "review_rule": {
-            "lineage_key": "mvp-format-content-view",
-            "scope": definition.review_scope,
-            "matcher": definition.review_matcher,
-            "permitted_action": "repair.format",
-            "risk_class": "LOW",
-            "evidence_requirements": list(_REVIEW_EVIDENCE),
-        },
-    }
-    request_fingerprint = canonical_fingerprint(
-        {
-            "candidate_id": str(definition.candidate_id),
-            "repository": definition.repository,
-            "review_rule_fingerprint": definition.review_rule_fingerprint,
-        }
-    )
-    precondition_fingerprint = canonical_fingerprint(
-        {
-            "policy_lineage": BOOTSTRAP_POLICY_LINEAGE,
-            "expected_version": 1,
-            "existing_policy": None,
-        }
-    )
-    decision_fingerprint = canonical_fingerprint(
-        {
-            "request_fingerprint": request_fingerprint,
-            "decision": "APPROVE",
-            "decided_by": LOCAL_OWNER_ID,
-            "decided_at": BOOTSTRAP_APPROVED_AT.isoformat(),
-        }
-    )
     return bool(
         task is not None
         and task.repository == definition.repository
@@ -716,17 +707,12 @@ def _support_records_match(
         and task.actor_id == BOOTSTRAP_ACTOR
         and candidate is not None
         and candidate.task_id == task.id
-        and candidate.proposed_rule
-        == (
-            "Permit one formatter-labeled repair to the acceptance app's "
-            "ContentView.swift file only."
-        )
+        and candidate.proposed_rule == definition.proposed_rule
         and candidate.cited_evidence_ids == []
         and candidate.recurrence_assessment == "Initial release-gate control; no recurrence claim."
         and candidate.severity_assessment == "LOW"
-        and candidate.false_positive_risks
-        == ["A formatting classification could conceal a broader requested change."]
-        and candidate.evaluation_result == expected_candidate_evaluation
+        and candidate.false_positive_risks == definition.false_positive_risks
+        and candidate.evaluation_result == definition.candidate_evaluation
         and candidate.status is RuleCandidateStatus.APPROVED
         and candidate.owner_id == LOCAL_OWNER_ID
         and candidate.actor_id == BOOTSTRAP_ACTOR
@@ -741,8 +727,8 @@ def _support_records_match(
         and approval.requesting_state is TaskState.INTAKE
         and approval.expires_at is None
         and approval.status is ApprovalStatus.APPROVED
-        and approval.request_fingerprint == request_fingerprint
-        and approval.precondition_fingerprint == precondition_fingerprint
+        and approval.request_fingerprint == definition.request_fingerprint
+        and approval.precondition_fingerprint == definition.precondition_fingerprint
         and approval.resume_state is TaskState.INTAKE
         and approval.blocked_operation
         == {
@@ -752,7 +738,7 @@ def _support_records_match(
         and approval.retry_history == []
         and approval.decision == "APPROVE"
         and approval.decision_id == definition.approval_decision_id
-        and approval.decision_fingerprint == decision_fingerprint
+        and approval.decision_fingerprint == definition.decision_fingerprint
         and approval.decided_by == LOCAL_OWNER_ID
         and _as_utc(approval.decided_at) == BOOTSTRAP_APPROVED_AT
         and approval.owner_id == LOCAL_OWNER_ID
@@ -842,6 +828,9 @@ def _record_context(root_id: UUID, *, causation_id: UUID | None = None) -> dict[
 
 def _serialize_initial_policy(session: Session) -> None:
     if session.get_bind().dialect.name == "sqlite":
+        # This must remain the bootstrap transaction's first database statement.
+        # Keeping BEGIN IMMEDIATE local avoids changing every SQLite reader into
+        # an eager writer while concurrent bootstrap calls wait for this lock.
         session.connection().exec_driver_sql("BEGIN IMMEDIATE")
     lock_policy_promotion(session, BOOTSTRAP_POLICY_LINEAGE)
 
@@ -905,12 +894,11 @@ def main() -> None:
     engine = None
     try:
         if args.dry_run:
+            definition = mvp_authority_definition(repository)
             snapshot = MvpAuthoritySnapshot(
-                definition=mvp_authority_definition(repository),
+                definition=definition,
                 operation="dry-run",
-                policy_fingerprint=_expected_policy_fingerprint(
-                    mvp_authority_definition(repository)
-                ),
+                policy_fingerprint=_expected_policy_fingerprint(definition),
             )
         else:
             engine = create_database_engine(settings.database_url)

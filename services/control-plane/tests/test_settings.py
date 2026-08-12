@@ -88,6 +88,8 @@ def test_relative_repository_root_is_rejected() -> None:
         "git@github.com:boppuh/mathews",
         "boppuh/mathews.git",
         "boppuh//mathews",
+        "boppuh-/mathews",
+        "boppuh--team/mathews",
     ),
 )
 def test_invalid_or_ambiguous_github_repository_names_are_rejected(

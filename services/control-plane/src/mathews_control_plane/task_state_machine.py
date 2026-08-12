@@ -33,6 +33,7 @@ from mathews_control_plane.evidence import (
     load_evidence,
     redact_evidence_content,
 )
+from mathews_control_plane.policy_activation import policy_authorizes_repository
 from mathews_control_plane.readiness_contract import HANDOFF_MEANING
 
 TASK_TRANSITION_EVENT_TYPE = "TASK_STATE_TRANSITION"
@@ -565,7 +566,7 @@ def _active_policy(
         .limit(1)
         .with_for_update()
     )
-    if policy is None:
+    if policy is None or not policy_authorizes_repository(policy, task.repository):
         raise TaskTransitionNotFoundError("active policy version is unavailable")
     return policy
 

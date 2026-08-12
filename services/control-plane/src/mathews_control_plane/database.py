@@ -1,4 +1,4 @@
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
@@ -128,11 +128,15 @@ def _enable_sqlite_foreign_keys(
         cursor.close()
 
 
-def create_database_engine(database_url: str | SecretStr) -> Engine:
+def create_database_engine(
+    database_url: str | SecretStr,
+    *,
+    connect_args: Mapping[str, object] | None = None,
+) -> Engine:
     """Create a lazy SQLAlchemy engine without opening a database connection."""
 
     url = database_url.get_secret_value() if isinstance(database_url, SecretStr) else database_url
-    engine = create_engine(url, pool_pre_ping=True)
+    engine = create_engine(url, pool_pre_ping=True, connect_args=dict(connect_args or {}))
     if engine.dialect.name == "sqlite":
         event.listen(engine, "connect", _enable_sqlite_foreign_keys)
     return engine

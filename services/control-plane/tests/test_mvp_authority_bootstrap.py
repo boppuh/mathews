@@ -1,12 +1,13 @@
 import json
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.authentication import AuthenticatedSession
 from mathews_control_plane.briefing import (
     AcceptanceCriterion,
     AffectedUserFlow,
@@ -41,8 +42,15 @@ from mathews_control_plane.mvp_authority_bootstrap import (
     MvpAuthorityBootstrapService,
     mvp_authority_definition,
 )
-from mathews_control_plane.prompt_compiler import PromptCompilerService, PromptRole
-from mathews_control_plane.readiness import _active_policy as readiness_active_policy
+from mathews_control_plane.prompt_compiler import (
+    PromptCompilerService,
+    PromptNotFoundError,
+    PromptRole,
+)
+from mathews_control_plane.readiness import ReadinessError
+from mathews_control_plane.readiness import (
+    _active_policy as readiness_active_policy,
+)
 from mathews_control_plane.review_resolution import (
     ReviewClassification,
     ReviewComment,
@@ -52,6 +60,7 @@ from mathews_control_plane.review_resolution import (
     _rule_matches,
     _unsafe_reason,
 )
+from mathews_control_plane.tasks import TaskNotFoundError, TaskService
 from sqlalchemy import Engine, func, select
 
 _REPOSITORY = "boppuh/mathews-ios-acceptance"
@@ -60,7 +69,10 @@ _NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
 
 @pytest.fixture
 def bootstrap_database(tmp_path: Path) -> Iterator[tuple[Engine, MvpAuthorityBootstrapService]]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'bootstrap.sqlite3'}")
+    engine = create_database_engine(
+        f"sqlite:///{tmp_path / 'bootstrap.sqlite3'}",
+        connect_args={"timeout": 30.0},
+    )
     Base.metadata.create_all(engine)
     service = MvpAuthorityBootstrapService(create_session_factory(engine), repository=_REPOSITORY)
     try:
@@ -252,6 +264,59 @@ def test_policy_is_consumable_by_briefing_prompts_review_and_readiness(
             rationale="Bounded formatting repair.",
         ),
     )
+
+
+def test_repository_bound_policy_fails_closed_for_a_different_task_repository(
+    bootstrap_database: tuple[Engine, MvpAuthorityBootstrapService],
+    tmp_path: Path,
+) -> None:
+    engine, service = bootstrap_database
+    definition = service.bootstrap().definition
+    factory = create_session_factory(engine)
+    with factory.begin() as session:
+        task = session.get(Task, definition.audit_task_id)
+        assert task is not None
+        task.repository = "boppuh/different-repository"
+
+    with factory() as session:
+        task = session.get(Task, definition.audit_task_id)
+        assert task is not None
+        with pytest.raises(ReadinessError, match="READINESS_POLICY_UNAVAILABLE"):
+            readiness_active_policy(session, task, lineage_key="mvp", now=_NOW)
+    with pytest.raises(PromptNotFoundError, match="policy version is unavailable"):
+        PromptCompilerService(
+            factory,
+            ArtifactStore(tmp_path / "artifacts"),
+            clock=lambda: _NOW,
+        ).compile(definition.audit_task_id, role=PromptRole.PLANNER)
+
+
+def test_bootstrap_audit_task_is_hidden_and_not_operable(
+    bootstrap_database: tuple[Engine, MvpAuthorityBootstrapService],
+    tmp_path: Path,
+) -> None:
+    engine, service = bootstrap_database
+    definition = service.bootstrap().definition
+    now = datetime.now(UTC)
+    authentication = AuthenticatedSession(
+        session_id=uuid4(),
+        user_id=1,
+        csrf_token_digest=b"0" * 32,
+        expires_at=now + timedelta(hours=1),
+        absolute_expires_at=now + timedelta(hours=1),
+        reauthenticated_until=now + timedelta(hours=1),
+        evaluated_at=now,
+        recent_password_verified=True,
+    )
+    tasks = TaskService(
+        create_session_factory(engine),
+        ArtifactStore(tmp_path / "artifacts"),
+        repository_key=_REPOSITORY,
+    )
+
+    assert tasks.list(authentication).tasks == []
+    with pytest.raises(TaskNotFoundError, match="task is unavailable"):
+        tasks.detail(definition.audit_task_id, authentication)
 
 
 def test_dry_run_and_output_are_non_secret_and_omit_prompt_bodies(

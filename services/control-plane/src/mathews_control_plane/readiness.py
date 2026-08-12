@@ -44,6 +44,7 @@ from mathews_control_plane.github_webhooks import (
     GITHUB_PULL_REQUEST_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
 )
+from mathews_control_plane.policy_activation import policy_authorizes_repository
 from mathews_control_plane.readiness_contract import (
     HANDOFF_ACKNOWLEDGEMENT,
     HANDOFF_MEANING,
@@ -969,7 +970,7 @@ def _active_policy(
         .order_by(PolicyVersion.version.desc())
         .limit(1)
     )
-    if policy is None:
+    if policy is None or not policy_authorizes_repository(policy, task.repository):
         raise ReadinessError("READINESS_POLICY_UNAVAILABLE")
     return policy
 

@@ -982,6 +982,28 @@ def test_create_rejects_a_valid_repository_outside_configured_authority(
         assert session.scalar(select(func.count()).select_from(Task)) == 0
 
 
+def test_create_reports_missing_canonical_repository_as_unavailable(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+    task_harness.task_service._repository_key = None
+
+    response = task_harness.client.post(
+        "/api/tasks",
+        json={
+            "repository": "boppuh/mathews",
+            "base_revision": _BASE_SHA,
+            "request": "Create a task.",
+        },
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "canonical repository is not configured"}
+    with task_harness.factory() as session:
+        assert session.scalar(select(func.count()).select_from(Task)) == 0
+
+
 def test_create_rejects_oversized_body_before_parsing(
     task_harness: TaskHarness,
 ) -> None:

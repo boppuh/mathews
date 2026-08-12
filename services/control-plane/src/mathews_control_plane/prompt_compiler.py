@@ -41,6 +41,7 @@ from mathews_control_plane.policy_activation import (
     activation_time,
     canonical_fingerprint,
     lock_policy_promotion,
+    policy_authorizes_repository,
     record_policy_activation,
     require_human_policy_authorization,
 )
@@ -273,6 +274,8 @@ class PromptCompilerService:
                     or _as_utc(policy.approved_at) > now
                 ):
                     raise PromptNotFoundError("policy version is unavailable")
+            if not policy_authorizes_repository(policy, task.repository):
+                raise PromptNotFoundError("policy version is unavailable")
             default = _default_prompt(session, policy.id, role)
             selected = (
                 default if template_id is None else session.get(PromptTemplateVersion, template_id)

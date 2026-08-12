@@ -23,7 +23,8 @@ The initial trust anchor is attributed to local owner `local-user` and actor
 task, evaluated rule candidate, and approved review-rule request because the
 existing executable-rule schema requires that complete approval lineage. These
 records are support evidence; they do not authorize repository mutation by
-themselves.
+themselves. The task API excludes the bootstrap actor's audit context from queue,
+detail, steering, cancellation, handoff, and event operations.
 
 All record and membership IDs are deterministic for this bootstrap version.
 Canonical SHA-256 fingerprints cover the intended definition. The first run is
@@ -103,3 +104,12 @@ URLs, Keychain references, credentials, and tokens. A representative shape is:
 Record the real output IDs and fingerprints in Phase 0 of the release-gate
 working report. Do not copy database connection details or any credential value
 into that report.
+
+## Runtime boundary
+
+Bootstrap installs durable authority; it does not install an automatic review
+classifier or the host, validation, and publishing adapters required by a
+`ReviewResolutionJobHandler`. The default worker therefore continues to classify
+reviews conservatively and escalate them unless those runtime components are
+configured together. This preserves fail-closed behavior while the hosted iOS
+acceptance harness remains a separate release-gate prerequisite.

@@ -154,6 +154,10 @@ class Settings(BaseSettings):
     def github_repository_is_canonical(cls, value: str | None) -> str | None:
         if value is not None and value.endswith(".git"):
             raise ValueError("GitHub repository name must not use a transport suffix")
+        if value is not None:
+            owner, _repository = value.split("/", maxsplit=1)
+            if owner.endswith("-") or "--" in owner:
+                raise ValueError("GitHub repository owner is not canonical")
         return value
 
     @field_validator("artifact_root", "host_socket_path")
