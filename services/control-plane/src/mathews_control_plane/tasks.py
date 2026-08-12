@@ -58,7 +58,10 @@ from mathews_control_plane.github_webhooks import (
     GITHUB_PULL_REQUEST_UPDATED_EVENT,
     GITHUB_REVIEW_UPDATED_EVENT,
 )
-from mathews_control_plane.principals import LOCAL_OWNER_ID
+from mathews_control_plane.principals import (
+    LOCAL_OWNER_ID,
+    MVP_AUTHORITY_BOOTSTRAP_ACTOR,
+)
 from mathews_control_plane.readiness import (
     HandoffResult,
     ReadinessError,
@@ -125,6 +128,18 @@ Clock = Callable[[], datetime]
 
 class TaskAccessError(RuntimeError):
     """The authenticated principal is not a supported local task owner."""
+
+
+class TaskRepositoryError(RuntimeError):
+    """Task intake is outside the one configured repository authority."""
+
+
+class TaskRepositoryNotConfiguredError(TaskRepositoryError):
+    """Task intake cannot start without a canonical repository."""
+
+
+class TaskRepositoryMismatchError(TaskRepositoryError):
+    """Task intake names a repository outside configured authority."""
 
 
 class TaskCreateRequest(BaseModel):
@@ -404,10 +419,12 @@ class TaskService:
         session_factory: SessionFactory,
         artifact_store: ArtifactStore,
         *,
+        repository_key: str | None,
         clock: Clock | None = None,
     ) -> None:
         self._factory = session_factory
         self._artifact_store = artifact_store
+        self._repository_key = repository_key
         self._clock = clock or (lambda: datetime.now(UTC))
         self._steering = SteeringService(
             session_factory,
@@ -426,6 +443,14 @@ class TaskService:
         authentication: AuthenticatedSession,
     ) -> TaskSummaryResponse:
         owner_id = _principal(authentication)
+        if self._repository_key is None:
+            raise TaskRepositoryNotConfiguredError(
+                "canonical repository is not configured"
+            )
+        if body.repository != self._repository_key:
+            raise TaskRepositoryMismatchError(
+                "task repository is outside configured authority"
+            )
         occurred_at = _as_utc(self._clock())
         summary = _request_summary(body.request)
 
@@ -495,7 +520,10 @@ class TaskService:
                         "last_activity_at"
                     ),
                 )
-                .where(Task.owner_id == owner_id)
+                .where(
+                    Task.owner_id == owner_id,
+                    Task.actor_id != MVP_AUTHORITY_BOOTSTRAP_ACTOR,
+                )
                 .order_by(
                     func.coalesce(last_event_at, Task.updated_at).desc(),
                     Task.id.desc(),
@@ -521,6 +549,7 @@ class TaskService:
         authentication: AuthenticatedSession,
     ) -> TaskSteeringResponse:
         owner_id = _principal(authentication)
+        self._require_operable_task(task_id, owner_id)
         result: SteeringResult = self._steering.steer(
             task_id,
             steering_id=body.steering_id,
@@ -562,7 +591,11 @@ class TaskService:
             raise PermissionError("recent password authentication required")
         with self._factory() as session:
             task = session.scalar(
-                select(Task).where(Task.id == task_id, Task.owner_id == owner_id)
+                select(Task).where(
+                    Task.id == task_id,
+                    Task.owner_id == owner_id,
+                    Task.actor_id != MVP_AUTHORITY_BOOTSTRAP_ACTOR,
+                )
             )
         if task is None:
             raise TaskNotFoundError("task is unavailable")
@@ -603,7 +636,11 @@ class TaskService:
             raise PermissionError("recent password authentication required")
         with self._factory() as session:
             task = session.scalar(
-                select(Task).where(Task.id == task_id, Task.owner_id == owner_id)
+                select(Task).where(
+                    Task.id == task_id,
+                    Task.owner_id == owner_id,
+                    Task.actor_id != MVP_AUTHORITY_BOOTSTRAP_ACTOR,
+                )
             )
         if task is None:
             raise TaskNotFoundError("task is unavailable")
@@ -636,6 +673,7 @@ class TaskService:
                 select(Task).where(
                     Task.id == task_id,
                     Task.owner_id == owner_id,
+                    Task.actor_id != MVP_AUTHORITY_BOOTSTRAP_ACTOR,
                 )
             )
             if task is None:
@@ -792,6 +830,7 @@ class TaskService:
                 select(Task.id).where(
                     Task.id == task_id,
                     Task.owner_id == owner_id,
+                    Task.actor_id != MVP_AUTHORITY_BOOTSTRAP_ACTOR,
                 )
             )
             if task_exists is None:
@@ -819,6 +858,18 @@ class TaskService:
                 )
                 for event in events
             ]
+
+    def _require_operable_task(self, task_id: UUID, owner_id: str) -> None:
+        with self._factory() as session:
+            task_exists = session.scalar(
+                select(Task.id).where(
+                    Task.id == task_id,
+                    Task.owner_id == owner_id,
+                    Task.actor_id != MVP_AUTHORITY_BOOTSTRAP_ACTOR,
+                )
+            )
+        if task_exists is None:
+            raise TaskNotFoundError("task is unavailable")
 
 
 def _principal(authentication: AuthenticatedSession) -> str:
@@ -2027,6 +2078,16 @@ def create_task_router(service: TaskService) -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="tasks unavailable",
+            ) from None
+        except TaskRepositoryNotConfiguredError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="canonical repository is not configured",
+            ) from None
+        except TaskRepositoryMismatchError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="task repository does not match the configured repository",
             ) from None
 
     return router

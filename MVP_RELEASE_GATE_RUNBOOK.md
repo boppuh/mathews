@@ -112,6 +112,7 @@ Create `.env` from `.env.example` when needed. Configure:
 
 - the local PostgreSQL connection and artifact root;
 - an absolute `MATHEWS_TARGET_REPOSITORY_ROOT`;
+- the exact canonical `MATHEWS_GITHUB_REPOSITORY` owner/repository name;
 - the Hermes endpoint;
 - the exact GitHub App, installation, and repository numeric IDs;
 - the private host socket and journal paths; and

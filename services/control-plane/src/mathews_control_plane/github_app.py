@@ -259,8 +259,6 @@ class VerifiedGitHubWebhook:
 
 def build_github_app_configuration(
     automation: AutomationConfiguration,
-    *,
-    repository_key: str,
 ) -> GitHubAppConfiguration:
     """Bind environment credentials to the versioned repository identity."""
 
@@ -268,7 +266,7 @@ def build_github_app_configuration(
         app_id=automation.github_app_id,
         installation_id=automation.github_installation_id,
         repository_id=automation.github_repository_id,
-        repository_key=repository_key,
+        repository_key=automation.github_repository,
         private_key_ref=automation.github_private_key_ref,
         webhook_secret_ref=automation.github_webhook_secret_ref,
     )

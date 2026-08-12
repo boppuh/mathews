@@ -16,6 +16,7 @@ def test_incomplete_configuration_blocks_automation() -> None:
         "host_auth_key_ref",
         "hermes_endpoint",
         "hermes_api_key_ref",
+        "github_repository",
         "github_app_id",
         "github_installation_id",
         "github_repository_id",
@@ -28,6 +29,7 @@ def test_incomplete_configuration_blocks_automation() -> None:
 
 
 def test_complete_configuration_returns_typed_snapshot(tmp_path: Path) -> None:
+    from mathews_control_plane.github_app import build_github_app_configuration
     from mathews_control_plane.settings import Settings
 
     settings = Settings(
@@ -39,6 +41,7 @@ def test_complete_configuration_returns_typed_snapshot(tmp_path: Path) -> None:
         ),
         hermes_endpoint=AnyHttpUrl("https://hermes.example.test"),
         hermes_api_key_ref=SecretReference.parse("keychain://com.boppuh.mathews.hermes/api-key"),
+        github_repository="boppuh/mathews-ios-acceptance",
         github_app_id=123,
         github_installation_id=456,
         github_repository_id=789,
@@ -59,9 +62,13 @@ def test_complete_configuration_returns_typed_snapshot(tmp_path: Path) -> None:
     assert configuration.host_auth_key_id == "host-control-plane-v1"
     assert str(configuration.hermes_endpoint) == "https://hermes.example.test/"
     assert configuration.github_app_id == 123
+    assert configuration.github_repository == "boppuh/mathews-ios-acceptance"
     assert configuration.github_repository_id == 789
     assert configuration.github_private_key_ref == SecretReference.parse(
         "keychain://com.boppuh.mathews.github-app/private-key"
+    )
+    assert build_github_app_configuration(configuration).repository_key == (
+        "boppuh/mathews-ios-acceptance"
     )
 
 
@@ -70,6 +77,37 @@ def test_relative_repository_root_is_rejected() -> None:
 
     with pytest.raises(ValidationError, match="absolute path"):
         Settings(target_repository_root=Path("relative/repository"))
+
+
+@pytest.mark.parametrize(
+    "repository",
+    (
+        "boppuh",
+        "boppuh/mathews/extra",
+        "https://github.com/boppuh/mathews",
+        "git@github.com:boppuh/mathews",
+        "boppuh/mathews.git",
+        "boppuh//mathews",
+        "boppuh-/mathews",
+        "boppuh--team/mathews",
+    ),
+)
+def test_invalid_or_ambiguous_github_repository_names_are_rejected(
+    repository: str,
+) -> None:
+    from mathews_control_plane.settings import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(github_repository=repository)
+
+
+def test_github_repository_name_is_normalized_and_safe_to_report() -> None:
+    from mathews_control_plane.settings import Settings
+
+    settings = Settings(github_repository=" BOPPUH/Mathews-iOS-Acceptance ")
+
+    assert settings.github_repository == "boppuh/mathews-ios-acceptance"
+    assert settings.safe_summary()["github_repository"] == ("boppuh/mathews-ios-acceptance")
 
 
 def test_blank_optional_environment_values_are_unconfigured(
@@ -82,6 +120,7 @@ def test_blank_optional_environment_values_are_unconfigured(
         "MATHEWS_HOST_AUTH_KEY_REF",
         "MATHEWS_HERMES_ENDPOINT",
         "MATHEWS_HERMES_API_KEY_REF",
+        "MATHEWS_GITHUB_REPOSITORY",
         "MATHEWS_GITHUB_APP_ID",
         "MATHEWS_GITHUB_INSTALLATION_ID",
         "MATHEWS_GITHUB_REPOSITORY_ID",
@@ -205,4 +244,5 @@ def test_example_environment_contains_references_not_raw_integration_secrets() -
     assert settings.hermes_api_key_ref is not None
     assert settings.github_private_key_ref is not None
     assert settings.github_webhook_secret_ref is not None
+    assert settings.github_repository == "boppuh/mathews-ios-acceptance"
     assert settings.automation_ready is False

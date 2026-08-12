@@ -70,6 +70,7 @@ from mathews_control_plane.github_webhooks import (
 )
 from mathews_control_plane.hermes_adapter import HermesJobInput, HermesJobPrompt
 from mathews_control_plane.host_gateway import authority_for_job_lease
+from mathews_control_plane.policy_activation import policy_authorizes_repository
 from mathews_control_plane.prompt_compiler import PromptCompilerService, PromptRole
 from mathews_control_plane.repository_configuration import (
     validated_repository_configuration,
@@ -1364,7 +1365,7 @@ def _active_policy(
         .order_by(PolicyVersion.version.desc())
         .limit(1)
     )
-    if policy is None:
+    if policy is None or not policy_authorizes_repository(policy, task.repository):
         raise ReviewResolutionError("REVIEW_POLICY_UNAVAILABLE")
     return policy
 

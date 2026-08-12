@@ -41,6 +41,15 @@ AuthenticatedPolicySession = Annotated[
 ]
 
 
+def policy_authorizes_repository(policy: PolicyVersion, repository: str) -> bool:
+    """Fail closed when a policy carries an exact repository authority binding."""
+
+    authority = policy.workflow_thresholds.get("repository_authority")
+    if authority is None:
+        return True
+    return authority == {"schema_version": 1, "repository": repository}
+
+
 class PolicyActivationError(RuntimeError):
     """Base class for stable controlled-policy failures."""
 

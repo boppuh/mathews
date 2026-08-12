@@ -38,6 +38,7 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
 )
+from mathews_control_plane.policy_activation import policy_authorizes_repository
 from mathews_control_plane.task_state_machine import (
     TaskTransitionGateEvaluator,
     TaskTransitionGuards,
@@ -815,7 +816,7 @@ def _active_policy(
         .limit(1)
         .with_for_update()
     )
-    if policy is None:
+    if policy is None or not policy_authorizes_repository(policy, task.repository):
         raise BriefingNotFoundError("active briefing policy is unavailable")
     return policy
 
