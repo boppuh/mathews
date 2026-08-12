@@ -8,18 +8,25 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, cast
 from uuid import UUID
 
+from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.authentication import AuthenticatedSession
 from mathews_control_plane.database import SessionFactory
 from mathews_control_plane.domain_models import (
+    AgentRunEvaluation,
     Brief,
+    EvaluationContractVersion,
     EvidenceRecord,
+    PolicyActivation,
+    PolicyActivationKind,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PolicyVersionReviewRule,
@@ -27,11 +34,22 @@ from mathews_control_plane.domain_models import (
     Task,
 )
 from mathews_control_plane.evidence import load_evidence
+from mathews_control_plane.policy_activation import (
+    AuthenticatedPolicySession,
+    PolicyActivationAuthorizationError,
+    PolicyActivationConflictError,
+    activation_time,
+    canonical_fingerprint,
+    lock_policy_promotion,
+    record_policy_activation,
+    require_human_policy_authorization,
+)
 
 PROMPT_TEMPLATE_SCHEMA_VERSION = 1
 MAX_EVIDENCE_REFERENCES = 20
 MAX_PROMPT_CHARACTERS = 32_000
 _LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
+_BASIS_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
 PromptInstruction = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=1_000),
@@ -75,6 +93,51 @@ class StructuredPromptTemplate(BaseModel):
         return value
 
 
+class PromptEvaluationBasis(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    retrieval_index_version: str = Field(min_length=1, max_length=100)
+    retrieval_chunker_version: str = Field(min_length=1, max_length=100)
+    retrieval_verifier_version: str = Field(min_length=1, max_length=100)
+    model_provider: str = Field(min_length=1, max_length=100)
+    model_name: str = Field(min_length=1, max_length=255)
+    model_version: str = Field(min_length=1, max_length=255)
+
+    @field_validator("*")
+    @classmethod
+    def basis_value_is_canonical(cls, value: str) -> str:
+        normalized = value.strip()
+        if _BASIS_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("evaluation basis value is invalid")
+        return normalized
+
+
+class PromptPromotionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    activation_id: UUID
+    promoted_prompt_id: UUID
+    policy_version_id: UUID
+    rollback_policy_version_id: UUID
+    candidate_version: int = Field(ge=1)
+    evaluation_contract_version_id: UUID
+    evaluation_basis: PromptEvaluationBasis
+    regression_reviewed: bool
+    activation_time: datetime
+
+
+class PromptPromotionResponse(BaseModel):
+    candidate_id: UUID
+    promoted_prompt_id: UUID
+    promoted_prompt_version: int
+    policy_version_id: UUID
+    policy_version: int
+    rollback_policy_version_id: UUID
+    activation_id: UUID
+    activated_at: datetime
+    replayed: bool
+
+
 @dataclass(frozen=True, slots=True)
 class CompiledPrompt:
     task_id: UUID
@@ -99,6 +162,8 @@ class PromptPromotionResult:
     policy_version_id: UUID
     policy_version: int
     rollback_policy_version_id: UUID
+    activation_id: UUID
+    activated_at: datetime
     replayed: bool
 
 
@@ -259,37 +324,51 @@ class PromptCompilerService:
         self,
         *,
         candidate_id: UUID,
+        candidate_version: int,
+        activation_id: UUID,
         promoted_prompt_id: UUID,
         policy_version_id: UUID,
-        evaluation_evidence_id: UUID,
-        evaluation_score: float,
+        rollback_policy_version_id: UUID,
+        evaluation_contract_version_id: UUID,
+        evaluation_basis: PromptEvaluationBasis,
         regression_reviewed: bool,
-        approved_by: str,
+        activation_time_value: datetime,
+        authentication: AuthenticatedSession,
     ) -> PromptPromotionResult:
-        now = _as_utc(self._clock())
-        approver = _required_text(approved_by, "human approver")
+        approver = require_human_policy_authorization(authentication)
+        now = activation_time(activation_time_value, now=self._clock())
         with self._factory() as session, session.begin():
             _begin_serialized(session)
+            lock_policy_promotion(session, self._policy_lineage)
             if (
                 session.get(PolicyVersion, policy_version_id) is not None
                 or session.get(PromptTemplateVersion, promoted_prompt_id) is not None
+                or session.get(PolicyActivation, activation_id) is not None
             ):
                 return _replayed_promotion(
                     session,
                     candidate_id=candidate_id,
+                    candidate_version=candidate_version,
+                    activation_id=activation_id,
                     promoted_prompt_id=promoted_prompt_id,
                     policy_version_id=policy_version_id,
-                    evaluation_evidence_id=evaluation_evidence_id,
-                    evaluation_score=evaluation_score,
+                    rollback_policy_version_id=rollback_policy_version_id,
+                    evaluation_contract_version_id=evaluation_contract_version_id,
+                    evaluation_basis=evaluation_basis,
                     regression_reviewed=regression_reviewed,
                     approved_by=approver,
+                    activated_at=now,
                 )
             candidate = session.scalar(
                 select(PromptTemplateVersion)
                 .where(PromptTemplateVersion.id == candidate_id)
                 .with_for_update()
             )
-            if candidate is None or candidate.promoted:
+            if (
+                candidate is None
+                or candidate.promoted
+                or candidate.version != candidate_version
+            ):
                 raise PromptNotFoundError("unpromoted prompt candidate is unavailable")
             latest_candidate_id = session.scalar(
                 select(PromptTemplateVersion.id)
@@ -307,22 +386,20 @@ class PromptCompilerService:
                 now=now,
                 for_update=True,
             )
-            threshold = _promotion_threshold(active)
-            if (
-                not regression_reviewed
-                or isinstance(evaluation_score, bool)
-                or not 0 <= evaluation_score <= 1
-                or evaluation_score < threshold
-            ):
+            if active.id != rollback_policy_version_id:
+                raise PromptConflictError("prompt rollback target is not the active policy")
+            if not regression_reviewed:
                 raise PromptConflictError("prompt promotion requirements are not satisfied")
-            evidence = session.get(EvidenceRecord, evaluation_evidence_id)
-            if (
-                evidence is None
-                or evidence.owner_id != candidate.owner_id
-                or evidence.evidence_type != "prompt-evaluation"
-            ):
-                raise PromptNotFoundError("prompt evaluation evidence is unavailable")
-            load_evidence(session, self._store, evidence)
+            threshold_evidence, evaluation_ids = _prompt_threshold_evidence(
+                session,
+                candidate=candidate,
+                evaluation_contract_version_id=evaluation_contract_version_id,
+                basis=evaluation_basis,
+                policy_version_id=active.id,
+            )
+            evaluation_score = float(
+                cast(int | float, threshold_evidence["average_quality_score"])
+            )
             promoted = PromptTemplateVersion(
                 id=promoted_prompt_id,
                 lineage_key=candidate.lineage_key,
@@ -330,7 +407,7 @@ class PromptCompilerService:
                 version=candidate.version + 1,
                 predecessor_id=candidate.id,
                 structured_template=candidate.structured_template,
-                evaluation_evidence_id=evidence.id,
+                evaluation_evidence_id=None,
                 evaluation_score=evaluation_score,
                 evaluation_threshold_passed=True,
                 regression_reviewed=True,
@@ -372,6 +449,33 @@ class PromptCompilerService:
                 actor_id=self._principal_id,
                 occurred_at=now,
             )
+            subject_fingerprint = canonical_fingerprint(
+                {
+                    "candidate_id": str(candidate.id),
+                    "candidate_version": candidate.version,
+                    "lineage_key": candidate.lineage_key,
+                    "role": candidate.role,
+                    "structured_template": candidate.structured_template,
+                }
+            )
+            record_policy_activation(
+                session,
+                activation_id=activation_id,
+                policy=policy,
+                source_policy=active,
+                rollback_policy=active,
+                kind=PolicyActivationKind.PROMPT_PROMOTION,
+                subject_type="PROMPT_TEMPLATE_VERSION",
+                subject_id=candidate.id,
+                subject_version=candidate.version,
+                subject_fingerprint=subject_fingerprint,
+                evaluation_contract_version_id=evaluation_contract_version_id,
+                threshold_evidence=threshold_evidence,
+                evidence_ids=evaluation_ids,
+                approved_by=approver,
+                activated_at=now,
+            )
+            session.flush()
             return PromptPromotionResult(
                 candidate_id=candidate.id,
                 promoted_prompt_id=promoted.id,
@@ -379,8 +483,63 @@ class PromptCompilerService:
                 policy_version_id=policy.id,
                 policy_version=policy.version,
                 rollback_policy_version_id=active.id,
+                activation_id=activation_id,
+                activated_at=now,
                 replayed=False,
             )
+
+
+def create_prompt_promotion_router(service: PromptCompilerService) -> APIRouter:
+    router = APIRouter(prefix="/api/prompts", tags=["prompts"])
+
+    @router.post(
+        "/{candidate_id}/promotions",
+        response_model=PromptPromotionResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def promote(
+        candidate_id: UUID,
+        body: PromptPromotionRequest,
+        authentication: AuthenticatedPolicySession,
+        response: Response,
+    ) -> PromptPromotionResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            result = service.promote(
+                candidate_id=candidate_id,
+                candidate_version=body.candidate_version,
+                activation_id=body.activation_id,
+                promoted_prompt_id=body.promoted_prompt_id,
+                policy_version_id=body.policy_version_id,
+                rollback_policy_version_id=body.rollback_policy_version_id,
+                evaluation_contract_version_id=(body.evaluation_contract_version_id),
+                evaluation_basis=body.evaluation_basis,
+                regression_reviewed=body.regression_reviewed,
+                activation_time_value=body.activation_time,
+                authentication=authentication,
+            )
+        except PromptNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="prompt promotion input is unavailable",
+            ) from error
+        except PolicyActivationAuthorizationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(error),
+            ) from error
+        except (
+            PromptConflictError,
+            PolicyActivationConflictError,
+            IntegrityError,
+        ) as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="prompt promotion changed",
+            ) from error
+        return PromptPromotionResponse.model_validate(result, from_attributes=True)
+
+    return router
 
 
 def _task_context(session: Session, task: Task, role: PromptRole) -> dict[str, object]:
@@ -484,20 +643,122 @@ def _active_policy(
     return policy
 
 
-def _promotion_threshold(policy: PolicyVersion) -> float:
-    raw = policy.workflow_thresholds.get("prompt_promotion_policy")
-    if not isinstance(raw, Mapping) or set(raw) != {"schema_version", "minimum_score"}:
-        raise PromptConflictError("prompt promotion policy is invalid")
-    version = raw.get("schema_version")
-    score = raw.get("minimum_score")
+def _prompt_threshold_evidence(
+    session: Session,
+    *,
+    candidate: PromptTemplateVersion,
+    evaluation_contract_version_id: UUID,
+    basis: PromptEvaluationBasis,
+    policy_version_id: UUID,
+) -> tuple[dict[str, object], tuple[UUID, ...]]:
+    contract = session.scalar(
+        select(EvaluationContractVersion)
+        .where(
+            EvaluationContractVersion.id == evaluation_contract_version_id,
+            EvaluationContractVersion.owner_id == candidate.owner_id,
+            EvaluationContractVersion.active.is_(True),
+        )
+        .with_for_update()
+    )
+    if contract is None:
+        raise PromptNotFoundError("active evaluation contract is unavailable")
+    thresholds = _evaluation_thresholds(contract.promotion_thresholds)
+    basis_values = basis.model_dump()
+    rows = tuple(
+        session.scalars(
+            select(AgentRunEvaluation)
+            .where(
+                AgentRunEvaluation.evaluation_contract_version_id == contract.id,
+                AgentRunEvaluation.prompt_template_version_id == candidate.id,
+                AgentRunEvaluation.prompt_template_version == candidate.version,
+                AgentRunEvaluation.policy_version_id == policy_version_id,
+                AgentRunEvaluation.owner_id == candidate.owner_id,
+                AgentRunEvaluation.retrieval_index_version
+                == basis_values["retrieval_index_version"],
+                AgentRunEvaluation.retrieval_chunker_version
+                == basis_values["retrieval_chunker_version"],
+                AgentRunEvaluation.retrieval_verifier_version
+                == basis_values["retrieval_verifier_version"],
+                AgentRunEvaluation.model_provider == basis_values["model_provider"],
+                AgentRunEvaluation.model_name == basis_values["model_name"],
+                AgentRunEvaluation.model_version == basis_values["model_version"],
+            )
+            .order_by(AgentRunEvaluation.id)
+        )
+    )
+    if not rows:
+        raise PromptNotFoundError("prompt threshold evidence is unavailable")
+    regression_cases = {str(value) for value in contract.regression_cases}
+    if not regression_cases:
+        raise PromptConflictError("prompt regression evidence is incomplete")
+    regression_values: list[bool] = []
+    for row in rows:
+        if (
+            set(row.regression_results) != regression_cases
+            or any(not isinstance(value, bool) for value in row.regression_results.values())
+        ):
+            raise PromptConflictError("prompt regression evidence is incomplete")
+        regression_values.extend(cast(list[bool], list(row.regression_results.values())))
+    quality = sum(row.quality_score for row in rows) / len(rows)
+    cost = sum(row.cost_microusd for row in rows) / len(rows)
+    regression_rate = sum(regression_values) / len(regression_values)
+    eligible = (
+        len(rows) >= thresholds["minimum_run_count"]
+        and quality >= thresholds["minimum_quality_score"]
+        and cost <= thresholds["maximum_average_cost_microusd"]
+        and regression_rate >= thresholds["minimum_regression_pass_rate"]
+    )
+    if not eligible:
+        raise PromptConflictError("prompt promotion requirements are not satisfied")
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "evaluation_contract_fingerprint": contract.contract_fingerprint,
+        "evaluation_policy_version_id": str(policy_version_id),
+        "evaluation_basis": basis_values,
+        "run_count": len(rows),
+        "average_quality_score": quality,
+        "average_cost_microusd": cost,
+        "regression_pass_rate": regression_rate,
+        "thresholds": thresholds,
+        "promotion_eligible": True,
+    }
+    return evidence, tuple(row.id for row in rows)
+
+
+def _evaluation_thresholds(value: object) -> dict[str, int | float]:
+    keys = {
+        "minimum_run_count",
+        "minimum_quality_score",
+        "maximum_average_cost_microusd",
+        "minimum_regression_pass_rate",
+    }
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise PromptConflictError("prompt evaluation thresholds are invalid")
+    run_count = value["minimum_run_count"]
+    quality = value["minimum_quality_score"]
+    cost = value["maximum_average_cost_microusd"]
+    regression = value["minimum_regression_pass_rate"]
     if (
-        version != 1
-        or isinstance(score, bool)
-        or not isinstance(score, (int, float))
-        or not 0 <= float(score) <= 1
+        not isinstance(run_count, int)
+        or isinstance(run_count, bool)
+        or run_count < 1
+        or not isinstance(cost, int)
+        or isinstance(cost, bool)
+        or cost < 0
+        or not isinstance(quality, int | float)
+        or isinstance(quality, bool)
+        or not 0 <= float(quality) <= 1
+        or not isinstance(regression, int | float)
+        or isinstance(regression, bool)
+        or not 0 <= float(regression) <= 1
     ):
-        raise PromptConflictError("prompt promotion policy is invalid")
-    return float(score)
+        raise PromptConflictError("prompt evaluation thresholds are invalid")
+    return {
+        "minimum_run_count": run_count,
+        "minimum_quality_score": float(quality),
+        "maximum_average_cost_microusd": cost,
+        "minimum_regression_pass_rate": float(regression),
+    }
 
 
 def _copy_policy_memberships(
@@ -560,27 +821,46 @@ def _replayed_promotion(
     session: Session,
     *,
     candidate_id: UUID,
+    candidate_version: int,
+    activation_id: UUID,
     promoted_prompt_id: UUID,
     policy_version_id: UUID,
-    evaluation_evidence_id: UUID,
-    evaluation_score: float,
+    rollback_policy_version_id: UUID,
+    evaluation_contract_version_id: UUID,
+    evaluation_basis: PromptEvaluationBasis,
     regression_reviewed: bool,
     approved_by: str,
+    activated_at: datetime,
 ) -> PromptPromotionResult:
     prompt = session.get(PromptTemplateVersion, promoted_prompt_id)
     policy = session.get(PolicyVersion, policy_version_id)
+    activation = session.get(PolicyActivation, activation_id)
     if (
         prompt is None
         or policy is None
+        or activation is None
         or prompt.predecessor_id != candidate_id
+        or prompt.version != candidate_version + 1
         or not prompt.promoted
-        or prompt.evaluation_evidence_id != evaluation_evidence_id
-        or prompt.evaluation_score != evaluation_score
+        or prompt.evaluation_evidence_id is not None
         or prompt.regression_reviewed is not regression_reviewed
         or prompt.approved_by != approved_by
-        or policy.predecessor_id is None
-        or policy.rollback_policy_version_id != policy.predecessor_id
+        or policy.predecessor_id != rollback_policy_version_id
+        or policy.rollback_policy_version_id != rollback_policy_version_id
         or policy.approved_by != approved_by
+        or _as_utc(policy.approved_at) != activated_at
+        or activation.policy_version_id != policy.id
+        or activation.source_policy_version_id != rollback_policy_version_id
+        or activation.rollback_policy_version_id != rollback_policy_version_id
+        or activation.activation_kind is not PolicyActivationKind.PROMPT_PROMOTION
+        or activation.subject_id != candidate_id
+        or activation.subject_version != candidate_version
+        or activation.evaluation_contract_version_id
+        != evaluation_contract_version_id
+        or activation.threshold_evidence.get("evaluation_basis")
+        != evaluation_basis.model_dump()
+        or activation.approved_by != approved_by
+        or _as_utc(activation.activated_at) != activated_at
     ):
         raise PromptConflictError("prompt promotion ids conflict")
     membership = session.scalar(
@@ -597,7 +877,9 @@ def _replayed_promotion(
         promoted_prompt_version=prompt.version,
         policy_version_id=policy.id,
         policy_version=policy.version,
-        rollback_policy_version_id=policy.predecessor_id,
+        rollback_policy_version_id=rollback_policy_version_id,
+        activation_id=activation.id,
+        activated_at=_as_utc(activation.activated_at),
         replayed=True,
     )
 

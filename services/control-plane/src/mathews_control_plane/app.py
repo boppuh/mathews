@@ -62,6 +62,15 @@ from mathews_control_plane.host_gateway import (
     HostGatewayError,
     configured_local_host_gateway,
 )
+from mathews_control_plane.policy_activation import (
+    PolicyActivationBodyLimitMiddleware,
+    PolicyActivationService,
+    create_policy_activation_router,
+)
+from mathews_control_plane.prompt_compiler import (
+    PromptCompilerService,
+    create_prompt_promotion_router,
+)
 from mathews_control_plane.reliability import (
     OwnedProcessTerminator,
     OwnedWorkspaceCleaner,
@@ -120,6 +129,8 @@ def create_app(
     approval_service: ApprovalService | None = None,
     approval_continuation: ApprovalContinuation | None = None,
     candidate_learning_service: CandidateLearningService | None = None,
+    prompt_compiler_service: PromptCompilerService | None = None,
+    policy_activation_service: PolicyActivationService | None = None,
     repository_service: RepositoryService | None = None,
     validation_evidence_scheduler: ValidationEvidenceJobScheduler | None = None,
     validation_decision_service: ValidationDecisionService | None = None,
@@ -186,6 +197,13 @@ def create_app(
             session_factory,
             artifact_store,
         )
+    if prompt_compiler_service is None:
+        prompt_compiler_service = PromptCompilerService(
+            session_factory,
+            artifact_store,
+        )
+    if policy_activation_service is None:
+        policy_activation_service = PolicyActivationService(session_factory)
     if repository_service is None:
         host_gateway = None
         if current_settings.automation_ready:
@@ -340,6 +358,8 @@ def create_app(
     application.state.task_service = task_service
     application.state.approval_service = approval_service
     application.state.candidate_learning_service = candidate_learning_service
+    application.state.prompt_compiler_service = prompt_compiler_service
+    application.state.policy_activation_service = policy_activation_service
     application.state.repository_service = repository_service
     application.state.validation_evidence_scheduler = validation_evidence_scheduler
     application.state.validation_decision_service = validation_decision_service
@@ -355,6 +375,8 @@ def create_app(
     application.include_router(
         create_candidate_learning_router(candidate_learning_service)
     )
+    application.include_router(create_prompt_promotion_router(prompt_compiler_service))
+    application.include_router(create_policy_activation_router(policy_activation_service))
     application.include_router(
         create_approval_router(approval_service, approval_continuation)
     )
@@ -399,6 +421,7 @@ def create_app(
     application.add_middleware(EvidenceBodyLimitMiddleware)
     application.add_middleware(TaskBodyLimitMiddleware)
     application.add_middleware(CandidateLearningBodyLimitMiddleware)
+    application.add_middleware(PolicyActivationBodyLimitMiddleware)
     application.add_middleware(ApprovalBodyLimitMiddleware)
     application.add_middleware(RepositoryBodyLimitMiddleware)
     application.add_middleware(ValidationEvidenceBodyLimitMiddleware)

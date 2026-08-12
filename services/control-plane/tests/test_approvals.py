@@ -46,6 +46,7 @@ from mathews_control_plane.domain_models import (
     BriefDecisionDisposition,
     EvidenceDeletionRequest,
     EvidenceRecord,
+    PolicyActivation,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PolicyVersionReviewRule,
@@ -181,7 +182,7 @@ def _create_task(
                 proposed_rule="Retry exact formatting failures once.",
                 cited_evidence_ids=[str(evidence_id)],
                 recurrence_assessment="repeated",
-                severity_assessment="low",
+                severity_assessment="HIGH",
                 false_positive_risks=[],
                 evaluation_result={
                     "passed": True,
@@ -654,6 +655,7 @@ def test_rule_candidate_approval_versions_rule_and_policy_without_prompts(
         decision_id=uuid4(),
         decision=ApprovalDecision.APPROVE,
         actor_id="local-user",
+        recent_password_verified=True,
     )
 
     assert result.task_state is TaskState.REPAIRING
@@ -663,6 +665,7 @@ def test_rule_candidate_approval_versions_rule_and_policy_without_prompts(
         policies = session.scalars(select(PolicyVersion).order_by(PolicyVersion.version)).all()
         memberships = session.scalars(select(PolicyVersionReviewRule)).all()
         prompt_memberships = session.scalars(select(PolicyVersionPromptTemplate)).all()
+        activations = session.scalars(select(PolicyActivation)).all()
     assert candidate is not None
     assert candidate.status is RuleCandidateStatus.APPROVED
     assert len(rules) == 1
@@ -680,6 +683,10 @@ def test_rule_candidate_approval_versions_rule_and_policy_without_prompts(
         (policies[1].id, rules[0].id)
     ]
     assert prompt_memberships == []
+    assert len(activations) == 1
+    assert activations[0].subject_id == candidate_id
+    assert activations[0].rollback_policy_version_id == policies[0].id
+    assert activations[0].threshold_evidence["human_regression_reviewed"] is True
 
 
 def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
@@ -777,7 +784,7 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
                     },
                     "proposed_rule": "Retry exact formatting failures once.",
                     "recurrence_assessment": "repeated",
-                    "severity_assessment": "low",
+                    "severity_assessment": "HIGH",
                     "false_positive_risks": [],
                     "cited_evidence_ids": [str(evidence_id)],
                     "lineage_key": "format-repair",
@@ -989,6 +996,14 @@ def test_policy_and_terminal_decisions_require_recent_password(
             actor_id="local-user",
             recent_password_verified=False,
         )
+    with pytest.raises(ApprovalRecentPasswordRequiredError):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="evaluation-worker",
+            recent_password_verified=True,
+        )
 
     with approval_harness.factory() as session:
         task = session.get(Task, task_id)
@@ -1029,6 +1044,7 @@ def test_rule_promotion_rejects_changed_or_unbound_candidate_evidence(
             decision_id=uuid4(),
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
+            recent_password_verified=True,
         )
 
     with approval_harness.factory() as session:
@@ -1101,6 +1117,7 @@ def test_rule_promotion_rejects_a_superseded_candidate_citation(
             decision_id=uuid4(),
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
+            recent_password_verified=True,
         )
 
     with approval_harness.factory() as session:
@@ -1147,6 +1164,7 @@ def test_rule_promotion_rejects_a_deletion_requested_candidate_citation(
             decision_id=uuid4(),
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
+            recent_password_verified=True,
         )
 
     with approval_harness.factory() as session:
@@ -1188,6 +1206,7 @@ def test_rule_approval_is_bound_to_the_evaluated_definition(
             decision_id=uuid4(),
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
+            recent_password_verified=True,
         )
 
 
@@ -1262,6 +1281,7 @@ def test_rule_promotion_uses_current_policy_and_preserves_lineage_position(
             decision_id=uuid4(),
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
+            recent_password_verified=True,
         )
         return task_id, candidate_id
 
@@ -1329,6 +1349,7 @@ def test_rule_promotion_does_not_copy_a_future_policy(
         decision_id=uuid4(),
         decision=ApprovalDecision.APPROVE,
         actor_id="local-user",
+        recent_password_verified=True,
     )
 
     with approval_harness.factory() as session:
@@ -1705,3 +1726,42 @@ def test_concurrent_human_decisions_have_one_durable_winner(
     }
     assert request.decision_id is not None
     assert event_count == 4
+
+
+def test_rule_promotion_rejects_missing_threshold_evidence(
+    approval_harness: ApprovalHarness,
+) -> None:
+    task_id, evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    with approval_harness.factory.begin() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+        assert candidate is not None
+        candidate.severity_assessment = "LOW"
+    service = _service(approval_harness)
+    request_id, _result = _request(
+        service,
+        task_id=task_id,
+        evidence_id=evidence_id,
+        expected_state=TaskState.REPAIRING,
+        request_type=ApprovalRequestType.REVIEW_RULE,
+        subject_id=candidate_id,
+    )
+
+    with pytest.raises(ApprovalConflictError, match="threshold"):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+            recent_password_verified=True,
+        )
+
+    with approval_harness.factory() as session:
+        request = session.get(ApprovalRequest, request_id)
+        activation_count = session.scalar(select(func.count(PolicyActivation.id)))
+    assert request is not None and request.status is ApprovalStatus.PENDING
+    assert activation_count == 0

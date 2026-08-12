@@ -39,6 +39,7 @@ from mathews_control_plane.domain_models import (
     BriefDecisionDisposition,
     DependencyOutageAttempt,
     EvidenceRecord,
+    PolicyActivationKind,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PolicyVersionReviewRule,
@@ -56,6 +57,7 @@ from mathews_control_plane.evidence import (
     invalidated_evidence_ids,
     load_evidence,
 )
+from mathews_control_plane.policy_activation import record_policy_activation
 from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.task_state_machine import (
     TaskTransitionError,
@@ -977,6 +979,38 @@ def _validated_rule_candidate(
     return rule, cited_evidence_ids, fingerprint
 
 
+def _rule_promotion_threshold_evidence(
+    session: Session,
+    candidate: RuleCandidate,
+    cited_evidence_ids: Sequence[UUID],
+) -> dict[str, object]:
+    severity = candidate.severity_assessment.strip().upper()
+    if severity not in {"LOW", "MEDIUM", "HIGH"}:
+        raise ApprovalConflictError("rule candidate severity is invalid")
+    origins = tuple(
+        session.scalars(
+            select(EvidenceRecord.origin).where(
+                EvidenceRecord.id.in_(cited_evidence_ids),
+                EvidenceRecord.owner_id == candidate.owner_id,
+                EvidenceRecord.deleted_at.is_(None),
+            )
+        )
+    )
+    if len(origins) != len(cited_evidence_ids):
+        raise ApprovalConflictError("rule candidate evidence is unavailable")
+    confirmed_occurrences = len(set(origins))
+    eligible = severity == "HIGH" or confirmed_occurrences >= 2
+    if not eligible:
+        raise ApprovalConflictError("rule promotion threshold is not satisfied")
+    return {
+        "schema_version": 1,
+        "eligibility_rule": "HIGH_SEVERITY_OR_TWO_CONFIRMED_OCCURRENCES",
+        "severity": severity,
+        "confirmed_occurrence_evidence_count": confirmed_occurrences,
+        "promotion_eligible": True,
+    }
+
+
 def _brief_fingerprint(brief: Brief) -> str:
     try:
         for value in (
@@ -1791,15 +1825,22 @@ class ApprovalService:
                     effective_decision,
                     decision_id=decision_id,
                 )
+                rule_promotion = (
+                    request_type is ApprovalRequestType.REVIEW_RULE
+                    and effective_decision is ApprovalDecision.APPROVE
+                )
                 if (
-                    recent_password_verified is False
-                    and effective_decision is not ApprovalDecision.EXPIRE
+                    effective_decision is not ApprovalDecision.EXPIRE
                     and (
-                        (
-                            request_type is ApprovalRequestType.REVIEW_RULE
-                            and effective_decision is ApprovalDecision.APPROVE
+                        (rule_promotion and (
+                            recent_password_verified is not True
+                            or normalized_actor != LOCAL_OWNER_ID
+                        ))
+                        or (
+                            recent_password_verified is False
+                            and transition_kind
+                            in {TaskTransitionKind.CANCEL, TaskTransitionKind.FAIL}
                         )
-                        or transition_kind in {TaskTransitionKind.CANCEL, TaskTransitionKind.FAIL}
                     )
                 ):
                     raise ApprovalRecentPasswordRequiredError(
@@ -2090,7 +2131,14 @@ class ApprovalService:
         actor_id: str,
         approved_at: datetime,
     ) -> None:
-        definition = _evaluated_review_rule(candidate)
+        definition, _validated_evidence_ids, candidate_fingerprint = (
+            _validated_rule_candidate(
+                session,
+                task,
+                candidate,
+                artifact_store=self._artifact_store,
+            )
+        )
         cited_evidence_ids = _candidate_evidence_ids(
             session,
             task,
@@ -2100,6 +2148,11 @@ class ApprovalService:
         )
         if not set(cited_evidence_ids).issubset(_stored_evidence_ids(request)):
             raise ApprovalConflictError("rule candidate evidence is not bound to the approval")
+        threshold_evidence = _rule_promotion_threshold_evidence(
+            session,
+            candidate,
+            cited_evidence_ids,
+        )
         _lock_policy_promotion(session, self._active_policy_lineage)
         predecessor = session.scalar(
             select(ReviewRule)
@@ -2171,6 +2224,11 @@ class ApprovalService:
                     cast(Mapping[str, object], candidate.evaluation_result)
                 ),
                 "schema_version": 1,
+                "reviewed_at": approved_at.isoformat(),
+                "review_due_at": (approved_at + timedelta(days=90)).isoformat(),
+                "review_policy": "HUMAN_REVIEW_REQUIRED_EVERY_90_DAYS",
+                "revocation_path": "ROLLBACK_ACTIVE_POLICY_VERSION",
+                "promotion_threshold_evidence": threshold_evidence,
             },
             approved_by=actor_id,
             approved_at=approved_at,
@@ -2234,6 +2292,31 @@ class ApprovalService:
                     **context,
                 )
             )
+        if request.decision_id is None:
+            raise ApprovalConflictError("rule promotion decision is unavailable")
+        record_policy_activation(
+            session,
+            activation_id=request.decision_id,
+            policy=policy,
+            source_policy=active,
+            rollback_policy=active,
+            kind=PolicyActivationKind.RULE_PROMOTION,
+            subject_type="RULE_CANDIDATE",
+            subject_id=candidate.id,
+            subject_version=None,
+            subject_fingerprint=candidate_fingerprint,
+            evaluation_contract_version_id=None,
+            threshold_evidence={
+                **threshold_evidence,
+                "candidate_evaluation_passed": True,
+                "approval_request_id": str(request.id),
+                "approval_request_fingerprint": request.request_fingerprint,
+                "human_regression_reviewed": True,
+            },
+            evidence_ids=cited_evidence_ids,
+            approved_by=actor_id,
+            activated_at=approved_at,
+        )
         session.flush()
 
 
