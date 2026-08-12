@@ -17,7 +17,7 @@ The field guide covers:
 
 ## Local development
 
-Use Node.js 22 or newer, then run:
+Use Node.js 22.13.0 or newer, then run:
 
 ```bash
 npm install
@@ -36,6 +36,6 @@ The `.openai/hosting.json` file binds this source tree to the existing private
 Sites project. Publish from this directory through the Sites workflow only
 after the exact source revision has passed `npm test`.
 
-The static architecture page in `public/mathews-architecture.html` is the
-original supplied artifact. Preserve it byte-for-byte when changing the rest of
-the field guide.
+The static architecture page in `public/mathews-architecture.html` retains the
+supplied sandbox and content-security policy. Its test-pinned digest must change
+only alongside a reviewed security update to that artifact.

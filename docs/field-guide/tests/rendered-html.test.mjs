@@ -63,14 +63,19 @@ test("server-renders every interactive guide", async () => {
   }
 });
 
-test("preserves the original architecture artifact byte-for-byte", async () => {
+test("preserves the reviewed architecture artifact byte-for-byte", async () => {
   const source = await readFile(
     new URL("../public/mathews-architecture.html", import.meta.url),
   );
   const digest = createHash("sha256").update(source).digest("hex");
+  const html = source.toString("utf8");
 
   assert.equal(
     digest,
-    "e54990fc7c0f8b819d31bf7f6ecb953e633c4343ee18bc993b95b990415784be",
+    "5f55690b6a9663775cbd3b56e630f748e76b98ecb48434a14f4a97fcd95f68a6",
   );
+  assert.match(html, /sandbox="allow-scripts"/);
+  assert.doesNotMatch(html, /sandbox="[^"]*allow-same-origin/);
+  assert.equal((html.match(/integrity=&quot;sha256-/g) ?? []).length, 3);
+  assert.equal((html.match(/crossorigin=&quot;anonymous&quot;/g) ?? []).length, 3);
 });

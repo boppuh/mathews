@@ -110,6 +110,35 @@ const phases: Phase[] = [
 const STORAGE_KEY = "mathews-release-gate-v1";
 const blankMeta: RunMeta = { runId: "", mathewsSha: "", acceptanceBase: "", owner: "", startedUtc: "" };
 const allItems = phases.flatMap((phase) => phase.items);
+const itemStatuses = new Set<ItemStatus>(["pending", "passed", "blocked"]);
+const knownItemIds = new Set(allItems.map((item) => item.id));
+
+function sanitizeItems(input: unknown): Record<string, ItemState> {
+  if (!input || typeof input !== "object") return {};
+
+  const sanitized: Record<string, ItemState> = {};
+  for (const [id, value] of Object.entries(input)) {
+    if (!knownItemIds.has(id) || !value || typeof value !== "object") continue;
+    const candidate = value as { status?: unknown; note?: unknown };
+    sanitized[id] = {
+      status: itemStatuses.has(candidate.status as ItemStatus) ? candidate.status as ItemStatus : "pending",
+      note: typeof candidate.note === "string" ? candidate.note : "",
+    };
+  }
+  return sanitized;
+}
+
+function sanitizeMeta(input: unknown): RunMeta {
+  if (!input || typeof input !== "object") return blankMeta;
+  const candidate = input as Record<string, unknown>;
+  return {
+    runId: typeof candidate.runId === "string" ? candidate.runId : "",
+    mathewsSha: typeof candidate.mathewsSha === "string" ? candidate.mathewsSha : "",
+    acceptanceBase: typeof candidate.acceptanceBase === "string" ? candidate.acceptanceBase : "",
+    owner: typeof candidate.owner === "string" ? candidate.owner : "",
+    startedUtc: typeof candidate.startedUtc === "string" ? candidate.startedUtc : "",
+  };
+}
 
 function defaultItems() {
   return Object.fromEntries(phases.flatMap((phase) => phase.items.map((item) => [item.id, { status: "pending", note: "" } as ItemState])));
@@ -127,9 +156,9 @@ export default function MvpReleaseGatePage() {
       try {
         const stored = window.localStorage.getItem(STORAGE_KEY);
         if (stored) {
-          const parsed = JSON.parse(stored) as { items?: Record<string, ItemState>; meta?: RunMeta };
-          if (parsed.items) setItems((current) => ({ ...current, ...parsed.items }));
-          if (parsed.meta) setMeta({ ...blankMeta, ...parsed.meta });
+          const parsed = JSON.parse(stored) as { items?: unknown; meta?: unknown };
+          if (parsed.items) setItems((current) => ({ ...current, ...sanitizeItems(parsed.items) }));
+          if (parsed.meta) setMeta(sanitizeMeta(parsed.meta));
         }
       } catch {
         // A blocked local store leaves the worksheet usable for this session.

@@ -65,7 +65,9 @@ export default function AuthorityMatrixPage() {
               {actions.map((row) => (
                 <tr key={row.action}>
                   <th scope="row">{row.action}</th>
-                  {[row.operator, row.control, row.hermes, row.host, row.github].map((value, index) => <td className={cellClass(value)} key={`${row.action}-${index}`}><span>{value}</span></td>)}
+                  {(["operator", "control", "hermes", "host", "github"] as const).map((column) => (
+                    <td className={cellClass(row[column])} key={column}><span>{row[column]}</span></td>
+                  ))}
                 </tr>
               ))}
             </tbody>
