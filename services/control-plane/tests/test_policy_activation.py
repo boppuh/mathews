@@ -146,24 +146,27 @@ def _authentication(*, recent: bool = True) -> AuthenticatedSession:
 def test_rollback_creates_an_audited_successor_with_prior_immutable_memberships(
     policy_harness: PolicyHarness,
 ) -> None:
-    service = PolicyActivationService(policy_harness.factory, clock=lambda: _NOW)
+    clock = [_NOW]
+    service = PolicyActivationService(policy_harness.factory, clock=lambda: clock[0])
     activation_id = uuid4()
     restored_id = uuid4()
+    requested_activation_time = _NOW + timedelta(seconds=30)
 
     result = service.rollback(
         policy_harness.source_policy_id,
         activation_id=activation_id,
         restored_policy_version_id=restored_id,
         restore_from_policy_version_id=policy_harness.rollback_target_id,
-        activation_time_value=_NOW,
+        activation_time_value=requested_activation_time,
         authentication=_authentication(),
     )
+    clock[0] = _NOW + timedelta(minutes=5)
     replay = service.rollback(
         policy_harness.source_policy_id,
         activation_id=activation_id,
         restored_policy_version_id=restored_id,
         restore_from_policy_version_id=policy_harness.rollback_target_id,
-        activation_time_value=_NOW,
+        activation_time_value=requested_activation_time,
         authentication=_authentication(),
     )
     with pytest.raises(PolicyActivationConflictError, match="policy rollback ids conflict"):
@@ -172,7 +175,7 @@ def test_rollback_creates_an_audited_successor_with_prior_immutable_memberships(
             activation_id=activation_id,
             restored_policy_version_id=restored_id,
             restore_from_policy_version_id=uuid4(),
-            activation_time_value=_NOW,
+            activation_time_value=requested_activation_time,
             authentication=_authentication(),
         )
 
@@ -187,11 +190,13 @@ def test_rollback_creates_an_audited_successor_with_prior_immutable_memberships(
             .order_by(PolicyVersionPromptTemplate.position)
         ).all()
     assert restored is not None
+    assert restored.approved_at.replace(tzinfo=UTC) == _NOW
     assert restored.workflow_thresholds == {"version": 1}
     assert restored.predecessor_id == policy_harness.source_policy_id
     assert restored.rollback_policy_version_id == policy_harness.source_policy_id
     assert prompt_ids == [policy_harness.rollback_prompt_id]
     assert activation is not None
+    assert activation.activated_at.replace(tzinfo=UTC) == requested_activation_time
     assert activation.activation_kind is PolicyActivationKind.ROLLBACK
     assert activation.subject_id == policy_harness.rollback_target_id
     assert activation.approved_by == "local-user"

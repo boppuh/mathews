@@ -58,7 +58,10 @@ and rule memberships and workflow thresholds, and records a human-authorized
 rollback target, so recovery remains reversible without mutating history.
 
 All activation commands are idempotent by caller-supplied UUIDs and conflict if
-the same IDs are replayed with different inputs. PostgreSQL advisory locking
+the same IDs are replayed with different inputs. Exact replays remain valid
+after the initial clock-skew window. The bounded caller timestamp is immutable
+audit data; the server transaction time is the successor policy's effective
+approval time. PostgreSQL advisory locking
 serializes prompt, rule, and rollback version allocation. Request bodies are
 bounded before parsing, and authenticated unsafe routes retain the normal
 trusted-origin and CSRF protections.

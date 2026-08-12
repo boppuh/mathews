@@ -347,9 +347,7 @@ def test_default_role_prompts_are_bounded_and_use_only_verified_metadata(
     assert result.template_id == prompt_harness.prompt_ids[role]
     assert result.evaluation_mode is False
     assert payload["role"] == role.value
-    assert payload["verified_evidence"][0]["evidence_id"] == str(
-        prompt_harness.evidence_id
-    )
+    assert payload["verified_evidence"][0]["evidence_id"] == str(prompt_harness.evidence_id)
     assert "FULL MUTABLE LOG" not in result.content
     assert "secret-value" not in result.content
     if role is PromptRole.PLANNER:
@@ -421,7 +419,12 @@ def test_prompt_rejects_unverified_or_excess_evidence(
 def test_promotion_creates_immutable_prompt_and_policy_successors(
     prompt_harness: PromptHarness,
 ) -> None:
-    service = _service(prompt_harness)
+    clock = [_NOW]
+    service = PromptCompilerService(
+        prompt_harness.factory,
+        prompt_harness.store,
+        clock=lambda: clock[0],
+    )
     candidate = service.create_candidate(
         prompt_id=uuid4(),
         lineage_key="implementer-experiment",
@@ -433,6 +436,7 @@ def test_promotion_creates_immutable_prompt_and_policy_successors(
     policy_id = uuid4()
     activation_id = uuid4()
     contract_id = _record_candidate_evaluation(prompt_harness, candidate)
+    requested_activation_time = _NOW + timedelta(seconds=30)
 
     result = service.promote(
         candidate_id=candidate.id,
@@ -444,9 +448,10 @@ def test_promotion_creates_immutable_prompt_and_policy_successors(
         evaluation_contract_version_id=contract_id,
         evaluation_basis=_evaluation_basis(),
         regression_reviewed=True,
-        activation_time_value=_NOW,
+        activation_time_value=requested_activation_time,
         authentication=_authentication(),
     )
+    clock[0] = _NOW + timedelta(minutes=5)
     replay = service.promote(
         candidate_id=candidate.id,
         candidate_version=candidate.version,
@@ -457,7 +462,7 @@ def test_promotion_creates_immutable_prompt_and_policy_successors(
         evaluation_contract_version_id=contract_id,
         evaluation_basis=_evaluation_basis(),
         regression_reviewed=True,
-        activation_time_value=_NOW,
+        activation_time_value=requested_activation_time,
         authentication=_authentication(),
     )
 
@@ -483,6 +488,11 @@ def test_promotion_creates_immutable_prompt_and_policy_successors(
         activation = session.get(PolicyActivation, activation_id)
         assert stored_candidate is not None and stored_candidate.promoted is False
         assert promoted is not None and promoted.promoted is True
+        assert promoted.approved_at is not None
+        assert promoted.approved_at.replace(tzinfo=UTC) == _NOW
+        assert policy is not None and policy.approved_at.replace(tzinfo=UTC) == _NOW
+        assert activation is not None
+        assert activation.activated_at.replace(tzinfo=UTC) == requested_activation_time
         assert promoted.approved_by == "local-user"
         assert policy is not None and policy.rollback_policy_version_id == prompt_harness.policy_id
         assert activation is not None and activation.policy_version_id == policy_id

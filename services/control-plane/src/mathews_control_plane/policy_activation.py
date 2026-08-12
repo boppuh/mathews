@@ -330,7 +330,7 @@ class PolicyActivationService:
                 _begin_serialized(session)
                 lock_policy_promotion(session, self._lineage)
                 transaction_now = _as_utc(self._clock())
-                activated_at = activation_time(activation_time_value, now=transaction_now)
+                requested_activation_time = _as_utc(activation_time_value)
                 existing = session.get(PolicyActivation, activation_id)
                 existing_policy = session.get(PolicyVersion, restored_policy_version_id)
                 if existing is not None or existing_policy is not None:
@@ -340,9 +340,13 @@ class PolicyActivationService:
                         activation_id=activation_id,
                         restored_policy_version_id=restored_policy_version_id,
                         restore_from_policy_version_id=restore_from_policy_version_id,
-                        activated_at=activated_at,
+                        activated_at=requested_activation_time,
                         approved_by=approver,
                     )
+                activated_at = activation_time(
+                    requested_activation_time,
+                    now=transaction_now,
+                )
                 source = active_policy(
                     session,
                     owner_id=approver,
@@ -381,15 +385,15 @@ class PolicyActivationService:
                     predecessor_id=source.id,
                     workflow_thresholds=restore_from.workflow_thresholds,
                     approved_by=approver,
-                    approved_at=activated_at,
+                    approved_at=transaction_now,
                     rollback_policy_version_id=source.id,
                     owner_id=approver,
                     actor_id=approver,
                     root_correlation_id=source.root_correlation_id,
                     causation_id=activation_id,
                     parent_correlation_id=source.id,
-                    created_at=activated_at,
-                    updated_at=activated_at,
+                    created_at=transaction_now,
+                    updated_at=transaction_now,
                 )
                 session.add(restored)
                 session.flush()
@@ -398,7 +402,7 @@ class PolicyActivationService:
                     source=restore_from,
                     target=restored,
                     actor_id=approver,
-                    occurred_at=activated_at,
+                    occurred_at=transaction_now,
                 )
                 session.flush()
                 record_policy_activation(
@@ -415,6 +419,7 @@ class PolicyActivationService:
                     evaluation_contract_version_id=None,
                     threshold_evidence={
                         "schema_version": 1,
+                        "effective_policy_approved_at": transaction_now.isoformat(),
                         "restored_immutable_policy": True,
                     },
                     evidence_ids=(),
@@ -465,7 +470,8 @@ class PolicyActivationService:
             or restored.predecessor_id != source_policy_version_id
             or restored.rollback_policy_version_id != source_policy_version_id
             or restored.approved_by != approved_by
-            or _as_utc(restored.approved_at) != activated_at
+            or activation.threshold_evidence.get("effective_policy_approved_at")
+            != _as_utc(restored.approved_at).isoformat()
             or restored.workflow_thresholds != restore_from.workflow_thresholds
         ):
             raise PolicyActivationConflictError("policy rollback ids conflict")

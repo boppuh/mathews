@@ -2360,6 +2360,7 @@ class ApprovalService:
             threshold_evidence={
                 **threshold_evidence,
                 "candidate_evaluation_passed": True,
+                "effective_policy_approved_at": approved_at.isoformat(),
                 "approval_request_id": str(request.id),
                 "approval_request_fingerprint": request.request_fingerprint,
                 "human_regression_review": {

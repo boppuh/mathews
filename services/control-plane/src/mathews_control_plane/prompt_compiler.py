@@ -338,7 +338,7 @@ class PromptCompilerService:
             _begin_serialized(session)
             lock_policy_promotion(session, self._policy_lineage)
             transaction_now = _as_utc(self._clock())
-            now = activation_time(activation_time_value, now=transaction_now)
+            requested_activation_time = _as_utc(activation_time_value)
             if (
                 session.get(PolicyVersion, policy_version_id) is not None
                 or session.get(PromptTemplateVersion, promoted_prompt_id) is not None
@@ -356,8 +356,12 @@ class PromptCompilerService:
                     evaluation_basis=evaluation_basis,
                     regression_reviewed=regression_reviewed,
                     approved_by=approver,
-                    activated_at=now,
+                    activated_at=requested_activation_time,
                 )
+            activated_at = activation_time(
+                requested_activation_time,
+                now=transaction_now,
+            )
             candidate = session.scalar(
                 select(PromptTemplateVersion)
                 .where(PromptTemplateVersion.id == candidate_id)
@@ -414,14 +418,14 @@ class PromptCompilerService:
                 regression_reviewed=True,
                 promoted=True,
                 approved_by=approver,
-                approved_at=now,
+                approved_at=transaction_now,
                 owner_id=candidate.owner_id,
                 actor_id=self._principal_id,
                 root_correlation_id=candidate.root_correlation_id,
                 causation_id=candidate.id,
                 parent_correlation_id=active.id,
-                created_at=now,
-                updated_at=now,
+                created_at=transaction_now,
+                updated_at=transaction_now,
             )
             policy = PolicyVersion(
                 id=policy_version_id,
@@ -430,15 +434,15 @@ class PromptCompilerService:
                 predecessor_id=active.id,
                 workflow_thresholds=active.workflow_thresholds,
                 approved_by=approver,
-                approved_at=now,
+                approved_at=transaction_now,
                 rollback_policy_version_id=active.id,
                 owner_id=active.owner_id,
                 actor_id=self._principal_id,
                 root_correlation_id=active.root_correlation_id,
                 causation_id=promoted.id,
                 parent_correlation_id=active.id,
-                created_at=now,
-                updated_at=now,
+                created_at=transaction_now,
+                updated_at=transaction_now,
             )
             session.add_all([promoted, policy])
             session.flush()
@@ -448,7 +452,7 @@ class PromptCompilerService:
                 replacement=promoted,
                 policy=policy,
                 actor_id=self._principal_id,
-                occurred_at=now,
+                occurred_at=transaction_now,
             )
             subject_fingerprint = canonical_fingerprint(
                 {
@@ -471,11 +475,14 @@ class PromptCompilerService:
                 subject_version=candidate.version,
                 subject_fingerprint=subject_fingerprint,
                 evaluation_contract_version_id=evaluation_contract_version_id,
-                threshold_evidence=threshold_evidence,
+                threshold_evidence={
+                    **threshold_evidence,
+                    "effective_policy_approved_at": transaction_now.isoformat(),
+                },
                 evidence_ids=evaluation_ids,
                 regression_reviewed=regression_reviewed,
                 approved_by=approver,
-                activated_at=now,
+                activated_at=activated_at,
             )
             session.flush()
             return PromptPromotionResult(
@@ -486,7 +493,7 @@ class PromptCompilerService:
                 policy_version=policy.version,
                 rollback_policy_version_id=active.id,
                 activation_id=activation_id,
-                activated_at=now,
+                activated_at=activated_at,
                 replayed=False,
             )
 
@@ -844,10 +851,11 @@ def _replayed_promotion(
         or prompt.evaluation_evidence_id is not None
         or prompt.regression_reviewed is not regression_reviewed
         or prompt.approved_by != approved_by
+        or prompt.approved_at is None
         or policy.predecessor_id != rollback_policy_version_id
         or policy.rollback_policy_version_id != rollback_policy_version_id
         or policy.approved_by != approved_by
-        or _as_utc(policy.approved_at) != activated_at
+        or _as_utc(prompt.approved_at) != _as_utc(policy.approved_at)
         or activation.policy_version_id != policy.id
         or activation.source_policy_version_id != rollback_policy_version_id
         or activation.rollback_policy_version_id != rollback_policy_version_id
@@ -856,6 +864,8 @@ def _replayed_promotion(
         or activation.subject_version != candidate_version
         or activation.evaluation_contract_version_id != evaluation_contract_version_id
         or activation.threshold_evidence.get("evaluation_basis") != evaluation_basis.model_dump()
+        or activation.threshold_evidence.get("effective_policy_approved_at")
+        != _as_utc(policy.approved_at).isoformat()
         or activation.approved_by != approved_by
         or _as_utc(activation.activated_at) != activated_at
     ):
