@@ -214,6 +214,11 @@ Exit gate:
 
 ## MVP release gate
 
+Execute this gate using the authoritative
+[`MVP_RELEASE_GATE_RUNBOOK.md`](MVP_RELEASE_GATE_RUNBOOK.md). Record the result
+in `MVP_RELEASE_GATE_REPORT.md` and review it through a pull request before
+starting production-roadmap implementation.
+
 After Wave 7, run one recorded end-to-end acceptance task through:
 
 `intake → briefing/approval → workspace → Hermes implementation → validation/repair → verified draft PR → CI/review → readiness → handoff`
