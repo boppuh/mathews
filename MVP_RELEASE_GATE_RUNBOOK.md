@@ -38,10 +38,14 @@ The gate is complete only when all four outputs exist:
 4. A completed acceptance report with an explicit `GO` or `NO-GO` decision and
    no unexplained deviations.
 
-Use the report template at the end of this document. Store the completed,
-redacted report in `MVP_RELEASE_GATE_REPORT.md` on a dedicated branch and review
-it through a pull request. Do not commit raw logs, credentials, cookies,
-installation tokens, webhook secrets, account data, or unredacted task input.
+Use the report template at the end of this document. During execution, keep the
+working report in a mode-`0700` recording directory outside both Git worktrees;
+the frozen Mathews worktree must remain clean and checked out at the recorded
+`main` SHA. After the gate, copy only the completed, redacted report into
+`MVP_RELEASE_GATE_REPORT.md` in a separate dedicated-branch worktree, update
+`MVP_EXECUTION_PLAN.md` there, and review both changes through a pull request.
+Do not commit raw logs, credentials, cookies, installation tokens, webhook
+secrets, account data, or unredacted task input.
 
 ## Non-negotiable rules
 
@@ -62,7 +66,8 @@ installation tokens, webhook secrets, account data, or unredacted task input.
 
 ## Phase 0 — Freeze the run
 
-Create the report before mutating the acceptance repository, then record:
+Create the external working report before mutating the acceptance repository,
+then record:
 
 - gate run ID in the form `mvp-YYYYMMDD-NN`;
 - UTC start time;
@@ -70,15 +75,16 @@ Create the report before mutating the acceptance repository, then record:
 - acceptance repository numeric ID and canonical `owner/repository` name;
 - acceptance repository base branch and full base commit SHA;
 - repository-configuration ID, version, and digest;
-- validation-contract ID, version, and digest;
 - active policy-version ID and version;
 - active prompt/evaluation-contract versions used by the run;
 - configured simulator runtime, device type, flow ID, and flow version;
 - required GitHub check names; and
 - names of the gate owner, operator, recorder, and defect owner.
 
-Abort before intake if any value is missing, ambiguous, mutable without a
-version, or broader than the single configured repository.
+Abort before intake if any repository-level value is missing, ambiguous,
+mutable without a version, or broader than the single configured repository.
+The task-specific validation contract does not exist yet and is deliberately
+frozen after final briefing in Phase 3.2.
 
 ## Phase 1 — Environment readiness
 
@@ -146,7 +152,28 @@ separate Git transport credential may push the exact candidate branch, but it
 must be restricted to the acceptance repository and must not be exposed to
 Hermes or the browser.
 
-### 1.4 Host and simulator
+### 1.4 Temporary webhook ingress
+
+Provision one gate-owned, time-bounded HTTPS ingress before creating the task.
+It must forward only `POST /api/github/webhooks` to
+`http://127.0.0.1:8000/api/github/webhooks`, preserve the request body and all
+`X-GitHub-*` headers byte-for-byte, reject every other method and path, and
+enforce a maximum body size of 1 MiB. The tunnel or relay credential, if any,
+must remain outside the repository and report.
+
+Set the GitHub App webhook URL to the temporary HTTPS endpoint ending exactly
+in `/api/github/webhooks`. Start the ingress only for the live gate, record its
+non-secret public hostname, process/service identity, UTC start time, and
+configuration owner, and verify one real signed GitHub delivery is accepted
+and durably recorded before continuing. A locally fabricated request is not an
+ingress check. If the relay changes bytes, headers, method, or path, the gate is
+`NO-GO`.
+
+The recorder must retain the prior App webhook URL so cleanup can restore it.
+The ingress must be stopped and its temporary URL removed from the GitHub App
+in Phase 6.
+
+### 1.5 Host and simulator
 
 Install or verify the per-user LaunchAgent as documented. Confirm:
 
@@ -163,16 +190,33 @@ Install or verify the per-user LaunchAgent as documented. Confirm:
 No simulator state from a prior run may be reused. The configured journey must
 perform shutdown, erase, boot, candidate installation, and the pinned XCTest.
 
-### 1.5 Services and authentication
+### 1.6 Services and authentication
 
-Apply migrations and start the stack:
+Start PostgreSQL and apply migrations:
 
 ```bash
+docker compose -f infra/compose.yaml up -d --wait postgres
 npm run db:migrate
-npm run dev
 ```
 
-Run `npm run dev` in a dedicated terminal and keep it running for the live gate.
+Then start only the API, worker, and web processes, with each command in its own
+dedicated terminal:
+
+```bash
+npm run dev:api
+```
+
+```bash
+npm run dev:worker
+```
+
+```bash
+npm run dev:web
+```
+
+Keep all three application processes running for the live gate. Do not run
+`npm run dev`: that command also starts a self-binding development host agent
+and conflicts with the launchd-owned host agent verified in Phase 1.5.
 
 Confirm the API and web health endpoints pass. Bootstrap the local operator
 only if no account exists:
@@ -233,14 +277,25 @@ In the web UI:
 3. Record the task ID and intake-event ID.
 4. Inspect the stored request evidence and confirm secrets or sensitive forms
    are redacted before persistence.
-5. Review the generated versioned brief, exclusions, typed criteria, risks,
-   affected flow, and validation plan.
-6. Require exactly one durable authorization outcome for the exact displayed
+5. Review and record the initial versioned brief and validation-contract IDs,
+   versions, and digests, but do not approve them yet.
+6. In chat, send one bounded, scope-affecting steering instruction that refines
+   an acceptance criterion without adding a prohibited path or unsafe action.
+   Record the steering event and evidence IDs. Confirm any active authority is
+   fenced, the prior brief and validation contract are invalidated, and the
+   task returns to `BRIEFING`.
+7. Review the regenerated brief, exclusions, typed criteria, risks, affected
+   flow, and validation plan. Record the successor brief and validation-contract
+   IDs, versions, and digests, and prove neither predecessor can authorize work.
+8. Freeze that successor validation contract for the rest of the task. Any
+   later brief change or contract replacement invalidates the run and requires
+   a clean golden-path rerun.
+9. Require exactly one durable authorization outcome for the exact displayed
    brief: either a human approval-decision ID or an unambiguous policy-bypass ID
    and version. Never record both or neither.
-7. Confirm that the selected authorization binds the accepted brief ID/version
-   and active policy ID/version. For a human approval, reauthenticate before
-   approving.
+10. Confirm that the selected authorization binds the accepted brief ID/version,
+    frozen validation-contract version, and active policy ID/version. For a
+    human approval, reauthenticate before approving.
 
 Pass only when the accepted brief and its single authorization outcome are
 durable, exact-version bound, and visible in the task cockpit. The same
@@ -299,10 +354,27 @@ Confirm the GitHub App token is repository-scoped and revoked after each
 bounded operation. The generated PR must remain a draft unless a human changes
 it outside Mathews.
 
-If a review repair is exercised, confirm that the repair is authorized by the
-active policy or an explicit human decision, creates a new exact head, reruns
-the full validation contract, and invalidates readiness evidence for the old
-head.
+Exercise both review-repair authorization paths; neither is optional:
+
+1. On the first verified PR head, have the designated acceptance reviewer post
+   one controlled, low-risk, in-scope comment that exactly matches a
+   preapproved active `ReviewRule`. Confirm Mathews records the comment and rule
+   fingerprint, performs the repair without a human approval decision, creates
+   one new head, reruns the complete frozen validation contract, updates the
+   same draft PR, and invalidates every readiness fact from the prior head.
+2. After CI passes on that new head, have the reviewer post one controlled
+   unmatched or scope-expanding comment. Confirm Mathews creates exactly one
+   bounded `REVIEW_CONFLICT` approval and performs no repair before a decision.
+   Reauthenticate, approve only the exact displayed review fingerprint, and
+   confirm the one-off repair creates another new head, reruns the complete
+   frozen validation contract, updates the same draft PR, and again invalidates
+   all prior-head readiness evidence.
+
+Record for both paths the source comment/thread, classification, authorization
+outcome, active-policy version, repair job/effect, predecessor and successor
+SHAs, fresh validation run, remote/PR head, CI results, and final thread state.
+A rule match plus a human approval, neither authorization, a reused old-head
+validation, a duplicate repair, or a second PR is `NO-GO`.
 
 ### 3.6 Readiness and handoff
 
@@ -474,6 +546,72 @@ Required live observation:
   commit, tree, configuration, contract, and policy identifiers at readiness
   and again at handoff. Every value must match the final immutable proof.
 
+### 4.7 Review-repair authorization
+
+Required automated coverage:
+
+- `services/control-plane/tests/test_review_resolution.py::test_automatic_repair_closes_for_every_non_low_risk_boundary`
+- `services/control-plane/tests/test_review_resolution.py::test_exact_low_risk_in_scope_classification_is_eligible`
+- `services/control-plane/tests/test_review_resolution.py::test_schedule_builds_exact_rule_bound_repair_job`
+- `services/control-plane/tests/test_review_resolution.py::test_unsafe_review_requests_bounded_one_off_approval_without_rule`
+- `services/control-plane/tests/test_review_resolution.py::test_approved_one_off_resumes_the_exact_review_event`
+- `services/control-plane/tests/test_review_resolution.py::test_handler_commits_new_head_fully_revalidates_and_updates_only_draft_pr`
+- `services/control-plane/tests/test_review_resolution.py::test_handler_refuses_to_publish_without_current_full_validation`
+
+Required live observations:
+
+- the preapproved, low-risk, in-scope repair in Phase 3.5 completes without a
+  human approval and fully validates its fresh head; and
+- the unmatched or scope-expanding repair in Phase 3.5 remains blocked until
+  the recently reauthenticated human approves its exact fingerprint, then fully
+  validates a different fresh head.
+
+Record these as two separate live-observation rows in addition to their
+individual automated-test rows.
+
+### 4.8 Candidate learning and governed promotion
+
+Required automated coverage:
+
+- `services/control-plane/tests/test_candidate_learning.py::test_cited_summary_is_redacted_non_authoritative_and_replayable`
+- `services/control-plane/tests/test_candidate_learning.py::test_rule_candidate_cannot_create_authority_or_approval`
+- `services/control-plane/tests/test_candidate_learning.py::test_authenticated_api_creates_candidate_learning_outputs`
+- `services/control-plane/tests/test_candidate_learning.py::test_rule_inbox_skips_candidate_with_missing_source_artifact`
+- `services/control-plane/tests/test_approvals.py::test_authenticated_inboxes_expose_bounded_decisions_and_record_audit`
+- `services/control-plane/tests/test_approvals.py::test_policy_and_terminal_decisions_require_recent_password`
+- `services/control-plane/tests/test_approvals.py::test_rule_promotion_rejects_changed_or_unbound_candidate_evidence`
+- `services/control-plane/tests/test_approvals.py::test_rule_promotion_rejects_missing_threshold_evidence`
+- `services/control-plane/tests/test_approvals.py::test_rule_promotion_uses_current_policy_and_preserves_lineage_position`
+- `services/control-plane/tests/test_prompt_compiler.py::test_prompt_promotion_rejects_worker_or_stale_human_authorization`
+
+Required live observations after the golden-path handoff:
+
+1. From current, readable evidence belonging to the acceptance task, create one
+   cited, redacted, explicitly non-authoritative learning summary and one
+   evaluated review-rule candidate. Record their IDs, exact source-evidence IDs
+   and hashes, definition fingerprint, evaluation result, and Rule Inbox entry.
+   Confirm creation changes no approval, executable rule, policy, prompt, task
+   state, or host authority.
+2. Attempt review or promotion with a missing, changed, or insufficient
+   citation/threshold binding and confirm it is rejected without changing the
+   active policy. Separately attempt promotion without recent human
+   authentication and confirm it is rejected with no authority-bearing effect.
+3. Use a candidate that satisfies the documented severity or distinct
+   validation-run threshold. In the Rule Inbox, inspect the exact citations,
+   evaluation, risks, regression-review attestation, prior active policy, and
+   rollback target. Reauthenticate and approve that exact candidate. Confirm
+   one immutable `ReviewRule`, one successor `PolicyVersion`, and one activation
+   record are created atomically and remain distinct from the golden task's
+   frozen policy binding.
+4. Through the supported human-only rollback path, restore the prior policy
+   memberships as another immutable successor and record both activation IDs.
+   No policy row, rule, prompt, evidence record, or prior activation may be
+   edited or deleted.
+
+Use separate report rows for candidate creation/inbox visibility,
+citation-threshold rejection, unauthorized-promotion rejection, human
+promotion, and rollback.
+
 ## Phase 5 — Evidence reconciliation
 
 Before deciding the gate, reconcile the report against the product's durable
@@ -492,6 +630,9 @@ records and GitHub:
 | Readiness | Assessment binds the same final PR head and durable proof. |
 | Handoff | Acknowledgement binds the readiness assessment and final PR head. |
 | Authority | Human decisions show recent authentication and the active policy/version. |
+| Steering | Successor brief and contract supersede the steered predecessors. |
+| Review repairs | Both authorization paths bind their own comment, policy, predecessor, successor, and fresh validation. |
+| Governance | Candidate citations, rejection evidence, promotion, successor policy, and rollback are exact and immutable. |
 | Effects | No duplicate branch, commit, push, PR, repair, handoff, tag, deployment, or release exists. |
 
 Any mismatch is a `NO-GO`; do not explain it away as eventual consistency.
@@ -508,10 +649,13 @@ After evidence reconciliation:
 4. Retain the host journal, database audit records, evidence tombstones, and
    content-addressed release evidence according to their policies.
 5. Remove temporary dependency blocks and confirm all health checks recover.
-6. Verify no plaintext secret, bootstrap token, session cookie, private key,
+6. Stop the temporary webhook ingress, restore the prior GitHub App webhook URL,
+   revoke any relay credential, and prove the temporary public URL no longer
+   forwards traffic.
+7. Verify no plaintext secret, bootstrap token, session cookie, private key,
    webhook secret, Git token, or test-account credential was written to the
    repository or report.
-7. Run `git status --short` in both Mathews and the acceptance repository and
+8. Run `git status --short` in both Mathews and the acceptance repository and
    record the expected clean state or explicitly owned acceptance artifacts.
 
 ## Go/no-go decision
@@ -520,6 +664,12 @@ The gate owner records `GO` only when:
 
 - all Phase 2 commands pass on the frozen Mathews SHA;
 - the golden-path task reaches `HANDED_OFF` with the exact proof chain intact;
+- the recorded task demonstrates scope-affecting steering and a regenerated,
+  frozen brief and validation contract;
+- both mandatory review-repair authorization paths pass on separate fresh
+  heads;
+- candidate learning, Rule Inbox review, fail-closed governance checks, human
+  promotion, and immutable rollback all pass;
 - every required safety/recovery matrix row passes;
 - every required live observation is completed;
 - all defects are closed or explicitly proven non-gating by the documented MVP
@@ -535,9 +685,19 @@ After a `GO`, update [`MVP_EXECUTION_PLAN.md`](MVP_EXECUTION_PLAN.md) to mark th
 release gate complete. Production-roadmap implementation may begin only after
 that update and the acceptance-report pull request are merged.
 
+After recording the decision in the external working report, create a separate
+Git worktree and dedicated report branch from the frozen Mathews `main` SHA.
+Copy only the redacted report into that worktree as
+`MVP_RELEASE_GATE_REPORT.md`. For `GO`, update the execution plan to mark the
+gate complete; for `NO-GO`, leave it active and link the required rerun. Commit
+and merge the report and plan through one pull request. Never switch or modify
+the original frozen worktree during this publication step.
+
 ## Acceptance report template
 
-Copy this section to `MVP_RELEASE_GATE_REPORT.md` for the actual run.
+Copy this template to the external working report for the actual run. Publish
+the redacted result as `MVP_RELEASE_GATE_REPORT.md` only after the decision, as
+described above.
 
 ```markdown
 # MVP Release-Gate Report
@@ -558,11 +718,13 @@ Copy this section to `MVP_RELEASE_GATE_REPORT.md` for the actual run.
 - Acceptance repository ID and name:
 - Base branch and commit SHA:
 - Repository configuration ID/version/digest:
-- Validation contract ID/version/digest:
-- Active policy ID/version:
+- Starting active policy ID/version:
 - Prompt/evaluation contract versions:
 - Simulator runtime/device/flow version:
 - Required GitHub checks:
+- Node.js/npm/uv/Python versions:
+- Temporary webhook hostname and service/process identity:
+- Temporary webhook start time and verified delivery ID:
 
 ## Baseline verification
 
@@ -577,11 +739,15 @@ Copy this section to `MVP_RELEASE_GATE_REPORT.md` for the actual run.
 - Redacted acceptance request:
 - Task ID:
 - Intake event/evidence IDs:
-- Accepted brief ID/version:
+- Initial brief and validation-contract IDs/versions/digests:
+- Steering event/evidence IDs and redacted instruction:
+- Steering fence/invalidation evidence:
+- Accepted successor brief ID/version:
+- Frozen successor validation-contract ID/version/digest:
 - Authorization outcome type: APPROVAL | POLICY_BYPASS
 - Approval decision ID, when selected:
 - Policy bypass ID/version, when selected:
-- Authorization's accepted brief and active policy bindings:
+- Authorization's brief, validation-contract, and policy bindings:
 - Workspace and lease IDs:
 - Hermes run ID and version bindings:
 - Candidate commit/tree SHAs:
@@ -590,11 +756,28 @@ Copy this section to `MVP_RELEASE_GATE_REPORT.md` for the actual run.
 - Remote branch/head:
 - Draft PR number/URL/head:
 - CI conclusions:
-- Review resolution evidence:
 - Readiness assessment ID:
 - Handoff acknowledgement/event ID:
 - Final state:
 - Proof that no merge/release/deployment occurred:
+
+## Mandatory review-repair cycles
+
+| Path | Comment/thread and classification | Authorization | Predecessor/successor SHAs | Fresh validation and CI | Final thread state | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| PREAPPROVED_RULE | | | | | | |
+| HUMAN_ONE_OFF | | | | | | |
+
+## Governed learning
+
+- Learning summary ID/fingerprint and exact citations:
+- Rule candidate ID/fingerprint/evaluation and inbox entry:
+- Citation or threshold rejection evidence:
+- Unauthorized-promotion rejection evidence:
+- Human reauthentication and promotion decision:
+- Created review-rule, policy-successor, and activation IDs:
+- Immutable rollback successor and activation IDs:
+- Proof that candidate creation granted no authority:
 
 ## Safety and recovery evidence
 
@@ -621,6 +804,11 @@ observation. Do not combine rows.
 | Repository configuration ID/version/digest | | | |
 | Policy and prompt bindings | | | |
 | Accepted brief/single authorization outcome | | | |
+| Steering predecessor/successor invalidation | | | |
+| Preapproved-rule repair and fresh head | | | |
+| Human one-off repair and fresh head | | | |
+| Learning citations and candidate non-authority | | | |
+| Promotion rejection/successor/rollback | | | |
 | Recent authentication for protected decisions | | | |
 | Duplicate or unauthorized effects | | | |
 
@@ -634,9 +822,12 @@ observation. Do not combine rows.
 - Companion tasks closed through supported paths:
 - Task-owned workspaces/processes cleaned:
 - Dependency blocks removed and health restored:
+- Temporary webhook stopped and prior App URL restored:
+- Temporary webhook URL no longer forwards:
 - Durable audit evidence retained:
 - Secret scan/review result:
 - Final repository states:
+- Report branch/worktree and pull request:
 
 ## Sign-off
 
