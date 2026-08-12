@@ -18,6 +18,7 @@ This repository currently implements the MVP foundation described in
 | `packages/contracts` | Shared TypeScript task and service contracts |
 | `infra` | Local PostgreSQL infrastructure |
 | `scripts` | Cross-service development orchestration |
+| `docs/field-guide` | Interactive system architecture and operator documentation |
 
 ## Prerequisites
 
@@ -229,6 +230,11 @@ npm run check
 ```
 
 ## Design documents
+
+The interactive [Mathews System Field Guide](https://mathews-architecture.ryanmathews10.chatgpt.site)
+combines the architecture, task lifecycle, authority, evidence, release-gate,
+recovery, and operating guidance in one navigable site. Its reviewed source is
+stored in [`docs/field-guide`](docs/field-guide).
 
 - `PRODUCT_WORKFLOW_ARCHITECTURE.md`
 - `MVP_ENGINEERING_SPEC.md`
