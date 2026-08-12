@@ -12,6 +12,7 @@ const taskId = "22222222-2222-4222-8222-222222222222";
 const candidateId = "33333333-3333-4333-8333-333333333333";
 const evidenceId = "44444444-4444-4444-8444-444444444444";
 const auditId = "55555555-5555-4555-8555-555555555555";
+const candidateFingerprint = "b".repeat(64);
 
 const approval = {
   id: requestId,
@@ -41,6 +42,7 @@ const approval = {
 
 const rule = {
   candidate_id: candidateId,
+  candidate_fingerprint: candidateFingerprint,
   approval_request_id: requestId,
   authority: "NON_AUTHORITATIVE",
   status: "EVALUATED",
@@ -185,7 +187,13 @@ describe("approvalClient", () => {
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("document", { cookie: "__Host-mathews-csrf=bound%2Ftoken" });
 
-    await expect(approvalClient.decide(requestId, "APPROVE")).resolves.toMatchObject({
+    await expect(
+      approvalClient.decide(requestId, "APPROVE", {
+        candidate_id: candidateId,
+        candidate_fingerprint: candidateFingerprint,
+        passed: true,
+      }),
+    ).resolves.toMatchObject({
       request_id: requestId,
       decision: "APPROVE",
       audit_event_id: auditId,
@@ -197,7 +205,14 @@ describe("approvalClient", () => {
       "Content-Type": "application/json",
       "X-CSRF-Token": "bound/token",
     });
-    expect(JSON.parse(String(init.body))).toEqual({ decision: "APPROVE" });
+    expect(JSON.parse(String(init.body))).toEqual({
+      decision: "APPROVE",
+      regression_review: {
+        candidate_id: candidateId,
+        candidate_fingerprint: candidateFingerprint,
+        passed: true,
+      },
+    });
   });
 
   it("fails before mutation without CSRF and sanitizes conflicts", async () => {

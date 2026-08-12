@@ -121,9 +121,7 @@ def upgrade() -> None:
             "activation_kind IN ('PROMPT_PROMOTION', 'RULE_PROMOTION', 'ROLLBACK')",
             name=op.f("ck_policy_activations_policy_activation_kind"),
         ),
-        sa.ForeignKeyConstraint(
-            ["policy_version_id"], ["policy_versions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["policy_version_id"], ["policy_versions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
             ["source_policy_version_id"], ["policy_versions.id"], ondelete="RESTRICT"
         ),
@@ -136,14 +134,18 @@ def upgrade() -> None:
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_policy_activations")),
-        sa.UniqueConstraint(
-            "policy_version_id", name=op.f("uq_policy_activation_version")
-        ),
+        sa.UniqueConstraint("policy_version_id", name=op.f("uq_policy_activation_version")),
     )
     _create_append_only_guards()
 
 
 def downgrade() -> None:
+    """Remove activation structures only before they contain audit provenance."""
+
+    if op.get_context().as_sql:
+        raise RuntimeError("Policy activation provenance requires an online guarded downgrade")
+    if op.get_bind().scalar(sa.text("SELECT 1 FROM policy_activations LIMIT 1")):
+        raise RuntimeError("Cannot downgrade while policy activation provenance exists")
     op.drop_table("policy_activations")
     if op.get_bind().dialect.name == "postgresql":
         op.execute(sa.text("DROP FUNCTION policy_activations_append_only_guard()"))

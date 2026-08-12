@@ -34,6 +34,7 @@ from mathews_control_plane.principals import LOCAL_OWNER_ID
 
 MAX_ACTIVATION_CLOCK_SKEW = timedelta(minutes=1)
 MAX_POLICY_ACTIVATION_BODY_BYTES = 32 * 1024
+LOCAL_OWNER_USER_ID = 1
 AuthenticatedPolicySession = Annotated[
     AuthenticatedSession,
     Depends(require_authenticated_session),
@@ -89,7 +90,7 @@ class PolicyRollbackResponse(BaseModel):
 
 
 def require_human_policy_authorization(authentication: AuthenticatedSession) -> str:
-    if authentication.user_id != 1:
+    if authentication.user_id != LOCAL_OWNER_USER_ID:
         raise PolicyActivationAuthorizationError("human policy authorization is unavailable")
     if not authentication.recent_password_verified:
         raise PolicyActivationAuthorizationError("recent password authentication required")
@@ -191,7 +192,7 @@ def copy_policy_memberships(
             PolicyVersionPromptTemplate(
                 policy_version_id=target.id,
                 prompt_template_version_id=prompt_membership.prompt_template_version_id,
-                prompt_promoted=True,
+                prompt_promoted=prompt_membership.prompt_promoted,
                 position=prompt_membership.position,
                 **context,
             )
@@ -242,11 +243,14 @@ def record_policy_activation(
     evaluation_contract_version_id: UUID | None,
     threshold_evidence: Mapping[str, object],
     evidence_ids: Sequence[UUID],
+    regression_reviewed: bool,
     approved_by: str,
     activated_at: datetime,
 ) -> PolicyActivation:
     if len(subject_fingerprint) != 64:
         raise PolicyActivationConflictError("policy activation subject is invalid")
+    if not regression_reviewed:
+        raise PolicyActivationConflictError("policy activation regression review is required")
     evidence_values = [str(value) for value in evidence_ids]
     if len(evidence_values) != len(set(evidence_values)):
         raise PolicyActivationConflictError("policy activation evidence is invalid")
@@ -256,12 +260,11 @@ def record_policy_activation(
         "activated_at": _as_utc(activated_at).isoformat(),
         "approved_by": approved_by,
         "evaluation_contract_version_id": (
-            None
-            if evaluation_contract_version_id is None
-            else str(evaluation_contract_version_id)
+            None if evaluation_contract_version_id is None else str(evaluation_contract_version_id)
         ),
         "evidence_ids": evidence_values,
         "policy_version_id": str(policy.id),
+        "regression_reviewed": regression_reviewed,
         "rollback_policy_version_id": str(rollback_policy.id),
         "source_policy_version_id": str(source_policy.id),
         "subject_fingerprint": subject_fingerprint,
@@ -283,7 +286,7 @@ def record_policy_activation(
         evaluation_contract_version_id=evaluation_contract_version_id,
         threshold_evidence=dict(threshold_evidence),
         evidence_ids=evidence_values,
-        regression_reviewed=True,
+        regression_reviewed=regression_reviewed,
         approved_by=approved_by,
         activated_at=_as_utc(activated_at),
         activation_fingerprint=canonical_fingerprint(payload),
@@ -322,11 +325,12 @@ class PolicyActivationService:
         authentication: AuthenticatedSession,
     ) -> PolicyRollbackResult:
         approver = require_human_policy_authorization(authentication)
-        activated_at = activation_time(activation_time_value, now=self._clock())
         try:
             with self._factory.begin() as session:
                 _begin_serialized(session)
                 lock_policy_promotion(session, self._lineage)
+                transaction_now = _as_utc(self._clock())
+                activated_at = activation_time(activation_time_value, now=transaction_now)
                 existing = session.get(PolicyActivation, activation_id)
                 existing_policy = session.get(PolicyVersion, restored_policy_version_id)
                 if existing is not None or existing_policy is not None:
@@ -343,7 +347,7 @@ class PolicyActivationService:
                     session,
                     owner_id=approver,
                     lineage_key=self._lineage,
-                    now=activated_at,
+                    now=transaction_now,
                     for_update=True,
                 )
                 if source.id != source_policy_version_id:
@@ -356,7 +360,7 @@ class PolicyActivationService:
                         PolicyVersion.id == restore_from_policy_version_id,
                         PolicyVersion.owner_id == approver,
                         PolicyVersion.lineage_key == self._lineage,
-                        PolicyVersion.approved_at <= activated_at,
+                        PolicyVersion.approved_at <= transaction_now,
                     )
                     .with_for_update()
                 )
@@ -366,7 +370,6 @@ class PolicyActivationService:
                     session.scalar(
                         select(func.max(PolicyVersion.version)).where(
                             PolicyVersion.lineage_key == self._lineage,
-                            PolicyVersion.owner_id == approver,
                         )
                     )
                     or 0
@@ -415,6 +418,7 @@ class PolicyActivationService:
                         "restored_immutable_policy": True,
                     },
                     evidence_ids=(),
+                    regression_reviewed=True,
                     approved_by=approver,
                     activated_at=activated_at,
                 )
@@ -604,6 +608,7 @@ def create_policy_activation_router(service: PolicyActivationService) -> APIRout
                 status_code=status.HTTP_409_CONFLICT,
                 detail="policy rollback changed",
             ) from error
+
     return router
 
 

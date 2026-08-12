@@ -13,7 +13,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -274,8 +274,8 @@ class PromptCompilerService:
                 ):
                     raise PromptNotFoundError("policy version is unavailable")
             default = _default_prompt(session, policy.id, role)
-            selected = default if template_id is None else session.get(
-                PromptTemplateVersion, template_id
+            selected = (
+                default if template_id is None else session.get(PromptTemplateVersion, template_id)
             )
             if (
                 selected is None
@@ -296,9 +296,7 @@ class PromptCompilerService:
                 "role": role.value,
                 "instructions": list(template.instructions),
                 "task": _task_context(session, task, role),
-                "verified_evidence": _verified_evidence(
-                    session, self._store, task, evidence_ids
-                ),
+                "verified_evidence": _verified_evidence(session, self._store, task, evidence_ids),
                 "execution": {
                     "policy_version_id": str(policy.id),
                     "template_id": str(selected.id),
@@ -336,10 +334,11 @@ class PromptCompilerService:
         authentication: AuthenticatedSession,
     ) -> PromptPromotionResult:
         approver = require_human_policy_authorization(authentication)
-        now = activation_time(activation_time_value, now=self._clock())
         with self._factory() as session, session.begin():
             _begin_serialized(session)
             lock_policy_promotion(session, self._policy_lineage)
+            transaction_now = _as_utc(self._clock())
+            now = activation_time(activation_time_value, now=transaction_now)
             if (
                 session.get(PolicyVersion, policy_version_id) is not None
                 or session.get(PromptTemplateVersion, promoted_prompt_id) is not None
@@ -364,11 +363,7 @@ class PromptCompilerService:
                 .where(PromptTemplateVersion.id == candidate_id)
                 .with_for_update()
             )
-            if (
-                candidate is None
-                or candidate.promoted
-                or candidate.version != candidate_version
-            ):
+            if candidate is None or candidate.promoted or candidate.version != candidate_version:
                 raise PromptNotFoundError("unpromoted prompt candidate is unavailable")
             latest_candidate_id = session.scalar(
                 select(PromptTemplateVersion.id)
@@ -383,11 +378,19 @@ class PromptCompilerService:
                 session,
                 owner_id=candidate.owner_id,
                 lineage_key=self._policy_lineage,
-                now=now,
+                now=transaction_now,
                 for_update=True,
             )
             if active.id != rollback_policy_version_id:
                 raise PromptConflictError("prompt rollback target is not the active policy")
+            next_policy_version = (
+                session.scalar(
+                    select(func.max(PolicyVersion.version)).where(
+                        PolicyVersion.lineage_key == active.lineage_key
+                    )
+                )
+                or 0
+            ) + 1
             if not regression_reviewed:
                 raise PromptConflictError("prompt promotion requirements are not satisfied")
             threshold_evidence, evaluation_ids = _prompt_threshold_evidence(
@@ -397,9 +400,7 @@ class PromptCompilerService:
                 basis=evaluation_basis,
                 policy_version_id=active.id,
             )
-            evaluation_score = float(
-                cast(int | float, threshold_evidence["average_quality_score"])
-            )
+            evaluation_score = float(cast(int | float, threshold_evidence["average_quality_score"]))
             promoted = PromptTemplateVersion(
                 id=promoted_prompt_id,
                 lineage_key=candidate.lineage_key,
@@ -425,7 +426,7 @@ class PromptCompilerService:
             policy = PolicyVersion(
                 id=policy_version_id,
                 lineage_key=active.lineage_key,
-                version=active.version + 1,
+                version=next_policy_version,
                 predecessor_id=active.id,
                 workflow_thresholds=active.workflow_thresholds,
                 approved_by=approver,
@@ -472,6 +473,7 @@ class PromptCompilerService:
                 evaluation_contract_version_id=evaluation_contract_version_id,
                 threshold_evidence=threshold_evidence,
                 evidence_ids=evaluation_ids,
+                regression_reviewed=regression_reviewed,
                 approved_by=approver,
                 activated_at=now,
             )
@@ -526,7 +528,7 @@ def create_prompt_promotion_router(service: PromptCompilerService) -> APIRouter:
         except PolicyActivationAuthorizationError as error:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=str(error),
+                detail="human policy authorization is required",
             ) from error
         except (
             PromptConflictError,
@@ -603,8 +605,7 @@ def _default_prompt(
         select(PromptTemplateVersion)
         .join(
             PolicyVersionPromptTemplate,
-            PolicyVersionPromptTemplate.prompt_template_version_id
-            == PromptTemplateVersion.id,
+            PolicyVersionPromptTemplate.prompt_template_version_id == PromptTemplateVersion.id,
         )
         .where(
             PolicyVersionPromptTemplate.policy_version_id == policy_id,
@@ -693,9 +694,8 @@ def _prompt_threshold_evidence(
         raise PromptConflictError("prompt regression evidence is incomplete")
     regression_values: list[bool] = []
     for row in rows:
-        if (
-            set(row.regression_results) != regression_cases
-            or any(not isinstance(value, bool) for value in row.regression_results.values())
+        if set(row.regression_results) != regression_cases or any(
+            not isinstance(value, bool) for value in row.regression_results.values()
         ):
             raise PromptConflictError("prompt regression evidence is incomplete")
         regression_values.extend(cast(list[bool], list(row.regression_results.values())))
@@ -797,8 +797,7 @@ def _copy_policy_memberships(
         select(PromptTemplateVersion)
         .join(
             PolicyVersionPromptTemplate,
-            PolicyVersionPromptTemplate.prompt_template_version_id
-            == PromptTemplateVersion.id,
+            PolicyVersionPromptTemplate.prompt_template_version_id == PromptTemplateVersion.id,
         )
         .where(PolicyVersionPromptTemplate.policy_version_id == active.id)
         .order_by(PolicyVersionPromptTemplate.position)
@@ -855,10 +854,8 @@ def _replayed_promotion(
         or activation.activation_kind is not PolicyActivationKind.PROMPT_PROMOTION
         or activation.subject_id != candidate_id
         or activation.subject_version != candidate_version
-        or activation.evaluation_contract_version_id
-        != evaluation_contract_version_id
-        or activation.threshold_evidence.get("evaluation_basis")
-        != evaluation_basis.model_dump()
+        or activation.evaluation_contract_version_id != evaluation_contract_version_id
+        or activation.threshold_evidence.get("evaluation_basis") != evaluation_basis.model_dump()
         or activation.approved_by != approved_by
         or _as_utc(activation.activated_at) != activated_at
     ):

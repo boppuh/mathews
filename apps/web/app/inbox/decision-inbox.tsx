@@ -8,6 +8,7 @@ import {
   ApprovalRequestError,
   approvalClient,
   LatestApprovalInboxLoader,
+  type RuleRegressionReviewInput,
 } from "../../lib/approval-client";
 import { AuthRequestError, authClient } from "../../lib/auth-client";
 import { stageLabel } from "../../lib/stages";
@@ -59,9 +60,13 @@ export function DecisionInbox() {
   const [state, setState] = useState<InboxState>({ status: "loading" });
   const [pendingRequest, setPendingRequest] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [reviewedRuleCandidates, setReviewedRuleCandidates] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
   const [reauthentication, setReauthentication] = useState<{
     requestId: string;
     decision: ApprovalDecision;
+    regressionReview?: RuleRegressionReviewInput;
   } | null>(null);
   const [password, setPassword] = useState("");
   const [reauthenticationError, setReauthenticationError] = useState<string | null>(null);
@@ -95,16 +100,17 @@ export function DecisionInbox() {
   async function decide(
     requestId: string,
     decision: ApprovalDecision,
+    regressionReview?: RuleRegressionReviewInput,
     afterReauthentication = false,
   ) {
     setPendingRequest(requestId);
     setActionError(null);
     try {
-      await approvalClient.decide(requestId, decision);
+      await approvalClient.decide(requestId, decision, regressionReview);
       await load(undefined, true);
     } catch (error) {
       if (!afterReauthentication && error instanceof ApprovalRequestError && error.status === 403) {
-        setReauthentication({ requestId, decision });
+        setReauthentication({ requestId, decision, regressionReview });
         setActionError(null);
         return;
       }
@@ -128,7 +134,7 @@ export function DecisionInbox() {
       setPassword("");
       setReauthentication(null);
       setPendingRequest(null);
-      await decide(target.requestId, target.decision, true);
+      await decide(target.requestId, target.decision, target.regressionReview, true);
     } catch (error) {
       setPassword("");
       setReauthenticationError(
@@ -466,6 +472,25 @@ export function DecisionInbox() {
                     taskPath={rule.task.cockpit_path}
                     evidenceIds={rule.cited_evidence_ids}
                   />
+                  {approval ? (
+                    <label className="rule-regression-review">
+                      <input
+                        checked={reviewedRuleCandidates.has(rule.candidate_id)}
+                        disabled={pendingRequest !== null}
+                        onChange={(event) => {
+                          const reviewed = event.currentTarget.checked;
+                          setReviewedRuleCandidates((current) => {
+                            const next = new Set(current);
+                            if (reviewed) next.add(rule.candidate_id);
+                            else next.delete(rule.candidate_id);
+                            return next;
+                          });
+                        }}
+                        type="checkbox"
+                      />
+                      I completed the regression review for this exact candidate and it passed.
+                    </label>
+                  ) : null}
                   <div className="inbox-card-footer">
                     <Link href={rule.task.cockpit_path}>Open task</Link>
                     {approval ? (
@@ -473,9 +498,25 @@ export function DecisionInbox() {
                         {approval.options.map((option) => (
                           <button
                             className={option === "APPROVE" ? "primary" : ""}
-                            disabled={pendingRequest !== null}
+                            disabled={
+                              pendingRequest !== null ||
+                              (option === "APPROVE" &&
+                                !reviewedRuleCandidates.has(rule.candidate_id))
+                            }
                             key={option}
-                            onClick={() => void decide(approval.id, option)}
+                            onClick={() =>
+                              void decide(
+                                approval.id,
+                                option,
+                                option === "APPROVE"
+                                  ? {
+                                      candidate_id: rule.candidate_id,
+                                      candidate_fingerprint: rule.candidate_fingerprint,
+                                      passed: true,
+                                    }
+                                  : undefined,
+                              )
+                            }
                             type="button"
                           >
                             {pendingRequest === approval.id ? "Recording…" : decisionLabels[option]}

@@ -178,9 +178,7 @@ def test_controlled_policy_activation_audit_is_append_only(tmp_path: Path) -> No
                     {
                         "id": policy_id.hex,
                         "version": version,
-                        "predecessor_id": (
-                            None if predecessor_id is None else predecessor_id.hex
-                        ),
+                        "predecessor_id": (None if predecessor_id is None else predecessor_id.hex),
                         "rollback_id": None if rollback_id is None else rollback_id.hex,
                         "correlation_id": correlation_id.hex,
                     },
@@ -212,10 +210,7 @@ def test_controlled_policy_activation_audit_is_append_only(tmp_path: Path) -> No
         with pytest.raises(IntegrityError, match="append-only"):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE policy_activations SET approved_by = 'rewritten' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE policy_activations SET approved_by = 'rewritten' WHERE id = :id"),
                     {"id": activation_id.hex},
                 )
         with pytest.raises(IntegrityError, match="append-only"):
@@ -243,6 +238,9 @@ def test_controlled_policy_activation_audit_is_append_only(tmp_path: Path) -> No
         }
     finally:
         engine.dispose()
+    with pytest.raises(RuntimeError, match="policy activation provenance"):
+        command.downgrade(config, "0014")
+    assert "policy_activations" in _table_names(database_url)
 
 
 def test_migrations_can_rebuild_schema_after_downgrade(tmp_path: Path) -> None:
@@ -462,8 +460,7 @@ def test_approval_revision_migrates_legacy_rows_and_guards_provenance(
     engine = create_engine(database_url)
     try:
         assert "request_fingerprint" not in {
-            column["name"]
-            for column in inspect(engine).get_columns("approval_requests")
+            column["name"] for column in inspect(engine).get_columns("approval_requests")
         }
         with engine.connect() as connection:
             restored = connection.execute(
@@ -581,19 +578,13 @@ def test_approval_revision_enforces_append_only_terminal_projection(
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE approval_requests SET reason = 'REWRITTEN' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE approval_requests SET reason = 'REWRITTEN' WHERE id = :id"),
                     {"id": request_id.hex},
                 )
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE approval_requests SET status = 'APPROVED' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE approval_requests SET status = 'APPROVED' WHERE id = :id"),
                     {"id": request_id.hex},
                 )
 
@@ -617,18 +608,13 @@ def test_approval_revision_enforces_append_only_terminal_projection(
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE approval_requests SET decision = 'DENY' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE approval_requests SET decision = 'DENY' WHERE id = :id"),
                     {"id": request_id.hex},
                 )
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "DELETE FROM approval_requests WHERE id = :id"
-                    ),
+                    text("DELETE FROM approval_requests WHERE id = :id"),
                     {"id": request_id.hex},
                 )
     finally:
@@ -672,9 +658,7 @@ def test_approval_service_operates_through_migrated_triggers(
             )
             session.flush()
             evidence_id = session.scalar(
-                select(EvidenceRecord.id).where(
-                    EvidenceRecord.task_id == task.id
-                )
+                select(EvidenceRecord.id).where(EvidenceRecord.task_id == task.id)
             )
             assert evidence_id is not None
             task_id = task.id
@@ -1236,10 +1220,7 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         ):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE task_cancellations "
-                        "SET reason_code = 'REWRITTEN' WHERE id = :id"
-                    ),
+                    text("UPDATE task_cancellations SET reason_code = 'REWRITTEN' WHERE id = :id"),
                     {"id": cancellation_id.hex},
                 )
         with pytest.raises(
@@ -1248,9 +1229,7 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         ):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "DELETE FROM task_cancellations WHERE id = :id"
-                    ),
+                    text("DELETE FROM task_cancellations WHERE id = :id"),
                     {"id": cancellation_id.hex},
                 )
     finally:

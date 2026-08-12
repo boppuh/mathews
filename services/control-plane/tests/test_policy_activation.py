@@ -166,22 +166,31 @@ def test_rollback_creates_an_audited_successor_with_prior_immutable_memberships(
         activation_time_value=_NOW,
         authentication=_authentication(),
     )
+    with pytest.raises(PolicyActivationConflictError, match="policy rollback ids conflict"):
+        service.rollback(
+            policy_harness.source_policy_id,
+            activation_id=activation_id,
+            restored_policy_version_id=restored_id,
+            restore_from_policy_version_id=uuid4(),
+            activation_time_value=_NOW,
+            authentication=_authentication(),
+        )
 
     assert result.restored_policy_version == 3
     assert replay.replayed is True
     with policy_harness.factory() as session:
         restored = session.get(PolicyVersion, restored_id)
         activation = session.get(PolicyActivation, activation_id)
-        prompt_id = session.scalar(
-            select(PolicyVersionPromptTemplate.prompt_template_version_id).where(
-                PolicyVersionPromptTemplate.policy_version_id == restored_id
-            )
-        )
+        prompt_ids = session.scalars(
+            select(PolicyVersionPromptTemplate.prompt_template_version_id)
+            .where(PolicyVersionPromptTemplate.policy_version_id == restored_id)
+            .order_by(PolicyVersionPromptTemplate.position)
+        ).all()
     assert restored is not None
     assert restored.workflow_thresholds == {"version": 1}
     assert restored.predecessor_id == policy_harness.source_policy_id
     assert restored.rollback_policy_version_id == policy_harness.source_policy_id
-    assert prompt_id == policy_harness.rollback_prompt_id
+    assert prompt_ids == [policy_harness.rollback_prompt_id]
     assert activation is not None
     assert activation.activation_kind is PolicyActivationKind.ROLLBACK
     assert activation.subject_id == policy_harness.rollback_target_id
@@ -216,5 +225,56 @@ def test_rollback_rejects_any_target_other_than_the_recorded_active_target(
             restored_policy_version_id=uuid4(),
             restore_from_policy_version_id=uuid4(),
             activation_time_value=_NOW,
+            authentication=_authentication(),
+        )
+
+
+def test_rollback_uses_server_time_to_reject_a_newer_active_policy(
+    policy_harness: PolicyHarness,
+) -> None:
+    newer_policy_id = uuid4()
+    with policy_harness.factory.begin() as session:
+        source = session.get(PolicyVersion, policy_harness.source_policy_id)
+        assert source is not None
+        session.add(
+            PolicyVersion(
+                id=newer_policy_id,
+                lineage_key="mvp",
+                version=3,
+                predecessor_id=source.id,
+                workflow_thresholds={"version": 3},
+                approved_by="local-user",
+                approved_at=_NOW,
+                rollback_policy_version_id=source.id,
+                owner_id=source.owner_id,
+                actor_id="local-user",
+                root_correlation_id=source.root_correlation_id,
+            )
+        )
+    service = PolicyActivationService(policy_harness.factory, clock=lambda: _NOW)
+
+    with pytest.raises(PolicyActivationConflictError, match="active policy changed"):
+        service.rollback(
+            policy_harness.source_policy_id,
+            activation_id=uuid4(),
+            restored_policy_version_id=uuid4(),
+            restore_from_policy_version_id=policy_harness.rollback_target_id,
+            activation_time_value=_NOW - timedelta(seconds=30),
+            authentication=_authentication(),
+        )
+
+
+def test_rollback_rejects_an_activation_time_outside_the_server_window(
+    policy_harness: PolicyHarness,
+) -> None:
+    service = PolicyActivationService(policy_harness.factory, clock=lambda: _NOW)
+
+    with pytest.raises(PolicyActivationConflictError, match="stale or future-dated"):
+        service.rollback(
+            policy_harness.source_policy_id,
+            activation_id=uuid4(),
+            restored_policy_version_id=uuid4(),
+            restore_from_policy_version_id=policy_harness.rollback_target_id,
+            activation_time_value=_NOW + timedelta(minutes=5),
             authentication=_authentication(),
         )

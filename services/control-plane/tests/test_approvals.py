@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,6 +21,8 @@ from mathews_control_plane.approvals import (
     ApprovalService,
     BlockedOperation,
     InvalidApprovalError,
+    RuleRegressionReviewInput,
+    _rule_promotion_threshold_evidence,
 )
 from mathews_control_plane.artifacts import ArtifactStore
 from mathews_control_plane.authentication import (
@@ -47,6 +50,7 @@ from mathews_control_plane.domain_models import (
     EvidenceDeletionRequest,
     EvidenceRecord,
     PolicyActivation,
+    PolicyActivationKind,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PolicyVersionReviewRule,
@@ -228,6 +232,30 @@ def _service(
     )
 
 
+def _rule_regression_review(
+    service: ApprovalService,
+    candidate_id: UUID,
+) -> RuleRegressionReviewInput:
+    inbox = service.inbox(
+        AuthenticatedSession(
+            session_id=uuid4(),
+            user_id=1,
+            csrf_token_digest=b"test",
+            expires_at=_NOW + timedelta(hours=1),
+            absolute_expires_at=_NOW + timedelta(hours=1),
+            reauthenticated_until=_NOW + timedelta(hours=1),
+            evaluated_at=_NOW,
+            recent_password_verified=True,
+        )
+    )
+    candidate = next(item for item in inbox.rule_candidates if item.candidate_id == candidate_id)
+    return RuleRegressionReviewInput(
+        candidate_id=candidate.candidate_id,
+        candidate_fingerprint=candidate.candidate_fingerprint,
+        passed=True,
+    )
+
+
 def _request(
     service: ApprovalService,
     *,
@@ -394,9 +422,10 @@ def test_brief_revision_returns_only_to_briefing(
         subject_id=brief_id,
     )
 
+    decision_id = uuid4()
     result = service.decide(
         request_id,
-        decision_id=uuid4(),
+        decision_id=decision_id,
         decision=ApprovalDecision.REQUEST_REVISION,
         actor_id="local-user",
     )
@@ -650,12 +679,14 @@ def test_rule_candidate_approval_versions_rule_and_policy_without_prompts(
         subject_id=candidate_id,
     )
 
+    decision_id = uuid4()
     result = service.decide(
         request_id,
-        decision_id=uuid4(),
+        decision_id=decision_id,
         decision=ApprovalDecision.APPROVE,
         actor_id="local-user",
         recent_password_verified=True,
+        regression_review=_rule_regression_review(service, candidate_id),
     )
 
     assert result.task_state is TaskState.REPAIRING
@@ -684,9 +715,13 @@ def test_rule_candidate_approval_versions_rule_and_policy_without_prompts(
     ]
     assert prompt_memberships == []
     assert len(activations) == 1
+    assert activations[0].id == decision_id
+    assert activations[0].activation_kind is PolicyActivationKind.RULE_PROMOTION
     assert activations[0].subject_id == candidate_id
     assert activations[0].rollback_policy_version_id == policies[0].id
-    assert activations[0].threshold_evidence["human_regression_reviewed"] is True
+    review = cast(dict[str, object], activations[0].threshold_evidence["human_regression_review"])
+    assert review["passed"] is True
+    assert len(cast(str, review["review_fingerprint"])) == 64
 
 
 def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
@@ -742,6 +777,8 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
         response = client.get("/api/approvals/inbox")
         assert response.status_code == 200
         assert response.headers["cache-control"] == "no-store"
+        candidate_fingerprint = response.json()["rule_candidates"][0]["candidate_fingerprint"]
+        assert len(candidate_fingerprint) == 64
         assert response.json() == {
             "approvals": [
                 {
@@ -772,11 +809,12 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
             ],
             "rule_candidates": [
                 {
-                        "candidate_id": str(candidate_id),
-                        "approval_request_id": str(request_id),
-                        "authority": "NON_AUTHORITATIVE",
-                        "status": "EVALUATED",
-                        "task": {
+                    "candidate_id": str(candidate_id),
+                    "candidate_fingerprint": candidate_fingerprint,
+                    "approval_request_id": str(request_id),
+                    "authority": "NON_AUTHORITATIVE",
+                    "status": "EVALUATED",
+                    "task": {
                         "id": str(task_id),
                         "summary": "Implement approvals",
                         "repository": "boppuh/mathews",
@@ -814,7 +852,14 @@ def test_authenticated_inboxes_expose_bounded_decisions_and_record_audit(
         assert oversized.status_code == 413
         decided = client.post(
             f"/api/approvals/{request_id}/decisions",
-            json={"decision": "APPROVE"},
+            json={
+                "decision": "APPROVE",
+                "regression_review": {
+                    "candidate_id": str(candidate_id),
+                    "candidate_fingerprint": candidate_fingerprint,
+                    "passed": True,
+                },
+            },
             headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: bound_csrf},
         )
         assert decided.status_code == 200, decided.text
@@ -1004,6 +1049,24 @@ def test_policy_and_terminal_decisions_require_recent_password(
             actor_id="evaluation-worker",
             recent_password_verified=True,
         )
+    with pytest.raises(ApprovalConflictError, match="regression review is required"):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+            recent_password_verified=True,
+        )
+    review = _rule_regression_review(service, candidate_id)
+    with pytest.raises(ApprovalConflictError, match="regression review changed"):
+        service.decide(
+            request_id,
+            decision_id=uuid4(),
+            decision=ApprovalDecision.APPROVE,
+            actor_id="local-user",
+            recent_password_verified=True,
+            regression_review=review.model_copy(update={"candidate_fingerprint": "f" * 64}),
+        )
 
     with approval_harness.factory() as session:
         task = session.get(Task, task_id)
@@ -1033,6 +1096,7 @@ def test_rule_promotion_rejects_changed_or_unbound_candidate_evidence(
         request_type=ApprovalRequestType.REVIEW_RULE,
         subject_id=candidate_id,
     )
+    regression_review = _rule_regression_review(service, candidate_id)
     with approval_harness.factory.begin() as session:
         candidate = session.get(RuleCandidate, candidate_id)
         assert candidate is not None
@@ -1045,6 +1109,7 @@ def test_rule_promotion_rejects_changed_or_unbound_candidate_evidence(
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
             recent_password_verified=True,
+            regression_review=regression_review,
         )
 
     with approval_harness.factory() as session:
@@ -1090,6 +1155,7 @@ def test_rule_promotion_rejects_a_superseded_candidate_citation(
         request_type=ApprovalRequestType.REVIEW_RULE,
         subject_id=candidate_id,
     )
+    regression_review = _rule_regression_review(service, candidate_id)
     with approval_harness.factory.begin() as session:
         source = session.get(EvidenceRecord, evidence_id)
         assert source is not None
@@ -1118,6 +1184,7 @@ def test_rule_promotion_rejects_a_superseded_candidate_citation(
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
             recent_password_verified=True,
+            regression_review=regression_review,
         )
 
     with approval_harness.factory() as session:
@@ -1142,6 +1209,7 @@ def test_rule_promotion_rejects_a_deletion_requested_candidate_citation(
         request_type=ApprovalRequestType.REVIEW_RULE,
         subject_id=candidate_id,
     )
+    regression_review = _rule_regression_review(service, candidate_id)
     with approval_harness.factory.begin() as session:
         source = session.get(EvidenceRecord, evidence_id)
         assert source is not None
@@ -1165,6 +1233,7 @@ def test_rule_promotion_rejects_a_deletion_requested_candidate_citation(
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
             recent_password_verified=True,
+            regression_review=regression_review,
         )
 
     with approval_harness.factory() as session:
@@ -1189,6 +1258,7 @@ def test_rule_approval_is_bound_to_the_evaluated_definition(
         request_type=ApprovalRequestType.REVIEW_RULE,
         subject_id=candidate_id,
     )
+    regression_review = _rule_regression_review(service, candidate_id)
     with approval_harness.factory.begin() as session:
         candidate = session.get(RuleCandidate, candidate_id)
         assert candidate is not None and candidate.evaluation_result is not None
@@ -1207,6 +1277,7 @@ def test_rule_approval_is_bound_to_the_evaluated_definition(
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
             recent_password_verified=True,
+            regression_review=regression_review,
         )
 
 
@@ -1282,6 +1353,7 @@ def test_rule_promotion_uses_current_policy_and_preserves_lineage_position(
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
             recent_password_verified=True,
+            regression_review=_rule_regression_review(service, candidate_id),
         )
         return task_id, candidate_id
 
@@ -1350,6 +1422,7 @@ def test_rule_promotion_does_not_copy_a_future_policy(
         decision=ApprovalDecision.APPROVE,
         actor_id="local-user",
         recent_password_verified=True,
+        regression_review=_rule_regression_review(service, candidate_id),
     )
 
     with approval_harness.factory() as session:
@@ -1758,6 +1831,7 @@ def test_rule_promotion_rejects_missing_threshold_evidence(
             decision=ApprovalDecision.APPROVE,
             actor_id="local-user",
             recent_password_verified=True,
+            regression_review=_rule_regression_review(service, candidate_id),
         )
 
     with approval_harness.factory() as session:
@@ -1765,3 +1839,34 @@ def test_rule_promotion_rejects_missing_threshold_evidence(
         activation_count = session.scalar(select(func.count(PolicyActivation.id)))
     assert request is not None and request.status is ApprovalStatus.PENDING
     assert activation_count == 0
+
+
+def test_rule_promotion_counts_distinct_validation_occurrences(
+    approval_harness: ApprovalHarness,
+) -> None:
+    _task_id, _evidence_id, candidate_id = _create_task(
+        approval_harness,
+        state=TaskState.REPAIRING,
+        with_rule_candidate=True,
+    )
+    assert candidate_id is not None
+    with approval_harness.factory() as session:
+        candidate = session.get(RuleCandidate, candidate_id)
+        assert candidate is not None
+        candidate.severity_assessment = "LOW"
+        session.expunge(candidate)
+    evidence_ids = (uuid4(), uuid4())
+    occurrence_ids = (uuid4(), uuid4())
+    session = Mock(spec=Session)
+    session.execute.return_value = (
+        (evidence_ids[0], occurrence_ids[0]),
+        (evidence_ids[1], occurrence_ids[0]),
+    )
+    with pytest.raises(ApprovalConflictError, match="threshold"):
+        _rule_promotion_threshold_evidence(session, candidate, evidence_ids)
+    session.execute.return_value = tuple(zip(evidence_ids, occurrence_ids, strict=True))
+
+    evidence = _rule_promotion_threshold_evidence(session, candidate, evidence_ids)
+
+    assert evidence["confirmed_occurrence_count"] == 2
+    assert evidence["confirmed_occurrence_ids"] == sorted(map(str, occurrence_ids))

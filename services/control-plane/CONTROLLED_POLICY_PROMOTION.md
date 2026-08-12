@@ -20,6 +20,9 @@ following inputs:
   activation timestamp within the bounded clock-skew window.
 
 The service recomputes the frozen thresholds in the activation transaction.
+Evaluation writers take the same policy-lineage lock and reject new rows after
+that candidate has an activation record, so the comparison group cannot change
+while promotion is committing.
 It rejects missing, ineligible, cross-policy, stale, ambiguous, or changed
 inputs. A successful transaction creates the promoted immutable prompt, copies
 the remaining active policy memberships, creates the successor policy, and
@@ -31,10 +34,12 @@ Rule promotion remains part of the exact `REVIEW_RULE` approval flow. Approval
 requires a recently reauthenticated local human. Immediately before activation
 the service reloads and locks the candidate and cited evidence, verifies the
 stored evaluation and approval fingerprints, and records the exact candidate
-fingerprint, citations, human regression review, activation time, and prior
-active policy in the same transaction as the approved `ReviewRule` and policy
-successor. Eligibility requires one confirmed high-severity occurrence or at
-least two independently cited occurrences. The approved rule provenance also
+fingerprint, citations, explicit passing regression-review attestation and its
+fingerprint, activation time, and prior active policy in the same transaction as
+the approved `ReviewRule` and policy successor. The inbox requires the human to
+confirm that review for the exact displayed candidate before approval.
+Eligibility requires high severity or at least two distinct cited validation-run
+identities; producer names do not count as occurrences. The approved rule provenance also
 records its review time, 90-day review policy, and policy-rollback revocation
 path.
 

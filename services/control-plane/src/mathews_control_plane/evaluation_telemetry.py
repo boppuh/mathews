@@ -21,12 +21,14 @@ from mathews_control_plane.domain_models import (
     EvaluationContractVersion,
     HermesRun,
     HermesRunStatus,
+    PolicyActivation,
     PolicyVersion,
     PromptTemplateVersion,
     RetrievalIndexChunk,
     RetrievalIndexGeneration,
 )
 from mathews_control_plane.evidence import normalize_evidence_timestamp
+from mathews_control_plane.policy_activation import lock_policy_promotion
 from mathews_control_plane.principals import LOCAL_OWNER_ID
 from mathews_control_plane.retrieval_index import RetrievalSearchResult
 
@@ -173,6 +175,7 @@ class EvaluationTelemetryService:
             policy = session.get(PolicyVersion, run.policy_version_id)
             if prompt is None or policy is None:
                 raise EvaluationTelemetryValidationError("evaluation prompt binding is invalid")
+            lock_policy_promotion(session, policy.lineage_key)
             normalized_metrics = _metrics(metrics, contract)
             retrieval_set = _retrieval_set(session, retrieval, generation)
             payload = {
@@ -200,6 +203,16 @@ class EvaluationTelemetryService:
                     raise EvaluationTelemetryValidationError("agent run evaluation conflicts")
                 session.expunge(existing)
                 return existing
+            if (
+                session.scalar(
+                    select(PolicyActivation.id).where(
+                        PolicyActivation.subject_type == "PROMPT_TEMPLATE_VERSION",
+                        PolicyActivation.subject_id == prompt.id,
+                    )
+                )
+                is not None
+            ):
+                raise EvaluationTelemetryValidationError("evaluation group is closed")
             evaluation = AgentRunEvaluation(
                 run_id=run.id,
                 task_id=run.task_id,

@@ -14,7 +14,7 @@ from typing import Annotated, Literal, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -216,6 +216,7 @@ class ApprovalInboxItem(BaseModel):
 
 class RuleInboxItem(BaseModel):
     candidate_id: UUID
+    candidate_fingerprint: str
     approval_request_id: UUID | None
     authority: Literal["NON_AUTHORITATIVE"] = "NON_AUTHORITATIVE"
     status: Literal["EVALUATED"] = "EVALUATED"
@@ -238,10 +239,19 @@ class ApprovalInboxResponse(BaseModel):
     rule_candidates: list[RuleInboxItem]
 
 
+class RuleRegressionReviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    candidate_id: UUID
+    candidate_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    passed: bool
+
+
 class ApprovalDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     decision: PublicApprovalDecision
+    regression_review: RuleRegressionReviewInput | None = None
 
 
 class ApprovalDecisionResponse(BaseModel):
@@ -644,6 +654,7 @@ def _decision_fingerprint(
     decision: ApprovalDecision,
     actor_id: str,
     evidence_ids: Sequence[UUID],
+    regression_review: RuleRegressionReviewInput | None,
 ) -> str:
     return _fingerprint(
         {
@@ -652,6 +663,9 @@ def _decision_fingerprint(
             "decision_evidence_ids": [str(value) for value in evidence_ids],
             "decision_id": str(decision_id),
             "request_id": str(request_id),
+            "regression_review": (
+                None if regression_review is None else regression_review.model_dump(mode="json")
+            ),
         }
     )
 
@@ -987,26 +1001,33 @@ def _rule_promotion_threshold_evidence(
     severity = candidate.severity_assessment.strip().upper()
     if severity not in {"LOW", "MEDIUM", "HIGH"}:
         raise ApprovalConflictError("rule candidate severity is invalid")
-    origins = tuple(
-        session.scalars(
-            select(EvidenceRecord.origin).where(
+    evidence_rows = tuple(
+        session.execute(
+            select(EvidenceRecord.id, EvidenceRecord.validation_run_id).where(
                 EvidenceRecord.id.in_(cited_evidence_ids),
                 EvidenceRecord.owner_id == candidate.owner_id,
                 EvidenceRecord.deleted_at.is_(None),
             )
         )
     )
-    if len(origins) != len(cited_evidence_ids):
+    if len(evidence_rows) != len(cited_evidence_ids):
         raise ApprovalConflictError("rule candidate evidence is unavailable")
-    confirmed_occurrences = len(set(origins))
-    eligible = severity == "HIGH" or confirmed_occurrences >= 2
+    occurrence_ids = sorted(
+        {
+            str(validation_run_id)
+            for _evidence_id, validation_run_id in evidence_rows
+            if validation_run_id
+        }
+    )
+    eligible = severity == "HIGH" or len(occurrence_ids) >= 2
     if not eligible:
         raise ApprovalConflictError("rule promotion threshold is not satisfied")
     return {
         "schema_version": 1,
         "eligibility_rule": "HIGH_SEVERITY_OR_TWO_CONFIRMED_OCCURRENCES",
         "severity": severity,
-        "confirmed_occurrence_evidence_count": confirmed_occurrences,
+        "confirmed_occurrence_count": len(occurrence_ids),
+        "confirmed_occurrence_ids": occurrence_ids,
         "promotion_eligible": True,
     }
 
@@ -1382,7 +1403,7 @@ class ApprovalService:
                     approval_item.unavailable_reason = "RULE_CANDIDATE_UNAVAILABLE"
                     continue
                 try:
-                    rule, stored_cited_evidence_ids, _candidate_fingerprint = (
+                    rule, stored_cited_evidence_ids, candidate_fingerprint = (
                         _validated_rule_candidate(
                             session,
                             task,
@@ -1413,6 +1434,7 @@ class ApprovalService:
                 rule_candidates.append(
                     RuleInboxItem(
                         candidate_id=candidate.id,
+                        candidate_fingerprint=candidate_fingerprint,
                         approval_request_id=request.id,
                         task=task_summary,
                         proposed_rule=candidate.proposed_rule,
@@ -1446,13 +1468,11 @@ class ApprovalService:
                 if candidate.id in projected_candidate_ids:
                     continue
                 try:
-                    rule, candidate_evidence_ids, _candidate_fingerprint = (
-                        _validated_rule_candidate(
-                            session,
-                            task,
-                            candidate,
-                            artifact_store=self._artifact_store,
-                        )
+                    rule, candidate_evidence_ids, candidate_fingerprint = _validated_rule_candidate(
+                        session,
+                        task,
+                        candidate,
+                        artifact_store=self._artifact_store,
                     )
                 except ApprovalConflictError:
                     _LOGGER.warning(
@@ -1463,6 +1483,7 @@ class ApprovalService:
                 rule_candidates.append(
                     RuleInboxItem(
                         candidate_id=candidate.id,
+                        candidate_fingerprint=candidate_fingerprint,
                         approval_request_id=None,
                         task=ApprovalTaskSummary(
                             id=task.id,
@@ -1698,6 +1719,7 @@ class ApprovalService:
         evidence_ids: Sequence[UUID] = (),
         expected_owner_id: str | None = None,
         recent_password_verified: bool | None = None,
+        regression_review: RuleRegressionReviewInput | None = None,
     ) -> ApprovalDecisionResult:
         normalized_actor = _required_identifier(
             actor_id,
@@ -1780,6 +1802,7 @@ class ApprovalService:
                     decision=effective_decision,
                     actor_id=normalized_actor,
                     evidence_ids=decision_evidence_ids,
+                    regression_review=regression_review,
                 )
                 if request.status is not ApprovalStatus.PENDING:
                     if (
@@ -1829,23 +1852,31 @@ class ApprovalService:
                     request_type is ApprovalRequestType.REVIEW_RULE
                     and effective_decision is ApprovalDecision.APPROVE
                 )
-                if (
-                    effective_decision is not ApprovalDecision.EXPIRE
-                    and (
-                        (rule_promotion and (
+                if effective_decision is not ApprovalDecision.EXPIRE and (
+                    (
+                        rule_promotion
+                        and (
                             recent_password_verified is not True
                             or normalized_actor != LOCAL_OWNER_ID
-                        ))
-                        or (
-                            recent_password_verified is False
-                            and transition_kind
-                            in {TaskTransitionKind.CANCEL, TaskTransitionKind.FAIL}
                         )
+                    )
+                    or (
+                        recent_password_verified is False
+                        and transition_kind in {TaskTransitionKind.CANCEL, TaskTransitionKind.FAIL}
                     )
                 ):
                     raise ApprovalRecentPasswordRequiredError(
                         "recent password authentication required"
                     )
+                if rule_promotion:
+                    if (
+                        regression_review is None
+                        or not regression_review.passed
+                        or regression_review.candidate_id != request.subject_id
+                    ):
+                        raise ApprovalConflictError("rule regression review is required")
+                elif regression_review is not None:
+                    raise InvalidApprovalError("regression review is only valid for rule promotion")
                 if (
                     request_type is ApprovalRequestType.BRIEF
                     and effective_decision is ApprovalDecision.APPROVE
@@ -1909,6 +1940,7 @@ class ApprovalService:
                     decision=effective_decision,
                     actor_id=normalized_actor,
                     decided_at=now,
+                    regression_review=regression_review,
                 )
                 session.flush()
                 event = _append_approval_event(
@@ -2064,6 +2096,7 @@ class ApprovalService:
         decision: ApprovalDecision,
         actor_id: str,
         decided_at: datetime,
+        regression_review: RuleRegressionReviewInput | None,
     ) -> None:
         request_type = _request_type(request)
         if request_type is ApprovalRequestType.BRIEF:
@@ -2119,6 +2152,7 @@ class ApprovalService:
                     candidate,
                     actor_id=actor_id,
                     approved_at=decided_at,
+                    regression_review=regression_review,
                 )
 
     def _promote_review_rule(
@@ -2130,14 +2164,13 @@ class ApprovalService:
         *,
         actor_id: str,
         approved_at: datetime,
+        regression_review: RuleRegressionReviewInput | None,
     ) -> None:
-        definition, _validated_evidence_ids, candidate_fingerprint = (
-            _validated_rule_candidate(
-                session,
-                task,
-                candidate,
-                artifact_store=self._artifact_store,
-            )
+        definition, _validated_evidence_ids, candidate_fingerprint = _validated_rule_candidate(
+            session,
+            task,
+            candidate,
+            artifact_store=self._artifact_store,
         )
         cited_evidence_ids = _candidate_evidence_ids(
             session,
@@ -2148,6 +2181,20 @@ class ApprovalService:
         )
         if not set(cited_evidence_ids).issubset(_stored_evidence_ids(request)):
             raise ApprovalConflictError("rule candidate evidence is not bound to the approval")
+        if (
+            regression_review is None
+            or not regression_review.passed
+            or regression_review.candidate_id != candidate.id
+            or regression_review.candidate_fingerprint != candidate_fingerprint
+        ):
+            raise ApprovalConflictError("rule regression review changed")
+        regression_review_fingerprint = _fingerprint(
+            {
+                "approved_at": approved_at.isoformat(),
+                "approved_by": actor_id,
+                **regression_review.model_dump(mode="json"),
+            }
+        )
         threshold_evidence = _rule_promotion_threshold_evidence(
             session,
             candidate,
@@ -2229,6 +2276,10 @@ class ApprovalService:
                 "review_policy": "HUMAN_REVIEW_REQUIRED_EVERY_90_DAYS",
                 "revocation_path": "ROLLBACK_ACTIVE_POLICY_VERSION",
                 "promotion_threshold_evidence": threshold_evidence,
+                "regression_review": {
+                    **regression_review.model_dump(mode="json"),
+                    "review_fingerprint": regression_review_fingerprint,
+                },
             },
             approved_by=actor_id,
             approved_at=approved_at,
@@ -2311,9 +2362,13 @@ class ApprovalService:
                 "candidate_evaluation_passed": True,
                 "approval_request_id": str(request.id),
                 "approval_request_fingerprint": request.request_fingerprint,
-                "human_regression_reviewed": True,
+                "human_regression_review": {
+                    **regression_review.model_dump(mode="json"),
+                    "review_fingerprint": regression_review_fingerprint,
+                },
             },
             evidence_ids=cited_evidence_ids,
+            regression_reviewed=regression_review.passed,
             approved_by=actor_id,
             activated_at=approved_at,
         )
@@ -2478,6 +2533,7 @@ def create_approval_router(
                 actor_id=owner_id,
                 expected_owner_id=owner_id,
                 recent_password_verified=(authentication.recent_password_verified),
+                regression_review=body.regression_review,
             )
             if result.decision is ApprovalDecision.EXPIRE:
                 raise ApprovalConflictError("approval request expired")
