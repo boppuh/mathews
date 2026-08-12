@@ -117,6 +117,7 @@ def repository_harness(tmp_path: Path) -> Iterator[RepositoryHarness]:
         factory,
         store,
         host_gateway=gateway,
+        repository_key="boppuh/mathews",
     )
     app = create_app(
         Settings(database_url=SecretStr(database_url), artifact_root=store.root),

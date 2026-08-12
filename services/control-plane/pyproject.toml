@@ -19,6 +19,7 @@ dependencies = [
 mathews-api = "mathews_control_plane.__main__:main"
 mathews-auth-bootstrap-token = "mathews_control_plane.authentication:bootstrap_token_main"
 mathews-config-check = "mathews_control_plane.configuration:main"
+mathews-bootstrap-mvp-authority = "mathews_control_plane.mvp_authority_bootstrap:main"
 mathews-worker = "mathews_control_plane.worker:main"
 
 [build-system]

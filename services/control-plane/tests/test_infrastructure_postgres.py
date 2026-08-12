@@ -61,6 +61,7 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
 )
+from mathews_control_plane.mvp_authority_bootstrap import MvpAuthorityBootstrapService
 from mathews_control_plane.reliability import CancellationService
 from mathews_control_plane.repository_configuration import (
     begin_preflight_attempt,
@@ -75,7 +76,7 @@ from mathews_control_plane.task_state_machine import (
     TaskTransitionResult,
     TaskTransitionService,
 )
-from sqlalchemy import inspect, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
@@ -910,6 +911,45 @@ def test_postgres_migrations_and_durable_storage_smoke(tmp_path: Path) -> None:
             AuthenticationService(recreated_factory).authenticate(issued_session.session_token)
             is None
         )
+    finally:
+        if engine is not None:
+            engine.dispose()
+        try:
+            if schema_created:
+                with admin_engine.begin() as connection:
+                    connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        finally:
+            admin_engine.dispose()
+
+
+def test_postgres_mvp_bootstrap_serializes_concurrent_initial_writers() -> None:
+    admin_database_url = _configured_database_url()
+    schema = f"mathews_bootstrap_{uuid4().hex}"
+    database_url = _schema_database_url(admin_database_url, schema)
+    migration_config = _migration_config(database_url)
+    admin_engine = create_database_engine(admin_database_url)
+    engine: Engine | None = None
+    schema_created = False
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        schema_created = True
+        command.upgrade(migration_config, "head")
+        engine = create_database_engine(database_url)
+        factory = create_session_factory(engine)
+
+        def bootstrap() -> str:
+            return MvpAuthorityBootstrapService(
+                factory,
+                repository="boppuh/mathews-ios-acceptance",
+            ).bootstrap().operation
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            operations = sorted(executor.map(lambda _value: bootstrap(), range(4)))
+
+        assert operations == ["created", "replayed", "replayed", "replayed"]
+        with factory() as session:
+            assert session.scalar(select(func.count(PolicyVersion.id))) == 1
     finally:
         if engine is not None:
             engine.dispose()

@@ -135,7 +135,12 @@ def webhook_harness(tmp_path: Path) -> Iterator[WebhookHarness]:
         head_sha=_HEAD_SHA,
         required_checks=("test",),
     )
-    task_service = TaskService(factory, store, clock=lambda: clock[0])
+    task_service = TaskService(
+        factory,
+        store,
+        repository_key="boppuh/mathews",
+        clock=lambda: clock[0],
+    )
     app = create_app(
         Settings(database_url=SecretStr(database_url), artifact_root=store.root),
         session_factory=factory,

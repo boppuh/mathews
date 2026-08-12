@@ -53,7 +53,6 @@ from mathews_control_plane.repository_configuration import (
     validated_repository_configuration,
 )
 
-ALLOWED_REPOSITORY_KEY = "boppuh/mathews"
 MAX_REPOSITORY_BODY_BYTES = 512 * 1024
 _MAX_REPOSITORY_BODY_CHUNKS = 4096
 _OWNER_ID = LOCAL_OWNER_ID
@@ -169,7 +168,7 @@ class RepositoryService:
         *,
         host_gateway: RepositoryHostGateway | None = None,
         clock: Clock | None = None,
-        repository_key: str = ALLOWED_REPOSITORY_KEY,
+        repository_key: str | None,
     ) -> None:
         self._factory = factory
         self._artifact_store = artifact_store
@@ -179,8 +178,9 @@ class RepositoryService:
 
     def current(self, authentication: AuthenticatedSession) -> RepositoryProjection:
         self._principal(authentication)
+        repository_key = self._required_repository_key()
         with self._factory() as session:
-            configuration = get_latest_repository_configuration(session, self._repository_key)
+            configuration = get_latest_repository_configuration(session, repository_key)
             return self._projection(session, configuration)
 
     def create_version(
@@ -189,7 +189,8 @@ class RepositoryService:
         authentication: AuthenticatedSession,
     ) -> RepositoryProjection:
         actor_id = self._principal(authentication)
-        if body.repository_key != self._repository_key:
+        repository_key = self._required_repository_key()
+        if body.repository_key != repository_key:
             raise ValueError("only the configured repository may be changed")
         now = _as_utc(self._clock())
         if not body.approve_sensitive_change:
@@ -203,7 +204,7 @@ class RepositoryService:
         with self._factory() as session, session.begin():
             _lock_repository_writer(session)
             latest = get_latest_repository_configuration(
-                session, self._repository_key, for_update=True
+                session, repository_key, for_update=True
             )
             expected_version = body.expected_configuration_version
             if (latest is None and expected_version is not None) or (
@@ -216,7 +217,7 @@ class RepositoryService:
             root_id = uuid4()
             created = create_repository_configuration(
                 session,
-                repository_key=self._repository_key,
+                repository_key=repository_key,
                 repository_settings=cast(Mapping[str, object], materialized["repository_settings"]),
                 git_settings=cast(Mapping[str, object], materialized["git_settings"]),
                 xcode_settings=cast(Mapping[str, object], materialized["xcode_settings"]),
@@ -234,12 +235,13 @@ class RepositoryService:
 
     def preflight(self, authentication: AuthenticatedSession) -> RepositoryProjection:
         actor_id = self._principal(authentication)
+        repository_key = self._required_repository_key()
         if self._host_gateway is None:
             raise HostGatewayError("HOST_UNAVAILABLE")
         now = _as_utc(self._clock())
         root_id = uuid4()
         with self._factory() as session, session.begin():
-            configuration = get_latest_repository_configuration(session, self._repository_key)
+            configuration = get_latest_repository_configuration(session, repository_key)
             if configuration is None:
                 raise RepositoryUnavailableError("repository configuration is unavailable")
             attempt = begin_preflight_attempt(
@@ -301,7 +303,7 @@ class RepositoryService:
                     captured_at=_as_utc(self._clock()),
                     causation_id=request.request_id,
                 )
-                configuration = get_latest_repository_configuration(session, self._repository_key)
+                configuration = get_latest_repository_configuration(session, repository_key)
                 return self._projection(session, configuration)
         except RepositoryPreflightBindingError:
             self._clear_failed_preflight(attempt)
@@ -322,7 +324,7 @@ class RepositoryService:
     ) -> RepositoryProjection:
         if configuration is None:
             return RepositoryProjection(
-                repository_key=self._repository_key,
+                repository_key=self._required_repository_key(),
                 configured=False,
                 mutation_blocked=True,
                 configuration=None,
@@ -358,7 +360,7 @@ class RepositoryService:
             preflight = RepositoryPreflightProjection(status="BLOCKED")
         projection = _configuration_projection(configuration)
         return RepositoryProjection(
-            repository_key=self._repository_key,
+            repository_key=self._required_repository_key(),
             configured=True,
             mutation_blocked=preflight.status != "PASSED",
             configuration=projection,
@@ -371,6 +373,11 @@ class RepositoryService:
         if authentication.user_id != _USER_ID:
             raise PermissionError("repository configuration is unavailable")
         return _OWNER_ID
+
+    def _required_repository_key(self) -> str:
+        if self._repository_key is None:
+            raise RepositoryUnavailableError("canonical repository is not configured")
+        return self._repository_key
 
 
 def _materialize_configuration(
@@ -538,6 +545,11 @@ def create_repository_router(service: RepositoryService) -> APIRouter:
             return await run_in_threadpool(service.current, authentication)
         except PermissionError:
             raise HTTPException(status_code=404, detail="repository is unavailable") from None
+        except RepositoryUnavailableError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="canonical repository is not configured",
+            ) from None
 
     @router.post("/versions", response_model=RepositoryProjection, status_code=201)
     async def create_version(
@@ -557,6 +569,11 @@ def create_repository_router(service: RepositoryService) -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="repository configuration changed; reload and try again",
+            ) from None
+        except RepositoryUnavailableError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="canonical repository is not configured",
             ) from None
         except (ValueError, SharedRepositoryConfigurationError):
             raise HTTPException(

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from mathews_configuration import (
@@ -9,10 +9,20 @@ from mathews_configuration import (
     SecretReference,
     validate_host_identifier,
 )
-from pydantic import AnyHttpUrl, PositiveInt, SecretStr, field_validator
+from pydantic import AnyHttpUrl, PositiveInt, SecretStr, StringConstraints, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 EnvironmentName = Literal["local", "test", "staging", "production"]
+GitHubRepositoryName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        to_lower=True,
+        min_length=3,
+        max_length=140,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,38})/[a-z0-9](?:[a-z0-9._-]{0,99})$",
+    ),
+]
 
 
 class ConfigurationIncompleteError(RuntimeError):
@@ -34,6 +44,7 @@ class AutomationConfiguration:
     host_auth_key_id: str
     hermes_endpoint: AnyHttpUrl
     hermes_api_key_ref: SecretReference
+    github_repository: str
     github_app_id: int
     github_installation_id: int
     github_repository_id: int
@@ -83,6 +94,7 @@ class Settings(BaseSettings):
     host_auth_key_ref: SecretReference | None = None
     hermes_endpoint: AnyHttpUrl | None = None
     hermes_api_key_ref: SecretReference | None = None
+    github_repository: GitHubRepositoryName | None = None
     github_app_id: PositiveInt | None = None
     github_installation_id: PositiveInt | None = None
     github_repository_id: PositiveInt | None = None
@@ -101,6 +113,14 @@ class Settings(BaseSettings):
     def empty_value_is_unconfigured(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("github_repository", mode="before")
+    @classmethod
+    def normalize_github_repository(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized or None
         return value
 
     @field_validator(
@@ -128,6 +148,13 @@ class Settings(BaseSettings):
         if not expanded.is_absolute():
             raise ValueError("target repository root must be an absolute path")
         return expanded.resolve(strict=False)
+
+    @field_validator("github_repository")
+    @classmethod
+    def github_repository_is_canonical(cls, value: str | None) -> str | None:
+        if value is not None and value.endswith(".git"):
+            raise ValueError("GitHub repository name must not use a transport suffix")
+        return value
 
     @field_validator("artifact_root", "host_socket_path")
     @classmethod
@@ -159,6 +186,7 @@ class Settings(BaseSettings):
             ("host_auth_key_ref", self.host_auth_key_ref),
             ("hermes_endpoint", self.hermes_endpoint),
             ("hermes_api_key_ref", self.hermes_api_key_ref),
+            ("github_repository", self.github_repository),
             ("github_app_id", self.github_app_id),
             ("github_installation_id", self.github_installation_id),
             ("github_repository_id", self.github_repository_id),
@@ -186,6 +214,7 @@ class Settings(BaseSettings):
             host_auth_key_id=self.host_auth_key_id,
             hermes_endpoint=cast(AnyHttpUrl, self.hermes_endpoint),
             hermes_api_key_ref=cast(SecretReference, self.hermes_api_key_ref),
+            github_repository=cast(str, self.github_repository),
             github_app_id=cast(int, self.github_app_id),
             github_installation_id=cast(int, self.github_installation_id),
             github_repository_id=cast(int, self.github_repository_id),
@@ -217,6 +246,7 @@ class Settings(BaseSettings):
             ),
             "hermes_endpoint": _safe_url(self.hermes_endpoint),
             "hermes_api_key_ref": _reference_status(self.hermes_api_key_ref),
+            "github_repository": self.github_repository,
             "github_app_id": self.github_app_id,
             "github_installation_id": self.github_installation_id,
             "github_repository_id": self.github_repository_id,

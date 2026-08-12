@@ -53,6 +53,15 @@ MATHEWS_GITHUB_INSTALLATION_ID=456
 MATHEWS_GITHUB_REPOSITORY_ID=789
 ```
 
+Bind those numeric values to the one normalized canonical repository name:
+
+```dotenv
+MATHEWS_GITHUB_REPOSITORY=boppuh/mathews-ios-acceptance
+```
+
+Task intake, repository configuration, preflight, draft-PR operations, and
+webhook correlation all use this same value and fail closed when it is absent.
+
 Do not put the PEM private key, webhook secret, or installation token in
 `.env`, command arguments, logs, task evidence, or prompts.
 

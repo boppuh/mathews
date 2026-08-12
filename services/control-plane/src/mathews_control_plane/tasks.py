@@ -127,6 +127,10 @@ class TaskAccessError(RuntimeError):
     """The authenticated principal is not a supported local task owner."""
 
 
+class TaskRepositoryError(RuntimeError):
+    """Task intake is outside the one configured repository authority."""
+
+
 class TaskCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -404,10 +408,12 @@ class TaskService:
         session_factory: SessionFactory,
         artifact_store: ArtifactStore,
         *,
+        repository_key: str | None,
         clock: Clock | None = None,
     ) -> None:
         self._factory = session_factory
         self._artifact_store = artifact_store
+        self._repository_key = repository_key
         self._clock = clock or (lambda: datetime.now(UTC))
         self._steering = SteeringService(
             session_factory,
@@ -426,6 +432,10 @@ class TaskService:
         authentication: AuthenticatedSession,
     ) -> TaskSummaryResponse:
         owner_id = _principal(authentication)
+        if self._repository_key is None:
+            raise TaskRepositoryError("canonical repository is not configured")
+        if body.repository != self._repository_key:
+            raise TaskRepositoryError("task repository is outside configured authority")
         occurred_at = _as_utc(self._clock())
         summary = _request_summary(body.request)
 
@@ -2027,6 +2037,11 @@ def create_task_router(service: TaskService) -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="tasks unavailable",
+            ) from None
+        except TaskRepositoryError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="task repository does not match the configured repository",
             ) from None
 
     return router

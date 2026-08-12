@@ -78,7 +78,6 @@ from mathews_control_plane.reliability import (
     StartupRecoveryService,
 )
 from mathews_control_plane.repositories import (
-    ALLOWED_REPOSITORY_KEY,
     RepositoryBodyLimitMiddleware,
     RepositoryService,
     create_repository_router,
@@ -186,6 +185,7 @@ def create_app(
         task_service = TaskService(
             session_factory,
             artifact_store,
+            repository_key=current_settings.github_repository,
         )
     if approval_service is None:
         approval_service = ApprovalService(
@@ -222,6 +222,7 @@ def create_app(
             session_factory,
             artifact_store,
             host_gateway=host_gateway,
+            repository_key=current_settings.github_repository,
         )
     if validation_evidence_scheduler is None:
         validation_evidence_scheduler = ValidationEvidenceJobScheduler(
@@ -241,7 +242,6 @@ def create_app(
     if github_webhook_service is None and current_settings.automation_ready:
         github_configuration = build_github_app_configuration(
             current_settings.require_automation_configuration(),
-            repository_key=ALLOWED_REPOSITORY_KEY,
         )
         github_webhook_service = GitHubWebhookService(
             session_factory,

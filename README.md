@@ -40,8 +40,9 @@ opaque Keychain references and credential values remain on the macOS host.
 ## Configuration and secrets
 
 The control plane validates environment values as typed settings. A complete
-automation configuration includes one absolute repository root, the Hermes
-endpoint, GitHub App, installation, and exact repository identifiers, and these
+automation configuration includes one canonical GitHub `owner/repository` name,
+one absolute repository root, the Hermes endpoint, GitHub App, installation,
+and exact repository identifiers, and these
 opaque references:
 
 | Setting | Keychain reference |
@@ -64,6 +65,17 @@ uv run --package mathews-control-plane mathews-config-check
 
 The command exits with status 2 until every required integration setting is
 present. It reports only redaction markers and opaque provider status.
+
+After migrations, initialize or inspect the immutable MVP policy, promoted role
+prompts, and controlled review rule using
+[`services/control-plane/MVP_AUTHORITY_BOOTSTRAP.md`](services/control-plane/MVP_AUTHORITY_BOOTSTRAP.md).
+Previewing the deterministic, non-secret identifiers and fingerprints does not
+write the database:
+
+```bash
+uv run --package mathews-control-plane \
+  mathews-bootstrap-mvp-authority --dry-run
+```
 
 Verify that a Keychain item exists without printing its value:
 

@@ -122,7 +122,12 @@ def task_harness(tmp_path: Path) -> Iterator[TaskHarness]:
     # the service clock aligned rather than letting this fixture age into expiry.
     clock = MutableClock(datetime.now(UTC).replace(microsecond=0))
     authentication_service = AuthenticationService(factory, clock=clock)
-    task_service = TaskService(factory, store, clock=clock)
+    task_service = TaskService(
+        factory,
+        store,
+        repository_key="boppuh/mathews",
+        clock=clock,
+    )
     app = create_app(
         Settings(
             database_url=SecretStr(database_url),
@@ -950,6 +955,29 @@ def test_create_rejects_invalid_or_extra_input_without_echoing_it(
 
     assert response.status_code == 422
     assert response.json() == {"detail": "invalid request"}
+    with task_harness.factory() as session:
+        assert session.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_create_rejects_a_valid_repository_outside_configured_authority(
+    task_harness: TaskHarness,
+) -> None:
+    csrf_token = _authenticate(task_harness)
+
+    response = task_harness.client.post(
+        "/api/tasks",
+        json={
+            "repository": "boppuh/another-repository",
+            "base_revision": _BASE_SHA,
+            "request": "Create a task.",
+        },
+        headers={"Origin": _ORIGIN, CSRF_HEADER_NAME: csrf_token},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "task repository does not match the configured repository"
+    }
     with task_harness.factory() as session:
         assert session.scalar(select(func.count()).select_from(Task)) == 0
 
