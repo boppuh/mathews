@@ -111,6 +111,12 @@ class RuleCandidateStatus(StrEnum):
     APPROVED = "APPROVED"
 
 
+class PolicyActivationKind(StrEnum):
+    PROMPT_PROMOTION = "PROMPT_PROMOTION"
+    RULE_PROMOTION = "RULE_PROMOTION"
+    ROLLBACK = "ROLLBACK"
+
+
 class BackgroundJobStatus(StrEnum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
@@ -1369,6 +1375,60 @@ class PolicyVersion(RecordContext, Base):
     approved_by: Mapped[str] = mapped_column(String(255), nullable=False)
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     rollback_policy_version_id: Mapped[UUID | None] = mapped_column(Uuid)
+
+
+class PolicyActivation(RecordContext, Base):
+    """Immutable human authorization and evidence for one active policy version."""
+
+    __tablename__ = "policy_activations"
+    __table_args__ = (
+        CheckConstraint("source_policy_version_id <> policy_version_id", name="source_not_active"),
+        CheckConstraint(
+            "rollback_policy_version_id <> policy_version_id",
+            name="rollback_not_active",
+        ),
+        CheckConstraint(
+            "subject_version IS NULL OR subject_version > 0",
+            name="subject_version_positive",
+        ),
+        CheckConstraint("regression_reviewed = true", name="regression_review_required"),
+        CheckConstraint(
+            "length(subject_fingerprint) = 64",
+            name="subject_fingerprint_length",
+        ),
+        CheckConstraint(
+            "length(activation_fingerprint) = 64",
+            name="activation_fingerprint_length",
+        ),
+        UniqueConstraint("policy_version_id", name="uq_policy_activation_version"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    policy_version_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("policy_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_policy_version_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("policy_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    rollback_policy_version_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("policy_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    activation_kind: Mapped[PolicyActivationKind] = mapped_column(
+        _enum(PolicyActivationKind, name="policy_activation_kind"), nullable=False
+    )
+    subject_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    subject_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    subject_version: Mapped[int | None] = mapped_column(Integer)
+    subject_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    evaluation_contract_version_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("evaluation_contract_versions.id", ondelete="RESTRICT")
+    )
+    threshold_evidence: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    evidence_ids: Mapped[list[object]] = mapped_column(JSON, nullable=False)
+    regression_reviewed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    approved_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    activation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 class PolicyVersionReviewRule(RecordContext, Base):

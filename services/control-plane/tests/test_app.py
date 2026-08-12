@@ -16,6 +16,8 @@ def test_health() -> None:
     }
     assert "/api/validation-evidence/collections" in paths
     assert "/api/validation-decisions/{task_id}/{commit_sha}/{tree_sha}" in paths
+    assert "/api/prompts/{candidate_id}/promotions" in paths
+    assert "/api/policies/{source_policy_version_id}/rollback" in paths
     response = client.get("/health")
 
     assert response.status_code == 200
@@ -36,6 +38,13 @@ def test_health() -> None:
     assert oversized.json() == {
         "detail": "validation evidence request body too large"
     }
+    oversized_promotion = client.post(
+        "/api/prompts/00000000-0000-4000-8000-000000000001/promotions",
+        content=b"x" * (32 * 1024 + 1),
+        headers={"Content-Type": "application/json"},
+    )
+    assert oversized_promotion.status_code == 413
+    assert oversized_promotion.json() == {"detail": "policy activation body too large"}
 
     preflight = client.options(
         "/health",

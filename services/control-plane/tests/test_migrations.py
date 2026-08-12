@@ -92,6 +92,7 @@ EXPECTED_HEAD_TABLES = {
     "validation_runs",
     "webhook_deliveries",
     "owned_host_processes",
+    "policy_activations",
 }
 RELIABILITY_TABLES = {
     "background_job_ignored_results",
@@ -120,6 +121,7 @@ CANDIDATE_LEARNING_TABLES = {
     "evidence_derivative_citations",
     "rule_candidate_citations",
 }
+CONTROLLED_POLICY_TABLES = {"policy_activations"}
 
 
 def _migration_config(database_url: str) -> Config:
@@ -145,6 +147,80 @@ def test_migrations_are_repeatable_from_clean_database(tmp_path: Path) -> None:
     command.upgrade(config, "head")
 
     assert _table_names(database_url) == EXPECTED_HEAD_TABLES
+
+
+def test_controlled_policy_activation_audit_is_append_only(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'migrations.sqlite3'}"
+    config = _migration_config(database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    source_policy_id = uuid4()
+    active_policy_id = uuid4()
+    activation_id = uuid4()
+    correlation_id = uuid4()
+    subject_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            for policy_id, version, predecessor_id, rollback_id in (
+                (source_policy_id, 1, None, None),
+                (active_policy_id, 2, source_policy_id, source_policy_id),
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO policy_versions ("
+                        "id, lineage_key, version, predecessor_id, workflow_thresholds, "
+                        "approved_by, approved_at, rollback_policy_version_id, owner_id, "
+                        "actor_id, root_correlation_id) VALUES ("
+                        ":id, 'mvp', :version, :predecessor_id, '{}', 'local-user', "
+                        "CURRENT_TIMESTAMP, :rollback_id, 'local-user', 'local-user', "
+                        ":correlation_id)"
+                    ),
+                    {
+                        "id": policy_id.hex,
+                        "version": version,
+                        "predecessor_id": (None if predecessor_id is None else predecessor_id.hex),
+                        "rollback_id": None if rollback_id is None else rollback_id.hex,
+                        "correlation_id": correlation_id.hex,
+                    },
+                )
+            connection.execute(
+                text(
+                    "INSERT INTO policy_activations ("
+                    "id, policy_version_id, source_policy_version_id, "
+                    "rollback_policy_version_id, activation_kind, subject_type, "
+                    "subject_id, subject_version, subject_fingerprint, "
+                    "threshold_evidence, evidence_ids, regression_reviewed, approved_by, "
+                    "activated_at, activation_fingerprint, owner_id, actor_id, "
+                    "root_correlation_id) VALUES ("
+                    ":id, :policy_id, :source_id, :source_id, 'ROLLBACK', "
+                    "'POLICY_VERSION', :subject_id, 1, :subject_fingerprint, '{}', '[]', "
+                    "1, 'local-user', CURRENT_TIMESTAMP, :activation_fingerprint, "
+                    "'local-user', 'local-user', :correlation_id)"
+                ),
+                {
+                    "id": activation_id.hex,
+                    "policy_id": active_policy_id.hex,
+                    "source_id": source_policy_id.hex,
+                    "subject_id": subject_id.hex,
+                    "subject_fingerprint": "a" * 64,
+                    "activation_fingerprint": "b" * 64,
+                    "correlation_id": correlation_id.hex,
+                },
+            )
+        with pytest.raises(IntegrityError, match="append-only"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE policy_activations SET approved_by = 'rewritten' WHERE id = :id"),
+                    {"id": activation_id.hex},
+                )
+        with pytest.raises(IntegrityError, match="append-only"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text("DELETE FROM policy_activations WHERE id = :id"),
+                    {"id": activation_id.hex},
+                )
+    finally:
+        engine.dispose()
     engine = create_engine(database_url)
     try:
         with engine.connect() as connection:
@@ -162,6 +238,9 @@ def test_migrations_are_repeatable_from_clean_database(tmp_path: Path) -> None:
         }
     finally:
         engine.dispose()
+    with pytest.raises(RuntimeError, match="policy activation provenance"):
+        command.downgrade(config, "0014")
+    assert "policy_activations" in _table_names(database_url)
 
 
 def test_migrations_can_rebuild_schema_after_downgrade(tmp_path: Path) -> None:
@@ -381,8 +460,7 @@ def test_approval_revision_migrates_legacy_rows_and_guards_provenance(
     engine = create_engine(database_url)
     try:
         assert "request_fingerprint" not in {
-            column["name"]
-            for column in inspect(engine).get_columns("approval_requests")
+            column["name"] for column in inspect(engine).get_columns("approval_requests")
         }
         with engine.connect() as connection:
             restored = connection.execute(
@@ -500,19 +578,13 @@ def test_approval_revision_enforces_append_only_terminal_projection(
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE approval_requests SET reason = 'REWRITTEN' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE approval_requests SET reason = 'REWRITTEN' WHERE id = :id"),
                     {"id": request_id.hex},
                 )
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE approval_requests SET status = 'APPROVED' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE approval_requests SET status = 'APPROVED' WHERE id = :id"),
                     {"id": request_id.hex},
                 )
 
@@ -536,18 +608,13 @@ def test_approval_revision_enforces_append_only_terminal_projection(
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE approval_requests SET decision = 'DENY' "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE approval_requests SET decision = 'DENY' WHERE id = :id"),
                     {"id": request_id.hex},
                 )
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "DELETE FROM approval_requests WHERE id = :id"
-                    ),
+                    text("DELETE FROM approval_requests WHERE id = :id"),
                     {"id": request_id.hex},
                 )
     finally:
@@ -591,9 +658,7 @@ def test_approval_service_operates_through_migrated_triggers(
             )
             session.flush()
             evidence_id = session.scalar(
-                select(EvidenceRecord.id).where(
-                    EvidenceRecord.task_id == task.id
-                )
+                select(EvidenceRecord.id).where(EvidenceRecord.task_id == task.id)
             )
             assert evidence_id is not None
             task_id = task.id
@@ -1022,6 +1087,7 @@ def test_job_loop_migration_enforces_fenced_provenance_and_guarded_downgrade(
         - RETRIEVAL_INDEX_TABLES
         - EVALUATION_TELEMETRY_TABLES
         - CANDIDATE_LEARNING_TABLES
+        - CONTROLLED_POLICY_TABLES
     )
 
 
@@ -1154,10 +1220,7 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         ):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "UPDATE task_cancellations "
-                        "SET reason_code = 'REWRITTEN' WHERE id = :id"
-                    ),
+                    text("UPDATE task_cancellations SET reason_code = 'REWRITTEN' WHERE id = :id"),
                     {"id": cancellation_id.hex},
                 )
         with pytest.raises(
@@ -1166,9 +1229,7 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         ):
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "DELETE FROM task_cancellations WHERE id = :id"
-                    ),
+                    text("DELETE FROM task_cancellations WHERE id = :id"),
                     {"id": cancellation_id.hex},
                 )
     finally:
@@ -1185,6 +1246,7 @@ def test_cancellation_revision_fences_queued_and_running_jobs(
         - RETRIEVAL_INDEX_TABLES
         - EVALUATION_TELEMETRY_TABLES
         - CANDIDATE_LEARNING_TABLES
+        - CONTROLLED_POLICY_TABLES
     )
 
 

@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from mathews_control_plane.artifacts import ArtifactStore
+from mathews_control_plane.authentication import AuthenticatedSession
 from mathews_control_plane.database import (
     Base,
     SessionFactory,
@@ -17,10 +18,19 @@ from mathews_control_plane.database import (
     create_task_record,
 )
 from mathews_control_plane.domain_models import (
+    AgentRunEvaluation,
+    BackgroundJob,
+    BackgroundJobLease,
     Brief,
+    EvaluationContractVersion,
+    HermesRun,
+    HermesRunStatus,
+    PolicyActivation,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PromptTemplateVersion,
+    RetrievalIndexGeneration,
+    Task,
     TaskState,
 )
 from mathews_control_plane.evidence import (
@@ -29,9 +39,11 @@ from mathews_control_plane.evidence import (
     EvidenceSourceKind,
     capture_evidence,
 )
+from mathews_control_plane.policy_activation import PolicyActivationAuthorizationError
 from mathews_control_plane.prompt_compiler import (
     PromptCompilerService,
     PromptConflictError,
+    PromptEvaluationBasis,
     PromptNotFoundError,
     PromptRole,
     StructuredPromptTemplate,
@@ -175,6 +187,151 @@ def _service(harness: PromptHarness) -> PromptCompilerService:
     )
 
 
+def _authentication(*, recent: bool = True) -> AuthenticatedSession:
+    return AuthenticatedSession(
+        session_id=uuid4(),
+        user_id=1,
+        csrf_token_digest=b"x" * 32,
+        expires_at=_NOW + timedelta(hours=1),
+        absolute_expires_at=_NOW + timedelta(hours=2),
+        reauthenticated_until=_NOW + timedelta(minutes=5),
+        evaluated_at=_NOW,
+        recent_password_verified=recent,
+    )
+
+
+def _evaluation_basis() -> PromptEvaluationBasis:
+    return PromptEvaluationBasis(
+        retrieval_index_version="retrieval-v1",
+        retrieval_chunker_version="chunker-v1",
+        retrieval_verifier_version="verifier-v1",
+        model_provider="openai",
+        model_name="gpt-5",
+        model_version="2026-08-01",
+    )
+
+
+def _record_candidate_evaluation(
+    harness: PromptHarness,
+    candidate: PromptTemplateVersion,
+    *,
+    quality_score: float = 0.95,
+) -> UUID:
+    basis = _evaluation_basis()
+    with harness.factory.begin() as session:
+        task = session.get(Task, harness.task_id)
+        assert task is not None
+        job = BackgroundJob(
+            task_id=task.id,
+            job_type="prompt-evaluation",
+            input_payload={},
+            input_fingerprint="1" * 64,
+            idempotency_key=f"prompt-evaluation:{candidate.id}",
+            owner_id=task.owner_id,
+            actor_id="evaluation-worker",
+            root_correlation_id=task.root_correlation_id,
+        )
+        session.add(job)
+        session.flush()
+        lease = BackgroundJobLease(
+            job_id=job.id,
+            lease_owner="evaluation-worker",
+            attempt=1,
+            fencing_token=1,
+            idempotency_key=f"prompt-evaluation-lease:{candidate.id}",
+            claim_fingerprint="2" * 64,
+            heartbeat_at=_NOW - timedelta(minutes=2),
+            expires_at=_NOW + timedelta(minutes=2),
+            owner_id=task.owner_id,
+            actor_id="evaluation-worker",
+            root_correlation_id=task.root_correlation_id,
+        )
+        session.add(lease)
+        generation = RetrievalIndexGeneration(
+            task_id=task.id,
+            index_version=basis.retrieval_index_version,
+            chunker_version=basis.retrieval_chunker_version,
+            verifier_version=basis.retrieval_verifier_version,
+            indexed_at=_NOW - timedelta(minutes=1),
+            source_count=0,
+            chunk_count=0,
+            owner_id=task.owner_id,
+            actor_id="evaluation-worker",
+            root_correlation_id=task.root_correlation_id,
+        )
+        contract = EvaluationContractVersion(
+            lineage_key=f"prompt-evaluation-{candidate.id}",
+            version=1,
+            promotion_thresholds={
+                "minimum_run_count": 1,
+                "minimum_quality_score": 0.9,
+                "maximum_average_cost_microusd": 2_000,
+                "minimum_regression_pass_rate": 1.0,
+            },
+            regression_cases=["baseline"],
+            contract_fingerprint="3" * 64,
+            active=True,
+            activated_at=_NOW - timedelta(minutes=1),
+            owner_id=task.owner_id,
+            actor_id="evaluation-worker",
+            root_correlation_id=task.root_correlation_id,
+        )
+        session.add_all((generation, contract))
+        session.flush()
+        run = HermesRun(
+            task_id=task.id,
+            job_id=job.id,
+            lease_id=lease.id,
+            fencing_token=lease.fencing_token,
+            attempt=1,
+            prompt_template_version_id=candidate.id,
+            policy_version_id=harness.policy_id,
+            evaluation_label="candidate-evaluation",
+            prompt_fingerprint="4" * 64,
+            status=HermesRunStatus.SUCCEEDED,
+            started_at=_NOW - timedelta(minutes=1),
+            completed_at=_NOW,
+            owner_id=task.owner_id,
+            actor_id="evaluation-worker",
+            root_correlation_id=task.root_correlation_id,
+        )
+        session.add(run)
+        session.flush()
+        session.add(
+            AgentRunEvaluation(
+                run_id=run.id,
+                task_id=task.id,
+                evaluation_contract_version_id=contract.id,
+                retrieval_generation_id=generation.id,
+                retrieval_index_version=basis.retrieval_index_version,
+                retrieval_chunker_version=basis.retrieval_chunker_version,
+                retrieval_verifier_version=basis.retrieval_verifier_version,
+                retrieval_set=[],
+                prompt_template_version_id=candidate.id,
+                prompt_template_version=candidate.version,
+                policy_version_id=harness.policy_id,
+                policy_version=1,
+                model_provider=basis.model_provider,
+                model_name=basis.model_name,
+                model_version=basis.model_version,
+                input_tokens=100,
+                output_tokens=20,
+                cached_tokens=0,
+                total_tokens=120,
+                cost_microusd=1_000,
+                quality_outcome="PASSED",
+                quality_score=quality_score,
+                regression_results={"baseline": True},
+                evaluation_fingerprint="5" * 64,
+                evaluated_at=_NOW,
+                owner_id=task.owner_id,
+                actor_id="evaluation-worker",
+                root_correlation_id=task.root_correlation_id,
+            )
+        )
+        return contract.id
+
+
 @pytest.mark.parametrize("role", list(PromptRole))
 def test_default_role_prompts_are_bounded_and_use_only_verified_metadata(
     prompt_harness: PromptHarness,
@@ -190,9 +347,7 @@ def test_default_role_prompts_are_bounded_and_use_only_verified_metadata(
     assert result.template_id == prompt_harness.prompt_ids[role]
     assert result.evaluation_mode is False
     assert payload["role"] == role.value
-    assert payload["verified_evidence"][0]["evidence_id"] == str(
-        prompt_harness.evidence_id
-    )
+    assert payload["verified_evidence"][0]["evidence_id"] == str(prompt_harness.evidence_id)
     assert "FULL MUTABLE LOG" not in result.content
     assert "secret-value" not in result.content
     if role is PromptRole.PLANNER:
@@ -264,7 +419,12 @@ def test_prompt_rejects_unverified_or_excess_evidence(
 def test_promotion_creates_immutable_prompt_and_policy_successors(
     prompt_harness: PromptHarness,
 ) -> None:
-    service = _service(prompt_harness)
+    clock = [_NOW]
+    service = PromptCompilerService(
+        prompt_harness.factory,
+        prompt_harness.store,
+        clock=lambda: clock[0],
+    )
     candidate = service.create_candidate(
         prompt_id=uuid4(),
         lineage_key="implementer-experiment",
@@ -274,24 +434,36 @@ def test_promotion_creates_immutable_prompt_and_policy_successors(
     )
     promoted_id = uuid4()
     policy_id = uuid4()
+    activation_id = uuid4()
+    contract_id = _record_candidate_evaluation(prompt_harness, candidate)
+    requested_activation_time = _NOW + timedelta(seconds=30)
 
     result = service.promote(
         candidate_id=candidate.id,
+        candidate_version=candidate.version,
+        activation_id=activation_id,
         promoted_prompt_id=promoted_id,
         policy_version_id=policy_id,
-        evaluation_evidence_id=prompt_harness.evidence_id,
-        evaluation_score=0.95,
+        rollback_policy_version_id=prompt_harness.policy_id,
+        evaluation_contract_version_id=contract_id,
+        evaluation_basis=_evaluation_basis(),
         regression_reviewed=True,
-        approved_by="human-reviewer",
+        activation_time_value=requested_activation_time,
+        authentication=_authentication(),
     )
+    clock[0] = _NOW + timedelta(minutes=5)
     replay = service.promote(
         candidate_id=candidate.id,
+        candidate_version=candidate.version,
+        activation_id=activation_id,
         promoted_prompt_id=promoted_id,
         policy_version_id=policy_id,
-        evaluation_evidence_id=prompt_harness.evidence_id,
-        evaluation_score=0.95,
+        rollback_policy_version_id=prompt_harness.policy_id,
+        evaluation_contract_version_id=contract_id,
+        evaluation_basis=_evaluation_basis(),
         regression_reviewed=True,
-        approved_by="human-reviewer",
+        activation_time_value=requested_activation_time,
+        authentication=_authentication(),
     )
 
     assert result.rollback_policy_version_id == prompt_harness.policy_id
@@ -313,10 +485,18 @@ def test_promotion_creates_immutable_prompt_and_policy_successors(
         stored_candidate = session.get(PromptTemplateVersion, candidate.id)
         promoted = session.get(PromptTemplateVersion, promoted_id)
         policy = session.get(PolicyVersion, policy_id)
+        activation = session.get(PolicyActivation, activation_id)
         assert stored_candidate is not None and stored_candidate.promoted is False
         assert promoted is not None and promoted.promoted is True
-        assert promoted.approved_by == "human-reviewer"
+        assert promoted.approved_at is not None
+        assert promoted.approved_at.replace(tzinfo=UTC) == _NOW
+        assert policy is not None and policy.approved_at.replace(tzinfo=UTC) == _NOW
+        assert activation is not None
+        assert activation.activated_at.replace(tzinfo=UTC) == requested_activation_time
+        assert promoted.approved_by == "local-user"
         assert policy is not None and policy.rollback_policy_version_id == prompt_harness.policy_id
+        assert activation is not None and activation.policy_version_id == policy_id
+        assert activation.threshold_evidence["promotion_eligible"] is True
         assert session.scalar(
             select(func.count())
             .select_from(PolicyVersionPromptTemplate)
@@ -326,12 +506,16 @@ def test_promotion_creates_immutable_prompt_and_policy_successors(
     with pytest.raises(PromptConflictError, match="ids conflict"):
         service.promote(
             candidate_id=candidate.id,
+            candidate_version=candidate.version,
+            activation_id=activation_id,
             promoted_prompt_id=promoted_id,
             policy_version_id=policy_id,
-            evaluation_evidence_id=prompt_harness.evidence_id,
-            evaluation_score=0.99,
+            rollback_policy_version_id=prompt_harness.policy_id,
+            evaluation_contract_version_id=uuid4(),
+            evaluation_basis=_evaluation_basis(),
             regression_reviewed=True,
-            approved_by="human-reviewer",
+            activation_time_value=_NOW,
+            authentication=_authentication(),
         )
 
 
@@ -357,12 +541,45 @@ def test_only_latest_candidate_in_a_lineage_can_be_promoted(
     with pytest.raises(PromptConflictError, match="latest"):
         service.promote(
             candidate_id=older.id,
+            candidate_version=older.version,
+            activation_id=uuid4(),
             promoted_prompt_id=uuid4(),
             policy_version_id=uuid4(),
-            evaluation_evidence_id=prompt_harness.evidence_id,
-            evaluation_score=0.95,
+            rollback_policy_version_id=prompt_harness.policy_id,
+            evaluation_contract_version_id=uuid4(),
+            evaluation_basis=_evaluation_basis(),
             regression_reviewed=True,
-            approved_by="human-reviewer",
+            activation_time_value=_NOW,
+            authentication=_authentication(),
+        )
+
+
+def test_prompt_promotion_rejects_worker_or_stale_human_authorization(
+    prompt_harness: PromptHarness,
+) -> None:
+    service = _service(prompt_harness)
+    candidate = service.create_candidate(
+        prompt_id=uuid4(),
+        lineage_key="human-only-experiment",
+        template=_template(PromptRole.PLANNER),
+        owner_id="local-user",
+        root_correlation_id=prompt_harness.task_id,
+    )
+    contract_id = _record_candidate_evaluation(prompt_harness, candidate)
+
+    with pytest.raises(PolicyActivationAuthorizationError, match="recent password"):
+        service.promote(
+            candidate_id=candidate.id,
+            candidate_version=candidate.version,
+            activation_id=uuid4(),
+            promoted_prompt_id=uuid4(),
+            policy_version_id=uuid4(),
+            rollback_policy_version_id=prompt_harness.policy_id,
+            evaluation_contract_version_id=contract_id,
+            evaluation_basis=_evaluation_basis(),
+            regression_reviewed=True,
+            activation_time_value=_NOW,
+            authentication=_authentication(recent=False),
         )
 
 
@@ -383,16 +600,25 @@ def test_promotion_fails_closed_without_all_governance_gates(
         owner_id="local-user",
         root_correlation_id=prompt_harness.task_id,
     )
+    contract_id = _record_candidate_evaluation(
+        prompt_harness,
+        candidate,
+        quality_score=score,
+    )
 
     with pytest.raises(PromptConflictError, match="requirements"):
         service.promote(
             candidate_id=candidate.id,
+            candidate_version=candidate.version,
+            activation_id=uuid4(),
             promoted_prompt_id=uuid4(),
             policy_version_id=uuid4(),
-            evaluation_evidence_id=prompt_harness.evidence_id,
-            evaluation_score=score,
+            rollback_policy_version_id=prompt_harness.policy_id,
+            evaluation_contract_version_id=contract_id,
+            evaluation_basis=_evaluation_basis(),
             regression_reviewed=regression_reviewed,
-            approved_by="human-reviewer",
+            activation_time_value=_NOW,
+            authentication=_authentication(),
         )
 
     with prompt_harness.factory() as session:

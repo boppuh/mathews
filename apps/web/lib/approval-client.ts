@@ -73,6 +73,7 @@ export interface ApprovalInboxItem {
 
 export interface RuleInboxItem {
   candidate_id: string;
+  candidate_fingerprint: string;
   approval_request_id: string | null;
   authority: "NON_AUTHORITATIVE";
   status: "EVALUATED";
@@ -88,6 +89,12 @@ export interface RuleInboxItem {
   scope: { [key: string]: ApprovalJsonValue };
   matcher: { [key: string]: ApprovalJsonValue };
   evidence_requirements: string[];
+}
+
+export interface RuleRegressionReviewInput {
+  candidate_id: string;
+  candidate_fingerprint: string;
+  passed: true;
 }
 
 export interface ApprovalInboxResponse {
@@ -128,6 +135,13 @@ function isBoundedString(value: unknown, maximum = 500): value is string {
 
 function parseUuid(value: unknown): string {
   if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
+    throw new Error("The control plane returned an invalid approval inbox.");
+  }
+  return value;
+}
+
+function parseFingerprint(value: unknown): string {
+  if (typeof value !== "string" || !FINGERPRINT_PATTERN.test(value)) {
     throw new Error("The control plane returned an invalid approval inbox.");
   }
   return value;
@@ -363,6 +377,7 @@ function parseRule(value: unknown): RuleInboxItem {
   }
   return {
     candidate_id: parseUuid(value.candidate_id),
+    candidate_fingerprint: parseFingerprint(value.candidate_fingerprint),
     approval_request_id:
       value.approval_request_id === null ? null : parseUuid(value.approval_request_id),
     authority: value.authority,
@@ -471,14 +486,21 @@ export const approvalClient = {
     return parseApprovalInbox(await response.json());
   },
 
-  async decide(requestId: string, decision: ApprovalDecision): Promise<ApprovalDecisionResponse> {
+  async decide(
+    requestId: string,
+    decision: ApprovalDecision,
+    regressionReview?: RuleRegressionReviewInput,
+  ): Promise<ApprovalDecisionResponse> {
     if (!UUID_PATTERN.test(requestId) || !decisions.has(decision)) {
       throw new ApprovalRequestError("That approval decision is invalid.", 0);
     }
     const response = await request(`/api/approvals/${encodeURIComponent(requestId)}/decisions`, {
       method: "POST",
       headers: csrfHeaders(),
-      body: JSON.stringify({ decision }),
+      body: JSON.stringify({
+        decision,
+        ...(regressionReview === undefined ? {} : { regression_review: regressionReview }),
+      }),
     });
     const parsed = parseDecision(await response.json());
     if (parsed.request_id !== requestId || parsed.decision !== decision) {

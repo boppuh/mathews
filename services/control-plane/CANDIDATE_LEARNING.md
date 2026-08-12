@@ -33,6 +33,8 @@ idempotent by caller-provided UUID and conflicts on changed content.
 approval, prompt-promotion, policy, transition, or host-operation services. A
 separate human-governed promotion flow must revalidate all cited evidence and
 the exact evaluated definition before creating any authority-bearing record.
+That boundary is implemented and documented in
+[`CONTROLLED_POLICY_PROMOTION.md`](CONTROLLED_POLICY_PROMOTION.md).
 
 ## Production ingestion
 

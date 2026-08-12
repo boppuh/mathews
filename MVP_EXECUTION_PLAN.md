@@ -39,10 +39,11 @@ complete here unless its backlog definition of done is satisfied on `main`.
   human handoff,
   `7.1` verified-source projections and provenance views, `7.2` rebuildable
   retrieval index, `7.3` version-bound retrieval and prompt telemetry, and
-  `7.4` cited candidate-only learning.
-- Remaining: 1 of 40 MVP tasks.
-- Active next wave: Wave 7 pull request, review, and controlled learning.
-- Next completion target: `7.5`.
+  `7.4` cited candidate-only learning, and `7.5` controlled, human-governed
+  prompt and rule promotion with immutable rollback.
+- Remaining: 0 of 40 MVP tasks.
+- Active next wave: MVP release gate and recorded manual acceptance run.
+- Next completion target: MVP release gate.
 
 ## Operating model
 
