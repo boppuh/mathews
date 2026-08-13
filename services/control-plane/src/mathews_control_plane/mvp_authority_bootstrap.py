@@ -21,6 +21,7 @@ from mathews_control_plane.database import (
 from mathews_control_plane.domain_models import (
     ApprovalRequest,
     ApprovalStatus,
+    EvaluationContractVersion,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PolicyVersionReviewRule,
@@ -47,6 +48,7 @@ from mathews_control_plane.settings import Settings, settings
 BOOTSTRAP_ACTOR = MVP_AUTHORITY_BOOTSTRAP_ACTOR
 BOOTSTRAP_APPROVED_AT = datetime(2026, 8, 12, tzinfo=UTC)
 BOOTSTRAP_POLICY_LINEAGE = "mvp"
+BOOTSTRAP_EVALUATION_LINEAGE = "mvp-prompt-evaluation"
 BOOTSTRAP_NAMESPACE = UUID("b6bc2975-7883-41f7-83d7-efdb7a2f9bd5")
 
 _PROMPT_ROLES = (
@@ -61,6 +63,13 @@ _REVIEW_EVIDENCE = (
     "review-repair-candidate",
     "validation-decision",
     "draft-pull-request-proof",
+)
+_EVALUATION_REGRESSION_CASES = (
+    "accepted-brief-exact-scope",
+    "missing-evidence-fails-closed",
+    "forbidden-change-escalates",
+    "exact-head-mismatch-stops",
+    "clean-draft-pr-handoff",
 )
 
 
@@ -110,12 +119,33 @@ class MvpAuthorityDefinition:
     review_rule_id: UUID
     review_rule_membership_id: UUID
     policy_id: UUID
+    evaluation_contract_id: UUID
     prompt_membership_ids: tuple[UUID, ...]
     prompts: tuple[PromptDefinition, ...]
     workflow_thresholds: dict[str, object]
     review_scope: dict[str, object]
     review_matcher: dict[str, object]
     review_provenance: dict[str, object]
+
+    @property
+    def evaluation_thresholds(self) -> dict[str, int | float]:
+        promotion = self.workflow_thresholds["prompt_promotion_policy"]
+        assert isinstance(promotion, dict)
+        return {
+            "minimum_run_count": int(promotion["minimum_run_count"]),
+            "minimum_quality_score": float(promotion["minimum_quality_score"]),
+            "maximum_average_cost_microusd": int(promotion["maximum_average_cost_microusd"]),
+            "minimum_regression_pass_rate": float(promotion["minimum_regression_pass_rate"]),
+        }
+
+    @property
+    def evaluation_contract_fingerprint(self) -> str:
+        return canonical_fingerprint(
+            {
+                "thresholds": self.evaluation_thresholds,
+                "cases": list(_EVALUATION_REGRESSION_CASES),
+            }
+        )
 
     @property
     def proposed_rule(self) -> str:
@@ -215,6 +245,15 @@ class MvpAuthorityDefinition:
                     "id": str(self.review_rule_id),
                     "fingerprint": self.review_rule_fingerprint,
                 },
+                "evaluation_contract": {
+                    "id": str(self.evaluation_contract_id),
+                    "lineage_key": BOOTSTRAP_EVALUATION_LINEAGE,
+                    "version": 1,
+                    "promotion_thresholds": self.evaluation_thresholds,
+                    "regression_cases": list(_EVALUATION_REGRESSION_CASES),
+                    "fingerprint": self.evaluation_contract_fingerprint,
+                    "active": True,
+                },
                 "memberships": {
                     "prompt": [str(value) for value in self.prompt_membership_ids],
                     "review_rule": str(self.review_rule_membership_id),
@@ -267,6 +306,14 @@ class MvpAuthoritySnapshot:
                 "version": 1,
                 "fingerprint": definition.review_rule_fingerprint,
             },
+            "evaluation_contract": {
+                "id": str(definition.evaluation_contract_id),
+                "lineage": BOOTSTRAP_EVALUATION_LINEAGE,
+                "version": 1,
+                "fingerprint": definition.evaluation_contract_fingerprint,
+                "active": True,
+                "regression_cases": list(_EVALUATION_REGRESSION_CASES),
+            },
             "memberships": {
                 "prompt_membership_ids": [str(value) for value in definition.prompt_membership_ids],
                 "prompt_ids": [str(prompt.id) for prompt in definition.prompts],
@@ -304,6 +351,7 @@ def mvp_authority_definition(repository: str) -> MvpAuthorityDefinition:
         review_rule_id=_stable_id("review-rule:mvp-format-content-view:v1"),
         review_rule_membership_id=_stable_id("membership:review-rule:1"),
         policy_id=_stable_id("policy:mvp:v1"),
+        evaluation_contract_id=_stable_id("evaluation-contract:mvp-prompt-evaluation:v1"),
         prompt_membership_ids=tuple(
             _stable_id(f"membership:prompt:{position}") for position in range(1, len(prompts) + 1)
         ),
@@ -379,6 +427,20 @@ class MvpAuthorityBootstrapService:
                     self._create(session)
                     session.flush()
                     return replace(self._verify(session), operation="created")
+                if (
+                    session.get(
+                        EvaluationContractVersion,
+                        self._definition.evaluation_contract_id,
+                    )
+                    is None
+                ):
+                    # Complete databases bootstrapped before the evaluation contract
+                    # became part of the MVP trust anchor, but only after proving the
+                    # existing authority is the exact expected definition.
+                    self._verify(session, require_evaluation_contract=False)
+                    self._create_evaluation_contract(session)
+                    session.flush()
+                    return replace(self._verify(session), operation="created")
                 return replace(self._verify(session), operation="replayed")
         except IntegrityError as error:
             raise MvpAuthorityBootstrapConflictError(
@@ -393,6 +455,7 @@ class MvpAuthorityBootstrapService:
             definition.approval_request_id,
             definition.review_rule_id,
             definition.policy_id,
+            definition.evaluation_contract_id,
             *(prompt.id for prompt in definition.prompts),
         )
         if any(_id_exists(session, value) for value in expected_ids):
@@ -540,19 +603,61 @@ class MvpAuthorityBootstrapService:
             )
         )
 
-    def _verify(self, session: Session) -> MvpAuthoritySnapshot:
+        self._create_evaluation_contract(session)
+
+    def _create_evaluation_contract(self, session: Session) -> None:
+        definition = self._definition
+        existing_lineage_id = session.scalar(
+            select(EvaluationContractVersion.id)
+            .where(EvaluationContractVersion.lineage_key == BOOTSTRAP_EVALUATION_LINEAGE)
+            .limit(1)
+        )
+        if existing_lineage_id is not None or _id_exists(
+            session, definition.evaluation_contract_id
+        ):
+            raise MvpAuthorityBootstrapConflictError(
+                "initial MVP evaluation contract conflicts with durable state"
+            )
+        session.add(
+            EvaluationContractVersion(
+                id=definition.evaluation_contract_id,
+                lineage_key=BOOTSTRAP_EVALUATION_LINEAGE,
+                version=1,
+                predecessor_id=None,
+                promotion_thresholds=definition.evaluation_thresholds,
+                regression_cases=list(_EVALUATION_REGRESSION_CASES),
+                contract_fingerprint=definition.evaluation_contract_fingerprint,
+                active=True,
+                activated_at=BOOTSTRAP_APPROVED_AT,
+                **_record_context(definition.audit_task_id, causation_id=definition.policy_id),
+            )
+        )
+
+    def _verify(
+        self,
+        session: Session,
+        *,
+        require_evaluation_contract: bool = True,
+    ) -> MvpAuthoritySnapshot:
         definition = self._definition
         task = session.get(Task, definition.audit_task_id)
         candidate = session.get(RuleCandidate, definition.candidate_id)
         approval = session.get(ApprovalRequest, definition.approval_request_id)
         rule = session.get(ReviewRule, definition.review_rule_id)
         policy = session.get(PolicyVersion, definition.policy_id)
+        evaluation_contract = session.get(
+            EvaluationContractVersion, definition.evaluation_contract_id
+        )
         if not _support_records_match(definition, task, candidate, approval):
             _conflict("bootstrap audit records differ from the expected definition")
         if not _review_rule_matches(definition, rule):
             _conflict("bootstrap review rule differs from the expected definition")
         if not _policy_matches(definition, policy):
             _conflict("mvp policy version 1 differs from the expected definition")
+        if require_evaluation_contract and not _evaluation_contract_matches(
+            definition, evaluation_contract
+        ):
+            _conflict("MVP evaluation contract differs from the expected definition")
 
         prompt_rows = tuple(
             session.get(PromptTemplateVersion, value.id) for value in definition.prompts
@@ -814,6 +919,28 @@ def _policy_matches(
     )
 
 
+def _evaluation_contract_matches(
+    definition: MvpAuthorityDefinition,
+    contract: EvaluationContractVersion | None,
+) -> bool:
+    return bool(
+        contract is not None
+        and contract.lineage_key == BOOTSTRAP_EVALUATION_LINEAGE
+        and contract.version == 1
+        and contract.predecessor_id is None
+        and contract.promotion_thresholds == definition.evaluation_thresholds
+        and contract.regression_cases == list(_EVALUATION_REGRESSION_CASES)
+        and contract.contract_fingerprint == definition.evaluation_contract_fingerprint
+        and contract.active is True
+        and _as_utc(contract.activated_at) == BOOTSTRAP_APPROVED_AT
+        and contract.owner_id == LOCAL_OWNER_ID
+        and contract.actor_id == BOOTSTRAP_ACTOR
+        and contract.root_correlation_id == definition.audit_task_id
+        and contract.causation_id == definition.policy_id
+        and contract.parent_correlation_id == definition.audit_task_id
+    )
+
+
 def _record_context(root_id: UUID, *, causation_id: UUID | None = None) -> dict[str, object]:
     return {
         "owner_id": LOCAL_OWNER_ID,
@@ -843,6 +970,7 @@ def _id_exists(session: Session, identifier: UUID) -> bool:
         ReviewRule,
         PolicyVersion,
         PromptTemplateVersion,
+        EvaluationContractVersion,
     )
     return any(session.get(model, identifier) is not None for model in model_types)
 
