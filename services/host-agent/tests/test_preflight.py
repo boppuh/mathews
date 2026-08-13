@@ -233,6 +233,19 @@ def _repository_fixture(tmp_path: Path) -> tuple[Path, str]:
     (scheme_directory / "Mathews.xcscheme").write_text(
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Scheme version="1.7">\n'
+        '  <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">\n'
+        "    <BuildActionEntries>\n"
+        '      <BuildActionEntry buildForTesting="YES" buildForRunning="YES" '
+        'buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">\n'
+        "        <BuildableReference "
+        'BuildableIdentifier="primary" '
+        'BlueprintIdentifier="999999999999999999999999" '
+        'BuildableName="Mathews.app" '
+        'BlueprintName="Mathews" '
+        'ReferencedContainer="container:Mathews.xcodeproj"/>\n'
+        "      </BuildActionEntry>\n"
+        "    </BuildActionEntries>\n"
+        "  </BuildAction>\n"
         '  <TestAction buildConfiguration="Debug">\n'
         "    <Testables>\n"
         '      <TestableReference skipped="NO">\n'
