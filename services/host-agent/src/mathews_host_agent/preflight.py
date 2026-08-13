@@ -1261,9 +1261,16 @@ def _scheme_selects_harness_target(
     ):
         return False
     root_children = tuple(root)
-    if len(root_children) != 1 or root_children[0].tag != "TestAction":
+    if len(root_children) == 2:
+        build_action, test_action = root_children
+        if not _safe_candidate_build_action(build_action, flow):
+            return False
+    elif len(root_children) == 1:
+        test_action = root_children[0]
+    else:
         return False
-    test_action = root_children[0]
+    if test_action.tag != "TestAction":
+        return False
     if test_action.attrib != {"buildConfiguration": "Debug"}:
         return False
     test_action_children = tuple(test_action)
@@ -1291,6 +1298,64 @@ def _scheme_selects_harness_target(
         "BlueprintName": target_name,
         "ReferencedContainer": f"container:{flow.harness_project_path}",
     }
+
+
+def _safe_candidate_build_action(action: ET.Element, flow: E2EFlow) -> bool:
+    """Allow one pinned app build without admitting scheme execution hooks."""
+
+    if action.tag != "BuildAction" or action.attrib != {
+        "parallelizeBuildables": "YES",
+        "buildImplicitDependencies": "YES",
+    }:
+        return False
+    children = tuple(action)
+    if len(children) != 1 or children[0].tag != "BuildActionEntries":
+        return False
+    entries_container = children[0]
+    entries = tuple(entries_container)
+    if entries_container.attrib or len(entries) != 1:
+        return False
+    entry = entries[0]
+    if entry.tag != "BuildActionEntry" or entry.attrib != {
+        "buildForTesting": "YES",
+        "buildForRunning": "YES",
+        "buildForProfiling": "NO",
+        "buildForArchiving": "NO",
+        "buildForAnalyzing": "YES",
+    }:
+        return False
+    buildables = tuple(entry)
+    if len(buildables) != 1 or buildables[0].tag != "BuildableReference":
+        return False
+    buildable = buildables[0]
+    attributes = buildable.attrib
+    project_reference = attributes.get("ReferencedContainer")
+    blueprint_identifier = attributes.get("BlueprintIdentifier")
+    buildable_name = attributes.get("BuildableName")
+    blueprint_name = attributes.get("BlueprintName")
+    return (
+        not tuple(buildable)
+        and set(attributes)
+        == {
+            "BuildableIdentifier",
+            "BlueprintIdentifier",
+            "BuildableName",
+            "BlueprintName",
+            "ReferencedContainer",
+        }
+        and attributes["BuildableIdentifier"] == "primary"
+        and isinstance(blueprint_identifier, str)
+        and _PBX_OBJECT_ID_PATTERN.fullmatch(blueprint_identifier) is not None
+        and isinstance(buildable_name, str)
+        and buildable_name.endswith(".app")
+        and isinstance(blueprint_name, str)
+        and _SCHEME_PATTERN.fullmatch(blueprint_name) is not None
+        and isinstance(project_reference, str)
+        and project_reference.startswith("container:")
+        and project_reference.endswith(".xcodeproj")
+        and project_reference != f"container:{flow.harness_project_path}"
+        and _safe_relative_path(project_reference.removeprefix("container:")) is not None
+    )
 
 
 def _project_compiles_exact_sources(
