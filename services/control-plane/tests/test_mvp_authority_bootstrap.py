@@ -29,6 +29,7 @@ from mathews_control_plane.database import (
 )
 from mathews_control_plane.database_base import Base
 from mathews_control_plane.domain_models import (
+    EvaluationContractVersion,
     PolicyVersion,
     PolicyVersionPromptTemplate,
     PolicyVersionReviewRule,
@@ -94,6 +95,8 @@ def test_first_bootstrap_creates_exact_authority_shape_and_order(
         assert session.scalar(select(func.count(PolicyVersion.id))) == 1
         assert session.scalar(select(func.count(PromptTemplateVersion.id))) == 5
         assert session.scalar(select(func.count(ReviewRule.id))) == 1
+        assert session.scalar(select(func.count(EvaluationContractVersion.id))) == 1
+        contract = session.get(EvaluationContractVersion, result.definition.evaluation_contract_id)
         prompt_memberships = tuple(
             session.scalars(
                 select(PolicyVersionPromptTemplate).order_by(PolicyVersionPromptTemplate.position)
@@ -111,6 +114,12 @@ def test_first_bootstrap_creates_exact_authority_shape_and_order(
     assert [(row.position, row.review_rule_id) for row in rule_memberships] == [
         (1, result.definition.review_rule_id)
     ]
+    assert contract is not None
+    assert contract.active
+    assert contract.version == 1
+    assert contract.lineage_key == "mvp-prompt-evaluation"
+    assert contract.contract_fingerprint == result.definition.evaluation_contract_fingerprint
+    assert contract.promotion_thresholds == result.definition.evaluation_thresholds
 
 
 def test_exact_replay_returns_same_records_without_new_rows(
@@ -129,6 +138,50 @@ def test_exact_replay_returns_same_records_without_new_rows(
         assert session.scalar(select(func.count(PolicyVersion.id))) == 1
         assert session.scalar(select(func.count(PromptTemplateVersion.id))) == 5
         assert session.scalar(select(func.count(ReviewRule.id))) == 1
+        assert session.scalar(select(func.count(EvaluationContractVersion.id))) == 1
+
+
+def test_replay_completes_a_pre_contract_bootstrap(
+    bootstrap_database: tuple[Engine, MvpAuthorityBootstrapService],
+) -> None:
+    engine, service = bootstrap_database
+    definition = service.bootstrap().definition
+    factory = create_session_factory(engine)
+    with factory.begin() as session:
+        contract = session.get(EvaluationContractVersion, definition.evaluation_contract_id)
+        assert contract is not None
+        session.delete(contract)
+
+    completed = service.bootstrap()
+
+    assert completed.operation == "created"
+    with factory() as session:
+        contracts = tuple(session.scalars(select(EvaluationContractVersion)))
+    assert [contract.id for contract in contracts] == [definition.evaluation_contract_id]
+    assert contracts[0].active
+
+
+def test_changed_evaluation_contract_conflicts_without_repairing_it(
+    bootstrap_database: tuple[Engine, MvpAuthorityBootstrapService],
+) -> None:
+    engine, service = bootstrap_database
+    definition = service.bootstrap().definition
+    factory = create_session_factory(engine)
+    with factory.begin() as session:
+        contract = session.get(EvaluationContractVersion, definition.evaluation_contract_id)
+        assert contract is not None
+        contract.promotion_thresholds = {
+            **contract.promotion_thresholds,
+            "minimum_run_count": 999,
+        }
+
+    with pytest.raises(MvpAuthorityBootstrapConflictError):
+        service.bootstrap()
+
+    with factory() as session:
+        contract = session.get(EvaluationContractVersion, definition.evaluation_contract_id)
+        assert contract is not None
+        assert contract.promotion_thresholds["minimum_run_count"] == 999
 
 
 def test_changed_bootstrap_repository_conflicts_without_modifying_records(
@@ -330,6 +383,7 @@ def test_dry_run_and_output_are_non_secret_and_omit_prompt_bodies(
     assert "token" not in rendered.lower()
     assert "Use only the supplied task context" not in rendered
     assert "instructions" not in rendered
+    assert '"evaluation_contract"' in rendered
 
 
 def _review_context(policy_id: UUID) -> _ReviewContext:

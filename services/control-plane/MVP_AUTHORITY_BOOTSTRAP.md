@@ -6,9 +6,11 @@ canonical `MATHEWS_GITHUB_REPOSITORY`; it does not accept credentials or prompt
 text as command-line input.
 
 The command creates policy lineage `mvp` version 1, promoted version 1 prompts
-for planner, implementer, validator, pull-request writer, and reviewer, and one
-human-approved low-risk review rule. The rule can match only a formatter-labeled
-`repair.format` classification for the single ordinary application source file
+for planner, implementer, validator, pull-request writer, and reviewer, one
+active immutable evaluation-contract version, and one human-approved low-risk
+review rule. The evaluation contract freezes the policy's numeric promotion
+thresholds and the five fail-closed MVP regression cases. The rule can match only
+a formatter-labeled `repair.format` classification for the single ordinary application source file
 `mathews-ios-acceptance/ContentView.swift`. Dependency, project configuration,
 CI, signing, security, schema, migration, release, deployment, test-harness,
 fixture, and account-recipe paths remain outside its scope. The review pipeline
@@ -26,12 +28,15 @@ records are support evidence; they do not authorize repository mutation by
 themselves. The task API excludes the bootstrap actor's audit context from queue,
 detail, steering, cancellation, handoff, and event operations.
 
-All record and membership IDs are deterministic for this bootstrap version.
+All record and membership IDs, including the evaluation-contract ID, are
+deterministic for this bootstrap version.
 Canonical SHA-256 fingerprints cover the intended definition. The first run is
 transactional. Exact replay verifies and returns the same records without
 inserting anything. A changed repository, threshold, prompt, rule, membership,
-approval, or audit binding fails closed. PostgreSQL advisory locking and the
-SQLite write lock serialize concurrent first-run attempts.
+approval, evaluation contract, or audit binding fails closed. A replay against
+the exact earlier bootstrap shape completes the missing evaluation contract;
+any conflicting evaluation lineage or deterministic ID fails closed. PostgreSQL
+advisory locking and the SQLite write lock serialize concurrent first-run attempts.
 
 ## Operator procedure
 
@@ -93,6 +98,14 @@ URLs, Keychain references, credentials, and tokens. A representative shape is:
     "lineage": "mvp-format-content-view",
     "version": 1,
     "fingerprint": "<64 lowercase hex characters>"
+  },
+  "evaluation_contract": {
+    "id": "<uuid>",
+    "lineage": "mvp-prompt-evaluation",
+    "version": 1,
+    "fingerprint": "<64 lowercase hex characters>",
+    "active": true,
+    "regression_cases": ["<five canonical case identifiers>"]
   },
   "memberships": {
     "prompt_membership_ids": ["<five ordered uuids>"],
