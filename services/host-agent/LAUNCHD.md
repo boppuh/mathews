@@ -84,12 +84,12 @@ then builds and installs the candidate before running that test.
    embedded credentials, queries, and fragments fail preflight. Re-point an
    existing SSH remote before deployment.
 
-5. Configure the control plane with the host HMAC reference and socket path:
+5. Configure the control plane with the host HMAC reference. Set its socket path
+   after registering the LaunchAgent, as described below:
 
    ```dotenv
    MATHEWS_HOST_AUTH_KEY_REF=keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1
    MATHEWS_HOST_AUTH_KEY_ID=host-control-plane-v1
-   MATHEWS_HOST_SOCKET_PATH="/Users/<you>/Library/Application Support/Mathews/host-agent.sock"
    ```
 
 The credential value must never be placed in an environment file, plist,
@@ -97,12 +97,13 @@ command argument, log, prompt, or artifact.
 
 ## Render and install
 
-After `uv sync --all-packages`, render the fixed plist using absolute paths:
+After `uv sync --all-packages`, render the fixed plist using absolute paths.
+Use the secure generated socket mode for the live gate:
 
 ```bash
 uv run --package mathews-host-agent mathews-host-agent-plist \
   --executable "$PWD/.venv/bin/mathews-host-agent" \
-  --socket-path "$HOME/Library/Application Support/Mathews/host-agent.sock" \
+  --secure-socket \
   --journal-path "$HOME/Library/Application Support/Mathews/host-agent.sqlite3" \
   --auth-reference keychain://com.boppuh.mathews.host-agent/control-plane-hmac-v1 \
   --auth-key-id host-control-plane-v1 \
@@ -120,6 +121,44 @@ launchctl bootstrap "gui/$(id -u)" \
 launchd owns the listening socket and starts the process on demand. The process
 requires the launchd descriptor when `--launchd-socket` is present and fails
 closed instead of falling back to a self-bound listener.
+
+`--secure-socket` renders `SecureSocketWithKey=MATHEWS_HOST_SOCKET_PATH` instead
+of `SockPathName`. launchd generates the private socket path and injects it into
+the host process's environment. The plist deliberately omits `--socket-path`
+from the program arguments so the agent uses that injected path. The journal
+stays at its explicit, stable path under Application Support.
+
+Inspect the registered job:
+
+```bash
+launchctl print "gui/$(id -u)/com.boppuh.mathews.host-agent"
+```
+
+Read the exact generated `MATHEWS_HOST_SOCKET_PATH` from the registered
+environment/socket details. Set the control plane's `MATHEWS_HOST_SOCKET_PATH`
+to that observed, non-secret path in `.env` before starting the API or worker.
+If the registration does not expose an unambiguous generated path, stop and
+inspect the registration rather than guessing a runtime-directory name.
+Verify its parent directory is owned by the current user with mode `0700` and
+the socket is owned by that user with mode `0600`, then verify authenticated
+`host.health`. Neither the rendered plist nor `.env` contains the HMAC value.
+
+The generated path belongs to the launchd registration: an ordinary service
+restart or `launchctl kickstart` preserves it, while bootout/bootstrap or a
+new login can generate a different path. After registration changes, reread
+the observed path, update the control plane configuration, and restart the
+API/worker before sending work. Retain the existing journal throughout.
+
+The renderer also supports the original static `--socket-path <absolute path>`
+mode, mutually exclusive with `--secure-socket`. Use it only when launchd keeps
+the socket at that original bound path. Some macOS versions bind a static
+socket at a generated path and move it to `SockPathName`; Mathews rejects that
+case because the original binding can no longer be checked. It accepts existing
+filesystem aliases such as `/var` and `/private/var` only when both socket names
+remain present, satisfy the owner/permission checks, and identify the same
+device and inode. A matching client peer-name string is not used as identity
+proof. Listener validation opens no probe connection and consumes no queued
+request.
 
 For explicit development only, omit `--launchd-socket` and run
 `mathews-host-agent` directly; the same private-path, authentication, framing,
