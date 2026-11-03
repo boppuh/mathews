@@ -32,7 +32,9 @@ Verified integration gaps:
   adapters, but default startup does not compose the complete set.
 - A real Hermes installation is available locally, but its Runs API is not the
   contract currently assumed by `HermesHttpRuntime`: the installed API exposes
-  lifecycle events separately and has no matching `/tool-results` route.
+  lifecycle events separately and has no matching `/tool-results` route. This
+  is a source-audit finding for the exact provider revision below; authenticated
+  live capability and run verification remain pending.
 - GitHub App identifiers and secret references remain unconfigured. Account
   provisioning, installation permissions, and a real signed delivery still need
   verification.
@@ -42,6 +44,39 @@ Verified integration gaps:
 
 The authorities remain `MVP_RELEASE_GATE_RUNBOOK.md`, the versioned repository
 configuration, and the documented host, GitHub, evidence, and policy contracts.
+
+## Inspected Hermes provider contract
+
+The 2026-11-03 source audit inspected installed Hermes revision
+`daedf4f627c73859974e587783b7cef8ce80e19a`. The inspected
+`gateway/platforms/api_server.py` had no local modifications. This identifies
+the audited source; it is not a claim that a live deployment has been pinned
+or accepted.
+
+An AST inventory of that revision's HTTP route registrations at lines 4805–4809
+found exactly these Runs routes:
+
+| Method | Route |
+| --- | --- |
+| POST | `/v1/runs` |
+| GET | `/v1/runs/{run_id}` |
+| GET | `/v1/runs/{run_id}/events` |
+| POST | `/v1/runs/{run_id}/approval` |
+| POST | `/v1/runs/{run_id}/stop` |
+
+There is no registered `/v1/runs/{run_id}/tool-results` route. In the same
+source, `_handle_get_run` (lines 4480–4492) returns the stored status record,
+while `_handle_run_events` (line 4494 onward) serves a separate SSE stream.
+Mathews' client instead expects sequenced events in its polled observation
+and submits authorized tool results to the missing route. Those are concrete
+provider/client contract differences rather than conclusions inferred from
+the Mathews client alone.
+
+No provider service was started and no authenticated capability request or
+model run was performed during this audit. PR 1 must verify the actual deployed
+runtime over its authenticated boundary, prove mediated tool execution and
+replay/cancellation behavior, and freeze that tested revision before intake.
+Repeat the source and capability audit if the provider revision changes.
 
 ## Dependency order
 
