@@ -42,6 +42,11 @@ complete here unless its backlog definition of done is satisfied on `main`.
   `7.4` cited candidate-only learning, and `7.5` controlled, human-governed
   prompt and rule promotion with immutable rollback.
 - Remaining: 0 of 40 MVP tasks.
+- Live integration status: the backlog components are implemented, but the
+  default API and worker do not yet compose the full intake-to-handoff runtime.
+  Complete [`MVP_LIVE_INTEGRATION_PLAN.md`](MVP_LIVE_INTEGRATION_PLAN.md) before
+  starting the recorded acceptance run; configured settings alone are not a
+  readiness proof.
 - Active next wave: MVP release gate and recorded manual acceptance run.
 - Next completion target: MVP release gate.
 

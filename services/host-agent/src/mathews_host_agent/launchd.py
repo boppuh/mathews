@@ -20,6 +20,7 @@ from mathews_configuration import SecretReference
 
 LAUNCH_AGENT_LABEL = "com.boppuh.mathews.host-agent"
 LAUNCHD_SOCKET_NAME = "HostAgent"
+LAUNCHD_SOCKET_PATH_ENVIRONMENT = "MATHEWS_HOST_SOCKET_PATH"
 _HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
 
 
@@ -35,15 +36,18 @@ class SocketActivator(Protocol):
 @dataclass(frozen=True, slots=True)
 class LaunchAgentSpecification:
     executable: Path
-    socket_path: Path
+    socket_path: Path | None
     journal_path: Path
     authentication_reference: SecretReference
     host_id: str
     authentication_key_id: str = "host-control-plane-v1"
+    secure_socket: bool = False
 
     def __post_init__(self) -> None:
+        if self.secure_socket == (self.socket_path is not None):
+            raise LaunchdConfigurationError("select exactly one launchd socket mode")
         for value in (self.executable, self.socket_path, self.journal_path):
-            if not value.is_absolute():
+            if value is not None and not value.is_absolute():
                 raise LaunchdConfigurationError("launchd paths must be absolute")
         if _HOST_ID.fullmatch(self.host_id) is None:
             raise LaunchdConfigurationError("host identity is invalid")
@@ -121,11 +125,29 @@ def validate_listener(listener: socket.socket, *, expected_path: Path) -> None:
         raise LaunchdConfigurationError("host agent requires a Unix stream socket")
     if not _listener_is_accepting(listener):
         raise LaunchdConfigurationError("launchd descriptor is not listening")
-    if listener.getsockname() != str(expected_path):
+    expected_stat = _validate_private_socket_path(expected_path)
+    bound_name = listener.getsockname()
+    if bound_name == str(expected_path):
+        return
+    if not isinstance(bound_name, str) or not Path(bound_name).is_absolute():
         raise LaunchdConfigurationError("launchd socket path does not match configuration")
+    # Resolve existing filesystem aliases such as /var and /private/var only.
+    # A renamed socket whose original bound path vanished is not an alias and
+    # must remain rejected. No connection is opened or queued request consumed.
+    bound_stat = _validate_private_socket_path(Path(bound_name))
+    if (bound_stat.st_dev, bound_stat.st_ino) != (
+        expected_stat.st_dev,
+        expected_stat.st_ino,
+    ):
+        raise LaunchdConfigurationError("launchd socket path does not match configuration")
+
+
+def _validate_private_socket_path(path: Path) -> os.stat_result:
+    if not path.is_absolute():
+        raise LaunchdConfigurationError("launchd socket path must be absolute")
     try:
-        parent_stat = expected_path.parent.lstat()
-        socket_stat = expected_path.lstat()
+        parent_stat = path.parent.lstat()
+        socket_stat = path.lstat()
     except OSError:
         raise LaunchdConfigurationError("launchd socket path is unavailable") from None
     if (
@@ -137,18 +159,24 @@ def validate_listener(listener: socket.socket, *, expected_path: Path) -> None:
         or stat.S_IMODE(socket_stat.st_mode) != 0o600
     ):
         raise LaunchdConfigurationError("launchd socket permissions are unsafe")
+    return socket_stat
 
 
 def render_launch_agent_plist(specification: LaunchAgentSpecification) -> bytes:
     """Render the fixed non-root LaunchAgent definition without credential bytes."""
 
-    value = {
-        "Label": LAUNCH_AGENT_LABEL,
-        "ProgramArguments": [
-            str(specification.executable),
-            "--launchd-socket",
-            "--socket-path",
-            str(specification.socket_path),
+    arguments = [str(specification.executable), "--launchd-socket"]
+    socket_configuration: dict[str, object] = {
+        "SockPathMode": 0o600,
+        "SockType": "stream",
+    }
+    if specification.secure_socket:
+        socket_configuration["SecureSocketWithKey"] = LAUNCHD_SOCKET_PATH_ENVIRONMENT
+    else:
+        socket_configuration["SockPathName"] = str(specification.socket_path)
+        arguments.extend(["--socket-path", str(specification.socket_path)])
+    arguments.extend(
+        [
             "--journal-path",
             str(specification.journal_path),
             "--auth-reference",
@@ -157,15 +185,15 @@ def render_launch_agent_plist(specification: LaunchAgentSpecification) -> bytes:
             specification.authentication_key_id,
             "--host-id",
             specification.host_id,
-        ],
+        ]
+    )
+    value = {
+        "Label": LAUNCH_AGENT_LABEL,
+        "ProgramArguments": arguments,
         "ProcessType": "Background",
         "RunAtLoad": False,
         "Sockets": {
-            LAUNCHD_SOCKET_NAME: {
-                "SockPathMode": 0o600,
-                "SockPathName": str(specification.socket_path),
-                "SockType": "stream",
-            }
+            LAUNCHD_SOCKET_NAME: socket_configuration,
         },
         "Umask": 0o077,
     }
@@ -177,7 +205,13 @@ def main() -> None:
         description="Render the fixed Mathews per-user LaunchAgent plist"
     )
     parser.add_argument("--executable", required=True, type=Path)
-    parser.add_argument("--socket-path", required=True, type=Path)
+    socket_mode = parser.add_mutually_exclusive_group(required=True)
+    socket_mode.add_argument("--socket-path", type=Path)
+    socket_mode.add_argument(
+        "--secure-socket",
+        action="store_true",
+        help="Have launchd inject its generated socket path into MATHEWS_HOST_SOCKET_PATH",
+    )
     parser.add_argument("--journal-path", required=True, type=Path)
     parser.add_argument(
         "--auth-reference",
@@ -191,7 +225,10 @@ def main() -> None:
         payload = render_launch_agent_plist(
             LaunchAgentSpecification(
                 executable=arguments.executable.resolve(),
-                socket_path=arguments.socket_path.resolve(),
+                socket_path=(
+                    arguments.socket_path.resolve() if arguments.socket_path is not None else None
+                ),
+                secure_socket=arguments.secure_socket,
                 journal_path=arguments.journal_path.resolve(),
                 authentication_reference=arguments.auth_reference,
                 host_id=arguments.host_id,
